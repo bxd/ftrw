@@ -1,0 +1,25 @@
+# 构建产物与本地二进制
+*.exe
+*.syso
+fqterm/bin/
+fqterm/.task/
+fqterm/.wails/
+
+# 前端依赖与产物（npm install / vite build 可再生）
+fqterm/frontend/node_modules/
+fqterm/frontend/dist/
+
+# Wails 生成的 TS 绑定：前端是手写 api.ts（动态 Call.ByName），不依赖此目录，每次 build 自动重生成
+fqterm/frontend/bindings/
+
+# 跨平台构建模板：本项目仅面向 Windows（字体枚举等直接用 Win32 注册表 API），不纳入体积大户
+fqterm/build/darwin/
+fqterm/build/ios/
+fqterm/build/android/
+fqterm/build/linux/
+fqterm/build/docker/
+
+# 运行时日志与系统杂项
+*.log
+.DS_Store
+Thumbs.db

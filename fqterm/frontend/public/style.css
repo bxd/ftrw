@@ -1,0 +1,47 @@
+/* FQTerm 全局样式：全屏无滚动的桌面应用布局 */
+:root {
+    --text: #d7d7d7;
+    --muted: #8a94a7;
+    color-scheme: dark;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+        "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;               /* 禁止页面级滚动条 */
+    background: #181a1e;
+    color: var(--text);
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* 挂载点铺满整个视口，让终端内容最大化 */
+#app {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+}
+
+input, textarea {
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+/* xterm.js 终端：隐藏常驻滚动条，让 BBS 内容铺满（滚轮翻页仍可用） */
+.xterm-viewport {
+    overflow-y: auto !important;
+}
+.xterm-viewport::-webkit-scrollbar {
+    width: 0 !important;
+    height: 0 !important;
+    background: transparent;
+}
