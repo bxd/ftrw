@@ -172,7 +172,12 @@ func (ts *TerminalService) Connect(site Site) (string, error) {
 		closed: make(chan struct{}),
 	}
 	if s.Title == "" {
-		s.Title = fmt.Sprintf("%s:%d", site.Host, site.Port)
+		if site.ProtocolType == 3 {
+			// 本地 shell 没有主机端口，“host:0” 这种标题既难看又容易让人以为连错了机器。
+			s.Title = exeBase(shellArgv(site)[0])
+		} else {
+			s.Title = fmt.Sprintf("%s:%d", site.Host, site.Port)
+		}
 	}
 	ts.mu.Lock()
 	ts.sessions[id] = s
@@ -208,7 +213,7 @@ func (ts *TerminalService) dial(site Site) (protoConn, error) {
 		auth := AuthMethod{Kind: AuthPassword, Password: site.Password}
 		return ConnectSSH(site.Host, portOr(site.Port, 22), site.UserName, auth, sshTermType(site), site.NumColumns, site.NumRows, ts.khosts.Callback())
 	case 3: // Local shell
-		return newLocalShell()
+		return newLocalShell(site)
 	default: // Telnet
 		addr := net.JoinHostPort(site.Host, strconv.Itoa(portOr(site.Port, 23)))
 		d := net.Dialer{Timeout: 15 * time.Second}

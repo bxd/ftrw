@@ -39,6 +39,11 @@ export interface Site {
   reconnectRetries: number // 重连重试次数，-1 = 无限
   enableZmodem: boolean
   group: string
+  // 本机 shell（protocolType===3）专用：shellID 是探测结果的稳定标识，shellArgs 是启动
+  // 参数，auto 表示这条由扫描生成（允许被自动清理/更新）。
+  shellID?: string
+  shellArgs?: string[]
+  auto?: boolean
 }
 
 export interface Preferences {
@@ -54,6 +59,12 @@ export interface Preferences {
   openWarnOnClose: boolean
   scrollbackLines: number
   confirmClose: boolean
+  // 窗口形态：quake 下拉与普通窗口共用同一个原生窗口，尺寸按工作区（已扣除任务栏）百分比算
+  quakeWidthPct: number
+  quakeHeightPct: number
+  quakeHideOnBlur: boolean
+  trayEnabled: boolean
+  closeToTray: boolean
 }
 
 export interface ColorScheme {
@@ -74,10 +85,11 @@ export interface SessionInfo {
 
 // ---- Keymap (Emacs 风格键序列) ----
 
+// 整张表都是应用内绑定（本窗口有焦点即生效）。早先的 scope 字段已退役：旧配置里
+// 残留的 "scope" 会被后端解码时忽略，下次保存就不再写回。
 export interface KeyBinding {
   keys: string      // 序列表示法：“C-x C-f”、“C-c <ESC> o”
   command: string   // 命令 id（可用 "id:参数"）
-  scope: string     // 'terminal' | 'global'
   enabled: boolean
   note: string
 }
@@ -93,6 +105,8 @@ export interface KeymapConfig {
 
 const cfg = 'main.ConfigService'
 const term = 'main.TerminalService'
+const appsvc = 'main.AppService'
+const pvsvc = 'main.PreviewService'
 
 export const ListSites = (): Promise<Site[]> => Call.ByName(`${cfg}.ListSites`)
 export const SaveSite = (index: number, site: Site): Promise<void> => Call.ByName(`${cfg}.SaveSite`, index, site)
@@ -107,6 +121,108 @@ export const ListSystemFonts = (): Promise<string[]> => Call.ByName(`${cfg}.List
 export const GetKeymap = (): Promise<KeymapConfig> => Call.ByName(`${cfg}.GetKeymap`)
 export const DefaultKeymap = (): Promise<KeymapConfig> => Call.ByName(`${cfg}.DefaultKeymap`)
 export const SaveKeymap = (km: KeymapConfig): Promise<void> => Call.ByName(`${cfg}.SaveKeymap`, km)
+
+// ---- 本机 shell 扫描 ----
+
+// 后端探测 cmd / PowerShell / pwsh / Git Bash / MSYS2 / Cygwin / WSL 各发行版，把它们落成
+// protocolType===3、group==='shell' 的真实站点条目。计数为 0 表示列表没有任何变化。
+export interface ShellSyncResult {
+  added: number
+  updated: number
+  removed: number
+  shells: string[]
+}
+
+export const SHELL_GROUP = 'shell'
+export const SyncShells = (): Promise<ShellSyncResult> => Call.ByName(`${cfg}.SyncShells`)
+
+// ---- 窗口形态 / 托盘 / 开机自启动 ----
+
+export interface WindowModeState {
+  mode: string    // 'window' | 'quake'
+  visible: boolean
+}
+
+export const GetWindowMode = (): Promise<WindowModeState> => Call.ByName(`${appsvc}.GetWindowMode`)
+export const ToggleWindowMode = (): Promise<WindowModeState> => Call.ByName(`${appsvc}.ToggleWindowMode`)
+export const SetWindowMode = (mode: string): Promise<void> => Call.ByName(`${appsvc}.SetMode`, mode)
+export const GetAutostart = (): Promise<boolean> => Call.ByName(`${appsvc}.GetAutostart`)
+export const SetAutostart = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetAutostart`, on)
+
+// ---- 跨应用热键（系统级） ----
+
+// 与应用内键序列是两套东西：由后端 WH_KEYBOARD_LL 低级键盘钩子匹配，本窗口没焦点也
+// 生效。形状只有「单段组合键」与「两段相同键的双击」，语法校验见 globalkey.ts。
+export interface GlobalKey {
+  keys: string      // "M-`"、"C-M-t"、"<C-M> <C-M>"
+  action: string    // 动作 id，取自 ListGlobalActions
+  enabled: boolean
+  note: string
+}
+
+export interface GlobalKeymap {
+  enabled: boolean
+  doubleTapMs: number
+  bindings: GlobalKey[]
+}
+
+export interface GlobalAction {
+  id: string
+  label: string
+  description: string
+}
+
+export const GetGlobalKeys = (): Promise<GlobalKeymap> => Call.ByName(`${appsvc}.GetGlobalKeys`)
+export const DefaultGlobalKeys = (): Promise<GlobalKeymap> => Call.ByName(`${appsvc}.DefaultGlobalKeys`)
+export const SaveGlobalKeys = (gk: GlobalKeymap): Promise<void> => Call.ByName(`${appsvc}.SaveGlobalKeys`, gk)
+export const ListGlobalActions = (): Promise<GlobalAction[]> => Call.ByName(`${appsvc}.ListGlobalActions`)
+// 热键编辑器打开期间静音真热键，否则录制时按下的组合键会真的把窗口呼出/收起
+export const SetGlobalKeysPaused = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetGlobalKeysPaused`, on)
+// 原生对话框会抢走主窗口焦点，quake 的「失焦即收起」需要这道护栏才不会误伤
+export const SetDialogGuard = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetDialogGuard`, on)
+// 偏好保存后重放与原生侧相关的设置（目前是托盘显隐）
+export const ApplyAppPreferences = (): Promise<void> => Call.ByName(`${appsvc}.ApplyPreferences`)
+
+// ---- 超链接预览窗口 ----
+
+// 一条链接。kind 由前端按扩展名判完再送进来（见 linkscan.ts），后端只用它分流：
+// 媒体→我们自己的预览页，网页→整窗顶层导航（frame 限制就是这么绕开的）。
+export interface PreviewItem {
+  url: string
+  kind: 'image' | 'audio' | 'video' | 'page'
+  name: string
+}
+
+export interface PreviewRequest {
+  items: PreviewItem[]
+  index: number
+}
+
+export const OpenPreview = (items: PreviewItem[], index: number): Promise<void> =>
+  Call.ByName(`${pvsvc}.OpenPreview`, items, index)
+export const TakePreviewRequest = (): Promise<PreviewRequest | null> =>
+  Call.ByName(`${pvsvc}.TakePreviewRequest`)
+export const ClosePreview = (): Promise<void> => Call.ByName(`${pvsvc}.ClosePreview`)
+export const OpenExternalURL = (url: string): Promise<void> => Call.ByName(`${pvsvc}.OpenExternal`, url)
+export const GetPreviewState = (): Promise<string> => Call.ByName(`${pvsvc}.GetPreviewState`)
+// 探类型与真文件名：发一次 HEAD 拿 Content-Type 与 Content-Disposition。扩展名认不出来的
+// 链接（BBS 的 att.php、纯附件号）靠它才不会被全判成网页，也不会整排图都叫 att.php。
+// Resolve 成与入参一一对应的回执，探不到就是空字段。
+export interface ProbeResult {
+  kind?: string | null
+  name?: string | null
+}
+export const ProbePreview = (url: string): Promise<ProbeResult> =>
+  Call.ByName(`${pvsvc}.Probe`, url)
+export const ProbePreviewMany = (urls: string[]): Promise<ProbeResult[]> =>
+  Call.ByName(`${pvsvc}.ProbeMany`, urls)
+// 另存为：必须走后端 —— 跨域图片的响应体 webview fetch 不到，download 属性也会被忽略。
+// Resolve 成选定的完整路径，取消则是空字符串。
+export const SavePreviewItem = (url: string, name: string): Promise<string> =>
+  Call.ByName(`${pvsvc}.SaveItem`, url, name)
+// 最大化/还原预览窗口，Resolve 成切换后的状态（以后端 IsMaximised 为准）。
+export const TogglePreviewMaximise = (): Promise<boolean> =>
+  Call.ByName(`${pvsvc}.ToggleMaximise`)
 
 // ---- Terminal service ----
 
@@ -133,6 +249,12 @@ export const onTermStatus = (cb: (d: TermStatus) => void) =>
   Events.On('term:status', (e: any) => cb(e.data))
 export const onZmodem = (cb: (d: ZmodemProgress) => void) =>
   Events.On('zmodem:progress', (e: any) => cb(e.data))
+export const onWindowMode = (cb: (d: WindowModeState) => void) =>
+  Events.On('app:mode', (e: any) => cb(e.data))
+// 预览窗口已开着时换内容。事件走全局总线（每个窗口都会收到），但只有预览页注册了
+// 监听者，主窗口那边没人听这一条，所以不必再按 sender 过滤。
+export const onPreviewLoad = (cb: (d: PreviewRequest) => void) =>
+  Events.On('preview:load', (e: any) => cb(e.data))
 
 // ---- Encoding labels (mirror fqterm) ----
 

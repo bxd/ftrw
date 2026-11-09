@@ -11,21 +11,19 @@ import (
 // Store persists sites, preferences, keymap and color schemes as JSON files
 // under the user config directory (e.g. %APPDATA%/FTRW on Windows).
 type Store struct {
-	mu      sync.RWMutex
-	dir     string
-	Sites   []Site        `json:"sites"`
-	Prefs   Preferences   `json:"prefs"`
-	Schemes []ColorScheme `json:"schemes"`
-	Keymap  KeymapConfig  `json:"keymap"`
-	loaded  bool
+	mu        sync.RWMutex
+	dir       string
+	Sites     []Site        `json:"sites"`
+	Prefs     Preferences   `json:"prefs"`
+	Schemes   []ColorScheme `json:"schemes"`
+	Keymap    KeymapConfig  `json:"keymap"`
+	GlobalKey GlobalKeymap  `json:"globalKey"`
+	loaded    bool
 }
 
 func NewStore() (*Store, error) {
-	base, err := os.UserConfigDir()
-	if err != nil {
-		base = "."
-	}
-	dir := filepath.Join(base, "FTRW")
+	dir := configRoot()
+	base := filepath.Dir(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -37,6 +35,16 @@ func NewStore() (*Store, error) {
 	return s, nil
 }
 
+// configRoot 是本应用自己的数据目录（Windows 上为 %APPDATA%\FTRW）。日志目录也从
+// 这里派生，所以它必须能在 Store 建起来之前就被调用。
+func configRoot() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		base = "."
+	}
+	return filepath.Join(base, "FTRW")
+}
+
 // legacyDirName is the config folder used before the app was renamed FTRW. It was
 // shared with the original C++ FQTerm, hence migration copies only our own JSON
 // files and never deletes or touches anything else in there.
@@ -45,7 +53,7 @@ const legacyDirName = "FQTerm"
 // ownConfigFiles are the files this rewrite owns; anything else in the legacy
 // directory (fqterm.cfg, address.cfg, known_hosts, ...) belongs to the original
 // client and must be left alone.
-var ownConfigFiles = []string{"sites.json", "prefs.json", "schemes.json", "keybindings.json"}
+var ownConfigFiles = []string{"sites.json", "prefs.json", "schemes.json", "keybindings.json", "globalkeys.json"}
 
 // migrateLegacyConfig seeds the new directory from the old one, but only when the
 // new directory is still empty of our own files — otherwise a partially written
@@ -89,12 +97,13 @@ func (s *Store) load() error {
 	s.Sites = nil
 	s.Schemes = defaultSchemes()
 	s.Keymap = DefaultKeymap()
+	s.GlobalKey = DefaultGlobalKeymap()
 
-	// prefs
+	// prefs：直接解码进 s.Prefs（已先填好出厂默认值），这样旧 prefs.json 里缺失的
+	// 新增字段会自然保留默认——若解码进一个空结构再整体赋值，新字段会被静默清零。
 	if b, err := os.ReadFile(s.file("prefs.json")); err == nil {
-		var p Preferences
-		if json.Unmarshal(b, &p) == nil {
-			s.Prefs = p
+		if err := json.Unmarshal(b, &s.Prefs); err != nil {
+			log.Printf("parse prefs.json: %v", err)
 		}
 	}
 	// sites
@@ -121,11 +130,49 @@ func (s *Store) load() error {
 			if km.Bindings == nil {
 				km.Bindings = []KeyBinding{}
 			}
+			seedFactoryBindings(&km, DefaultKeymap())
 			s.Keymap = km
+		}
+	}
+	// globalkeys.json：跨应用热键表。与应用内键序表故意分开存：两张表的生效条件、
+	// 语法形状、由谁匹配都不同，混在一个文件里会让 normalizeKeymap 那种「按形状钳制」
+	// 变成两套分支。这张表不做补种，出厂值只在文件不存在时生效。
+	if b, err := os.ReadFile(s.file("globalkeys.json")); err == nil {
+		var gk GlobalKeymap
+		if json.Unmarshal(b, &gk) == nil {
+			s.GlobalKey = normalizeGlobalKeymap(gk)
 		}
 	}
 	s.loaded = true
 	return nil
+}
+
+// seedFactoryBindings 把新版本新增的出厂绑定补种进用户已有的绑定表。
+//
+// 判据是 Seeded 里「已尝试过补种的命令 id」而不是「表里有没有这条 Keys」：用户
+// 可能改键或干脆解绑，只要某个命令的出厂绑定被尝试过一次就不再强塞回去，否则
+// 「删掉 M-x M-q」会在每次启动时复活。bound 那一跳是为了区分「用户手工解绑」与
+// 「用户把这条改成了别的键」——后者命令 id 还在，不该再加一条重复绑定。
+func seedFactoryBindings(cur *KeymapConfig, factory KeymapConfig) {
+	seeded := make(map[string]bool, len(cur.Seeded))
+	for _, id := range cur.Seeded {
+		seeded[id] = true
+	}
+	bound := make(map[string]bool, len(cur.Bindings))
+	for _, b := range cur.Bindings {
+		bound[b.Command] = true
+	}
+	for _, b := range factory.Bindings {
+		if seeded[b.Command] {
+			continue
+		}
+		seeded[b.Command] = true
+		cur.Seeded = append(cur.Seeded, b.Command)
+		if bound[b.Command] {
+			continue
+		}
+		cur.Bindings = append(cur.Bindings, b)
+	}
 }
 
 func (s *Store) saveJSON(name string, v interface{}) error {
@@ -158,6 +205,13 @@ func (s *Store) SaveKeymap() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.saveJSON("keybindings.json", s.Keymap)
+}
+
+// SaveGlobalKey 落盘跨应用热键表（globalkeys.json）。
+func (s *Store) SaveGlobalKey() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveJSON("globalkeys.json", s.GlobalKey)
 }
 
 // Dir returns the config directory (used for default zmodem download path).

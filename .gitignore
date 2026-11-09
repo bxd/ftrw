@@ -1,5 +1,7 @@
 # 构建产物与本地二进制
+# *.exe~ 是 go build 在 Windows 上目标被占用时的改名残留（旧进程还没退就重新构建）
 *.exe
+*.exe~
 *.syso
 fqterm/bin/
 fqterm/.task/
@@ -23,3 +25,6 @@ fqterm/build/docker/
 *.log
 .DS_Store
 Thumbs.db
+
+# 本地取证现场：ConPTY 复现留下的输出只对本机排查有用，不进仓库
+_conptyrepro/

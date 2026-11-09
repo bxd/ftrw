@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref, onMounted } from 'vue'
+import { reactive, ref, computed, onMounted } from 'vue'
 import * as api from '../api'
 
 const props = defineProps<{
@@ -34,10 +34,39 @@ onMounted(() => {
   api.ListSystemFonts().then((f) => { fonts.value = f || [] }).catch(() => { fonts.value = [] })
 })
 
+// 本地 shell：host 存可执行文件路径，port/保活/重连/ZMODEM 都没有意义。
+const isLocal = computed(() => s.protocolType === 3)
+
+// 启动参数在界面上是一行空格分隔的文本，内部是 string[]。带空格的路径或发行版名用
+// 双引号括起来就能当成一个参数（"Ubuntu 24.04 LTS"）。
+const argsText = ref(joinArgs(raw.shellArgs || []))
+
+function joinArgs(a: string[]): string {
+  return a.map((x) => (/\s|"/.test(x) ? `"${x.replace(/"/g, '')}"` : x)).join(' ')
+}
+
+function splitArgs(t: string): string[] {
+  const m = t.match(/"[^"]*"|\S+/g)
+  return (m || []).map((x) => x.replace(/^"|"$/g, '')).filter(Boolean)
+}
+
 // When protocol changes, auto-adjust default port
 function onProtocol() {
   if (s.protocolType >= 1 && s.port === 23) s.port = 22
   if (s.protocolType === 0 && s.port === 22) s.port = 23
+  // 本地 shell 没有服务器：把连接类开关一律关掉。留着它们不只是没意义，保活还会
+  // 定时往 shell 里灌 NUL 字节。
+  if (s.protocolType === 3) {
+    s.port = 0
+    s.antiIdle = false
+    s.autoReconnect = false
+    s.enableZmodem = false
+    s.autoLogin = false
+    if (!s.group) s.group = api.SHELL_GROUP
+    // 从一个远程站点切过来时，主机名当路径用没意义，清空让它回退到系统默认 shell。
+    // 不带分隔符的名字（pwsh.exe 这种）不动：CreateProcess 会自己在 PATH 里找。
+    if (s.host && !/[\\/]/.test(s.host)) s.host = ''
+  }
 }
 
 // when hostType BBS toggled, set sensible defaults
@@ -47,6 +76,13 @@ function onHostType() {
 }
 
 function doSave() {
+  if (isLocal.value) {
+    // 本地 shell 不参与下面那套「旧站点缺字段」兼容归一化：它的 maxIdleSeconds=0 是
+    // 故意关掉，补成 120 会让保活重新启动。
+    s.shellArgs = splitArgs(argsText.value)
+    emit('save', { ...s }, props.index, props.save)
+    return
+  }
   // 字段归一化：避免旧站点数据缺项导致后端拿到 0 值而行为错乱。
   if (!s.maxIdleSeconds || s.maxIdleSeconds < 10) s.maxIdleSeconds = 120
   if (!s.reconnectInterval || s.reconnectInterval < 1) s.reconnectInterval = 3
@@ -71,14 +107,25 @@ function doSave() {
           <select v-model.number="s.protocolType" @change="onProtocol">
             <option v-for="(p, i) in api.PROTOCOLS" :key="i" :value="i">{{ p }}</option>
           </select>
-          <label>主机</label><input v-model="s.host" placeholder="bbs.example.com" />
-          <label>端口</label><input type="number" v-model.number="s.port" />
+          <template v-if="!isLocal">
+            <label>主机</label><input v-model="s.host" placeholder="bbs.example.com" />
+            <label>端口</label><input type="number" v-model.number="s.port" />
+          </template>
+          <template v-else>
+            <label>程序</label><input v-model="s.host" placeholder="C:\Windows\System32\cmd.exe" />
+            <label>参数</label><input v-model="argsText" placeholder="-d Ubuntu 或 --login -i" />
+          </template>
           <label>类型</label>
           <select v-model.number="s.hostType" @change="onHostType">
             <option :value="0">BBS</option><option :value="1">*NIX</option>
           </select>
           <label>分组</label><input v-model="s.group" placeholder="默认分组" />
         </div>
+
+        <p v-if="isLocal" class="hint">
+          本地 shell 直接起一个本机进程（Windows 走 ConPTY 伪终端，输出统一为 UTF-8，服务器编码请保持 UTF-8）。
+          路径写完整绝对路径；参数空格分隔，带空格的值用双引号括起来。点「保存并连接」立刻开一个 shell 终端。
+        </p>
 
         <fieldset v-if="s.protocolType >= 1 && s.protocolType <= 2">
           <legend>SSH 登录</legend>
@@ -88,7 +135,7 @@ function doSave() {
           </div>
         </fieldset>
 
-        <fieldset>
+        <fieldset v-if="!isLocal">
           <legend>自动登录</legend>
           <label class="chk"><input type="checkbox" v-model="s.autoLogin" /> 启用自动登录</label>
           <div class="grid">
@@ -97,7 +144,7 @@ function doSave() {
           </div>
         </fieldset>
 
-        <fieldset>
+        <fieldset v-if="!isLocal">
           <legend>空闲保活 / 自动重连</legend>
           <label class="chk"><input type="checkbox" v-model="s.antiIdle" /> 启用防空闲（挂机不被踢下线）</label>
           <div class="grid">

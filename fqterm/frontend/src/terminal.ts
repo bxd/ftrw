@@ -7,6 +7,7 @@ import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import * as api from './api'
 import { keyseq } from './keyseq'
+import { scanLines, type PreviewItem } from './linkscan'
 
 /**
  * 中英分别字体：xterm.js 只有一个 fontFamily，但 CSS 字体栈是按字符逐个回退的
@@ -63,6 +64,11 @@ export class TermTab {
   // 对齐原版 isFontAutoFit_ 三态：1=字号随窗口（默认）0=行列随窗口 2=固定行列。
   fontAutoFit = 1
   centerContent = true
+  /**
+   * 点到超链接时的去处（由 App.vue 注入：开预览窗口，或交给系统浏览器）。
+   * 不在这儿直接 window.open：那会开出 WebView2 自己的弹窗，既不受我们控制也关不掉。
+   */
+  onLink?: (uri: string) => void
   private baseFontSize: number
   private cellUnit: { w: number; h: number } | null = null
   private stretchRaf = 0
@@ -98,7 +104,7 @@ export class TermTab {
     this.search = new SearchAddon()
     this.term.loadAddon(this.fit)
     this.term.loadAddon(this.search)
-    this.term.loadAddon(new WebLinksAddon((_e, uri) => window.open(uri, '_blank')))
+    this.term.loadAddon(new WebLinksAddon((_e, uri) => this.onLink?.(uri)))
 
     this.term.open(container)
     this.applyScheme(null)
@@ -109,7 +115,7 @@ export class TermTab {
     // 前缀（如绑定了 `x y` 后按下的 x）会被浏览器写进辅助 textarea，漏进远端输入。
     this.term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== 'keydown') return true
-      if (keyseq.feed(ev as KeyboardEvent, 'terminal') === 'swallow') {
+      if (keyseq.feed(ev as KeyboardEvent) === 'swallow') {
         ev.preventDefault()
         return false
       }
@@ -269,6 +275,22 @@ export class TermTab {
   }
 
   setStatus(s: string) { this.status = s }
+
+  /**
+   * 当前屏幕上的超链接清单（按出现顺序，同一地址只留一次）。
+   *
+   * 只扫可见区而不是整个回滚缓冲区：一屏就是一帖的阅读现场，把用户早就翻过去的
+   * 老图也收进「下一个」里，循环浏览就变成考古了。
+   */
+  collectLinks(): PreviewItem[] {
+    const b = this.term.buffer.active
+    const start = b.baseY + b.viewportY
+    const lines: string[] = []
+    for (let i = start; i < start + this.term.rows; i++) {
+      lines.push(b.getLine(i)?.translateToString(true) ?? '')
+    }
+    return scanLines(lines)
+  }
 
   focus() { this.term.focus() }
 

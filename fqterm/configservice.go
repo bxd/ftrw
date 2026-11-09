@@ -29,7 +29,14 @@ func (cs *ConfigService) ListSites() []Site {
 // normalizeSite 给旧配置补上后来新增的空闲/重连默认值。以 maxIdleSeconds==0 判定
 // “字段缺失的旧站点”（0 秒本身无意义），按原版默认开启防空闲；避免升级后老站点
 // 默默丢掉保活能力。重连保持默认关闭，仅补齐间隔/次数。
+//
+// 本地 shell（ProtocolType==3）直接原样返回：它没有服务器，MaxIdleSeconds==0 是
+// 「故意关掉」而不是「字段缺失」，一旦走进上面的分支就会被补成开保活 + ^@ 消息，
+// 于是每隔两分钟往用户的 shell 里灌一个 NUL。
 func normalizeSite(site Site) Site {
+	if site.ProtocolType == 3 {
+		return site
+	}
 	if site.MaxIdleSeconds == 0 {
 		site.MaxIdleSeconds = 120
 		site.AntiIdle = true
@@ -94,10 +101,21 @@ func (cs *ConfigService) GetPreferences() Preferences {
 }
 
 func (cs *ConfigService) SetPreferences(prefs Preferences) error {
+	prefs = normalizePreferences(prefs)
 	cs.store.mu.Lock()
 	cs.store.Prefs = prefs
 	cs.store.mu.Unlock()
 	return cs.store.SavePrefs()
+}
+
+// normalizePreferences 守住 quake 宽/高的合法区间：前端传回的是整个 Preferences 对象，
+// 旧版本页面或缺失字段（上一轮还没有 quakeWidthPct）会把它们带成 0，直接生效会把
+// 窗口压成看不见的 0 尺寸条。
+func normalizePreferences(p Preferences) Preferences {
+	def := defaultPreferences()
+	p.QuakeWidthPct = quakePct(p.QuakeWidthPct, def.QuakeWidthPct)
+	p.QuakeHeightPct = quakePct(p.QuakeHeightPct, def.QuakeHeightPct)
+	return p
 }
 
 // --- Color schemes ---
@@ -159,9 +177,27 @@ func (cs *ConfigService) DefaultKeymap() KeymapConfig { return normalizeKeymap(D
 func (cs *ConfigService) SaveKeymap(km KeymapConfig) error {
 	km = normalizeKeymap(km)
 	cs.store.mu.Lock()
+	// Seeded 是后端自己的补种台账，前端那个对象里根本没这个字段（见 api.ts 的
+	// KeymapConfig）。不并回去的话，一次保存就能把台账清空，下次启动又把用户
+	// 删掉的出厂绑定塞回来。
+	km.Seeded = mergeSeeded(cs.store.Keymap.Seeded, km.Seeded)
 	cs.store.Keymap = km
 	cs.store.mu.Unlock()
 	return cs.store.SaveKeymap()
+}
+
+// mergeSeeded 求两份补种记录的并集，保持先后顺序且去重。
+func mergeSeeded(existing, incoming []string) []string {
+	seen := make(map[string]bool, len(existing)+len(incoming))
+	out := make([]string, 0, len(existing)+len(incoming))
+	for _, id := range append(append([]string(nil), existing...), incoming...) {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 func normalizeKeymap(km KeymapConfig) KeymapConfig {
@@ -173,9 +209,7 @@ func normalizeKeymap(km KeymapConfig) KeymapConfig {
 		if b.Keys == "" || b.Command == "" {
 			continue // 残缺条目（手改文件）直接丢弃，不让它遮蔽其他序列
 		}
-		if b.Scope != "global" {
-			b.Scope = "terminal"
-		}
+		// 旧配置里的 "scope" 字段已退役：解码时自然被忽略，下次保存就不再写回。
 		out = append(out, b)
 	}
 	km.Bindings = out

@@ -10,6 +10,7 @@ import ZmodemDialog from './components/ZmodemDialog.vue'
 import KeymapDialog from './components/KeymapDialog.vue'
 import { keyseq, registerCommand, type EchoInfo } from './keyseq'
 import { registerBuiltinCommands } from './keymapcmds'
+import { applyProbe, asKind, classifyURL, linkName, looksGenericName, mediaOnly, probeTargets, type PreviewItem } from './linkscan'
 
 interface TabMeta { id: string; title: string; status: string }
 
@@ -192,6 +193,8 @@ function toggleSidebar() {
 /* ---------------- Emacs 式键序列 ---------------- */
 
 const km = ref<api.KeymapConfig>({ enabled: true, timeoutMs: 1000, echo: true, bindings: [] })
+// 跨应用热键表：后端低级键盘钩子那份，界面只负责读出来交给编辑器
+const gk = ref<api.GlobalKeymap>({ enabled: true, doubleTapMs: 400, bindings: [] })
 const kmDlg = reactive({ show: false })
 const echoMsg = ref('')
 const echoKind = ref<EchoInfo['kind']>('info')
@@ -212,15 +215,35 @@ function applyKeymap(c: api.KeymapConfig) {
 }
 
 /**
- * 全局作用域入口（window 捕获阶段）。焦点在终端时直接返回，
- * 留给 xterm 的 customKeyEventHandler 按 'terminal' 作用域处理，避免同一键被查两次。
+ * 焦点不在终端时的键序列入口（window 捕获阶段）。
+ *
+ * 绑定表整体是应用内生效的，所以这里不能只查「全局」那一半：否则用户点过任意一个
+ * 工具栏按钮后焦点就停在按钮上（不在 viewport 里），M-x p 这类绑定会全部失效。
  */
 function onGlobalKey(ev: KeyboardEvent) {
   const el = document.activeElement
-  if (el && viewport.value && viewport.value.contains(el)) return
-  if (keyseq.feed(ev, 'global') === 'swallow') {
+  if (el && viewport.value && viewport.value.contains(el)) return // 焦点在终端，交给 xterm 的回调，不查两遍
+  if (isTextEditing(el)) return // 正在往输入框打字，按键一律属于输入内容
+  if (keyseq.feed(ev) === 'swallow') {
     ev.preventDefault()
     ev.stopPropagation()
+  }
+}
+
+// 可写文本控件：这些控件里的按键属于打字，不得被序列框架抢走。xterm 的辅助
+// textarea 也是 textarea，但它被上面 viewport 那行提前拦下，走不到这里。
+const NON_TEXT_INPUT_TYPES = ['checkbox', 'radio', 'button', 'submit', 'range', 'color', 'file']
+function isTextEditing(el: Element | null): boolean {
+  if (!el) return false
+  const e = el as HTMLElement
+  if (e.isContentEditable) return true
+  switch (e.tagName) {
+    case 'TEXTAREA':
+      return true
+    case 'INPUT':
+      return !NON_TEXT_INPUT_TYPES.includes((e as HTMLInputElement).type)
+    default:
+      return false
   }
 }
 
@@ -242,14 +265,70 @@ registerCommand({
   handler: () => toggleSidebar(),
 })
 
-async function onKeymapSave(c: api.KeymapConfig) {
-  try { await api.SaveKeymap(c) } catch (e) { showEcho(`保存绑定表失败：${e}`, 'error'); return }
+registerCommand({
+  id: 'app.toggle-quake-mode',
+  title: '窗口：普通 / quake 下拉模式互切',
+  description: '默认序列 M-x M-q；跨应用呼出走系统全局热键 Alt+`（两种键位都认）',
+  handler: () => { toggleWindowMode() },
+})
+
+registerCommand({
+  id: 'tab.prev',
+  title: '标签：切到上一个（循环）',
+  description: '默认 S-<LEFT>；已在头部时绕到尾部，只剩一个标签时不做动作',
+  handler: () => cycleTab(-1),
+})
+
+registerCommand({
+  id: 'tab.next',
+  title: '标签：切到下一个（循环）',
+  description: '默认 S-<RIGHT>；已在尾端时绕回头部，只剩一个标签时不做动作',
+  handler: () => cycleTab(1),
+})
+
+// 窗口形态（普通 / quake）。与后端共用同一个原生窗口，这里只镜像状态供界面使用。
+const winMode = ref<api.WindowModeState>({ mode: 'window', visible: true })
+const isQuake = computed(() => winMode.value.mode === 'quake')
+
+async function toggleWindowMode() {
+  try {
+    winMode.value = await api.ToggleWindowMode()
+  } catch (e) {
+    showEcho(`切换窗口模式失败：${e}`, 'error')
+  }
+}
+
+// 原生对话框是独立 HWND，弹出时必然让主窗口失焦。quake 的「失焦即收起」
+// 不看这道护栏就会在选完文件、点完“确认断开”后把窗口直接吞掉。
+async function withDialogGuard<T>(run: () => Promise<T>): Promise<T> {
+  await api.SetDialogGuard(true).catch(() => {})
+  try {
+    return await run()
+  } finally {
+    // 对话框已经关闭、焦点正在回到主窗口，稍等一下再拆护栏，免得中间那次
+    // 失焦事件被当成「用户切走了」。
+    setTimeout(() => { api.SetDialogGuard(false).catch(() => {}) }, 250)
+  }
+}
+
+async function onKeymapSave(c: api.KeymapConfig, g: api.GlobalKeymap) {
+  // 两张表一起提交，但只有应用内那份需要在前端重放：全局热键由后端自己重编译匹配器，
+  // 前端只是镜像一份供下次打开编辑器时回填。
+  try {
+    await api.SaveKeymap(c)
+    await api.SaveGlobalKeys(g)
+  } catch (e) {
+    showEcho(`保存热键表失败：${e}`, 'error')
+    return
+  }
+  gk.value = g
   // 必须先等编辑器卸载：它在挂载期间把引擎强制置为静默，卸载时才恢复，
   // 若先 applyKeymap 再卸载，刚保存的开关会被旧值覆盖回去。
   kmDlg.show = false
   await nextTick()
   applyKeymap(c)
-  showEcho(`键序列已保存：${c.bindings.length} 条绑定${c.enabled ? '' : '（引擎当前停用）'}`, c.enabled ? 'info' : 'warn')
+  const gs = g.enabled && g.bindings.length ? `，全局 ${g.bindings.length} 条` : ''
+  showEcho(`键序列已保存：${c.bindings.length} 条绑定${gs}${c.enabled ? '' : '（引擎当前停用）'}`, c.enabled ? 'info' : 'warn')
 }
 
 // 无边框窗口控制（最小化/最大化切换/关闭）
@@ -299,6 +378,7 @@ async function newTab(site: api.Site) {
   viewport.value!.appendChild(container)
 
   const tab = new TermTab(site, container)
+  tab.onLink = (uri) => void onLinkClick(tab, uri)
   insts.push(tab)
   tabs.value.push({ id: '', title: tab.title, status: 'connecting' })
   const myIdx = insts.length - 1
@@ -323,21 +403,91 @@ async function newTab(site: api.Site) {
   // 必须移除，否则会与后端重复注入一次输入。
 }
 
+/**
+ * 点到超链接：交给预览窗口。
+ *
+ * 清单取自当前屏幕（tab.collectLinks()），所以点开一张图之后还能在这一帖的图里
+ * 循环着翻；被点的那条万一不在清单里（跨行折断一类）就单独补一条，保证「点了必有
+ * 反应」。扩展名判不准的先问一次服务器：BBS 的图大量走 att.php?... 或纯附件号，
+ * 误判成网页就得把整个窗口交给对方文档，缩放/翻页/另存为全都画不出来；而且真文件名
+ * 只在服务器的响应头里，不探测就只能拿地址末段当名字。
+ * 偏好里关掉预览时退回系统浏览器，不拦截用户。
+ */
+async function onLinkClick(tab: TermTab, uri: string) {
+  if (!prefs.value?.imageViewerEnabled) {
+    try {
+      await api.OpenExternalURL(uri)
+    } catch (e) {
+      showEcho(`打开链接失败：${e}`, 'error')
+    }
+    return
+  }
+  const scanned = tab.collectLinks()
+  const targets = probeTargets(scanned)
+  const list = applyProbe(scanned, targets, await probeInfos(targets))
+  let clicked = list.find((it) => it.url === uri)
+  if (!clicked) {
+    // 屏幕里没扫到：单独探这一条，别让它因为扩展名不明就退化成开网页
+    const solo = (await probeInfos([uri]))[0]
+    const name = (solo?.name || '').trim()
+    clicked = {
+      url: uri,
+      kind: asKind(solo?.kind) || classifyURL(uri),
+      name: name && !looksGenericName(name) ? name : linkName(uri),
+    }
+  }
+  let items: PreviewItem[]
+  if (clicked.kind === 'page') {
+    items = [clicked]
+  } else {
+    items = mediaOnly(list)
+    if (!items.some((it) => it.url === uri)) items = [clicked, ...items]
+  }
+  const index = Math.max(0, items.findIndex((it) => it.url === uri))
+  try {
+    await api.OpenPreview(items, index)
+  } catch (e) {
+    showEcho(`预览打开失败：${e}`, 'error')
+  }
+}
+
+/** 问后端一批链接的真实类型与文件名。探测不许拖垮点击：失败就当没探到，退回原判。 */
+async function probeInfos(urls: string[]): Promise<api.ProbeResult[]> {
+  if (!urls.length) return []
+  try {
+    return (await api.ProbePreviewMany(urls)) || []
+  } catch {
+    return []
+  }
+}
+
 function setActive(i: number) {
   active.value = i
   insts.forEach((t, idx) => { t.container.style.display = idx === i ? 'block' : 'none' })
   nextTick(() => { const t = insts[i]; if (t) { t.fitNow(); t.focus() } })
 }
 
+/**
+ * 在标签间循环切换：delta 为 +1（往后）或 -1（往前）。
+ *
+ * 取余而不是限幅，所以从尾部再往右会回到头部 —— “循环”就是这条绑定的全部语义。
+ * 只有一个标签时直接返回：不做动作也不回显，避开在状态区刷没意义的提示。
+ */
+function cycleTab(delta: number) {
+  const n = insts.length
+  if (n < 2 || active.value < 0) return
+  setActive((active.value + delta + n) % n)
+}
+
 async function closeTab(i: number) {
   const t = insts[i]
   if (!t) return
   if (t.status === 'connected' && prefs.value?.confirmClose) {
-    const r = await Dialogs.Question({
+    const r = await withDialogGuard(() => Dialogs.Question({
       Title: 'FTRW',
       Message: `断开 “${t.title}” ？`,
       Buttons: [{ Label: '断开', IsDefault: true }, { Label: '取消', IsCancel: true }],
-    })
+    }))
     if (r !== '断开') return
   }
   if (t.id) { api.Disconnect(t.id); byId.delete(t.id) }
@@ -372,6 +522,44 @@ async function onSiteSaved(site: api.Site, index: number, save: boolean) {
 async function removeSite(index: number) { await api.DeleteSite(index); await refreshSites() }
 async function refreshSites() { sites.value = await api.ListSites() }
 
+// 扫描本机 shell：后端探测 cmd/PowerShell/pwsh/Git Bash/WSL 等，落成 shell 组的站点条目。
+// 启动时静默跑一次（auto 发现不弹窗），侧栏 ⟳ 手动跑一次则报计数。
+const shellScanning = ref(false)
+async function scanShells(report: boolean) {
+  if (shellScanning.value) return
+  shellScanning.value = true
+  try {
+    const r = await api.SyncShells()
+    const changed = (r.added || 0) + (r.updated || 0) + (r.removed || 0)
+    if (changed > 0) await refreshSites()
+    if (report) {
+      showEcho(changed === 0
+        ? `本机 shell 无变化（共 ${r.shells?.length || 0} 个）`
+        : `本机 shell：新增 ${r.added || 0}、更新 ${r.updated || 0}、移除 ${r.removed || 0}`,
+        'info')
+    }
+  } catch (e: any) {
+    if (report) showEcho('扫描本机 shell 失败：' + (e?.message || e), 'warn')
+    else console.warn('scanShells', e)
+  } finally {
+    shellScanning.value = false
+  }
+}
+
+function dotClass(site: api.Site) {
+  if (site.protocolType === 3) return 'local'
+  return site.protocolType === 0 ? 'tel' : 'ssh'
+}
+
+// shell 条目把协议列换成「shell」，比显示 “Local” 直观；名字空时退回路径末尾的程
+// 序名，避免侧栏只剩一个反斜杠串。
+function protoLabel(site: api.Site) { return site.protocolType === 3 ? 'shell' : api.PROTOCOLS[site.protocolType] }
+function siteLabel(site: api.Site) {
+  if (site.name) return site.name
+  if (site.protocolType === 3) return String(site.host || '').split(/[\\/]/).pop() || site.host
+  return site.host
+}
+
 function grouped(): { name: string; items: { site: api.Site; index: number }[] }[] {
   const map = new Map<string, { site: api.Site; index: number }[]>()
   sites.value.forEach((site, index) => {
@@ -382,23 +570,17 @@ function grouped(): { name: string; items: { site: api.Site; index: number }[] }
   return [...map.entries()].map(([name, items]) => ({ name, items }))
 }
 
-async function uploadFile() {
-  const t = insts[active.value]
-  if (!t || !t.id) return
-  try {
-    const picked = await Dialogs.OpenFile({ Title: '选择要发送的文件', CanChooseFiles: true, AllowsMultipleSelection: true })
-    if (!picked) return
-    const paths = Array.isArray(picked) ? picked : [picked]
-    await api.SendFile(t.id, paths)
-  } catch { /* cancelled or unsupported */ }
-}
+// 工具栏不再放「上传」按钮：BBS 的上传由对端跑 sz 触发，收到 ZRQINIT 后
+// zmodemEngine.promptUploadFiles 会自己弹原生选文件框，手动入口反而容易误操作。
 
-let offData: () => void, offStatus: () => void, offZ: () => void
+let offData: () => void, offStatus: () => void, offZ: () => void, offMode: (() => void) | undefined
 
 onMounted(async () => {
   prefs.value = await api.GetPreferences()
   await refreshSites()
   schemes.value = await api.ListSchemes()
+  // 首次扫描放后台：WSL 探针最长要 3 秒，不能让它挡在第一帧之前。扫完自动刷新列表。
+  void scanShells(false)
 
   offData = api.onTermData((d) => { byId.get(d.id)?.write(d.data) })
   offStatus = api.onTermStatus((d) => {
@@ -442,11 +624,24 @@ onMounted(async () => {
   window.addEventListener('resize', onWinResize)
   window.addEventListener('blur', onWindowBlur)
   try { applyKeymap(await api.GetKeymap()) } catch { /* 读不到就用出厂默认表 */ }
+  try { gk.value = await api.GetGlobalKeys() } catch { /* 全局表读不到不影响应用内绑定 */ }
   window.addEventListener('keydown', onGlobalKey, true)
   Window.IsMaximised().then((v) => { isMax.value = v }).catch(() => {})
+
+  // 窗口形态：先拉一次快照，再订阅后端变更（全局热键与托盘都会广播）。
+  // 从 quake 热键呼出时 webview 可能刚从隐藏中恢复，终端需要一次重新 fit + 聚焦，
+  // 否则看上去是一片旧尺寸、且键盘输入没落到终端里。
+  try { winMode.value = await api.GetWindowMode() } catch { /* 保持默认 */ }
+  offMode = api.onWindowMode((d) => {
+    const wasVisible = winMode.value.visible
+    winMode.value = d
+    if (d.visible && !wasVisible) {
+      nextTick(() => { const t = insts[active.value]; if (t) { t.fitNow(); t.focus() } })
+    }
+  })
 })
 
-onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
+onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
 
 function onWinResize() {
   insts[active.value]?.fitNow()
@@ -469,20 +664,35 @@ const activeScheme = computed({
   },
 })
 
-async function savePrefs(p: api.Preferences) { await api.SetPreferences(p); prefs.value = p; prefsDlg.show = false }
+async function savePrefs(p: api.Preferences) {
+  await api.SetPreferences(p)
+  prefs.value = p
+  prefsDlg.show = false
+  // 托盘显隐等原生侧设置需要推给 AppService 重放
+  await api.ApplyAppPreferences().catch(() => { /* 不影响偏好已保存 */ })
+}
 
 const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value], inst: insts[active.value] } : null))
 </script>
 
 <template>
-  <div class="app">
-    <div class="toolbar">
+  <div class="app" :class="{ quake: isQuake }">
+    <div class="topbar">
       <span class="brand">FTRW</span>
       <button @click="toggleSidebar" :title="sidebarShown ? '隐藏站点栏（Alt+X P）' : '显示站点栏（Alt+X P，或鼠标移到窗口左缘）'">☰ 站点</button>
       <button @click="openQuickConnect" title="新建连接">＋ 连接</button>
-      <button @click="uploadFile" :disabled="active < 0" title="ZMODEM 发送文件">⇧ 上传</button>
       <button @click="closeTab(active)" :disabled="active < 0" title="关闭当前标签">✕ 断开</button>
+      <!-- 标签页跟工具栏共用一行：多一个会话就少不了一行高，窄屏下标签区自己滚动 -->
+      <div class="tabs" v-if="tabs.length">
+        <div v-for="(t, i) in tabs" :key="i" class="tab" :class="{ on: i === active }" @click="setActive(i)">
+          <span class="tdot" :class="t.status"></span>
+          <span class="ttitle" :title="t.title">{{ t.title }}</span>
+          <span class="tclose" @click.stop="closeTab(i)">✕</span>
+        </div>
+      </div>
       <div class="spacer" />
+      <button @click="toggleWindowMode()" :class="{ 'mode-on': isQuake }"
+              :title="isQuake ? '回到普通窗口（M-x M-q）' : '切到 quake 下拉窗口（M-x M-q / 全局 Alt+`）'">{{ isQuake ? '▾ quake' : '▢ 普通' }}</button>
       <select v-model="activeScheme" :disabled="active < 0" title="配色方案">
         <option v-for="s in schemes" :key="s.name" :value="s.name">{{ s.name }}</option>
       </select>
@@ -491,8 +701,8 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       <button @click="prefsDlg.show = true" title="偏好设置">⚙ 设置</button>
       <div class="wctl">
         <button class="wc" @click="winMin" title="最小化">&#8722;</button>
-        <button class="wc" @click="winToggleMax" :title="isMax ? '还原' : '最大化'">{{ isMax ? '❐' : '□' }}</button>
-        <button class="wc wc-close" @click="winClose" title="关闭">&#10005;</button>
+        <button class="wc" @click="winToggleMax" v-if="!isQuake" :title="isMax ? '还原' : '最大化'">{{ isMax ? '❐' : '□' }}</button>
+        <button class="wc wc-close" @click="winClose" :title="prefs?.closeToTray ? '收起至托盘' : '关闭'">&#10005;</button>
       </div>
     </div>
 
@@ -503,36 +713,36 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
            @keydown="onSidebarKey">
         <div class="side-head">
           <span>站点管理<i class="tip">↑↓ 选择 · Enter 连接</i></span>
-          <button class="mini" @click="openSiteEditor(-1)">＋</button>
+          <span class="head-acts">
+            <button class="mini" :disabled="shellScanning" title="扫描本机 Shell（CMD / PowerShell / Git Bash / WSL）"
+                    @click="scanShells(true)">{{ shellScanning ? '…' : '⟳' }}</button>
+            <button class="mini" title="新建站点" @click="openSiteEditor(-1)">＋</button>
+          </span>
         </div>
         <div class="tree">
           <div v-for="g in grouped()" :key="g.name" class="group">
-            <div class="group-name">{{ g.name }}</div>
+            <div class="group-name" :class="{ shell: g.name === api.SHELL_GROUP }"
+                 :title="g.name === api.SHELL_GROUP ? '启动时自动扫描本机生成，可自行编辑或删除' : ''">
+              {{ g.name === api.SHELL_GROUP ? 'shell · 本机' : g.name }}
+            </div>
             <div v-for="it in g.items" :key="it.index" class="site"
                  :data-idx="it.index" :tabindex="sidebarShown ? 0 : -1"
                  @dblclick="newTab(it.site)"
                  @contextmenu.prevent="openSiteEditor(it.index)">
-              <span class="dot" :class="it.site.protocolType === 0 ? 'tel' : 'ssh'"></span>
-              <span class="sname">{{ it.site.name || it.site.host }}</span>
-              <span class="sproto">{{ api.PROTOCOLS[it.site.protocolType] }}</span>
+              <span class="dot" :class="dotClass(it.site)"></span>
+              <span class="sname">{{ siteLabel(it.site) }}</span>
+              <span class="sproto">{{ protoLabel(it.site) }}</span>
               <span class="acts">
                 <button class="mini" @click.stop="openSiteEditor(it.index)">✎</button>
                 <button class="mini" @click.stop="removeSite(it.index)">🗑</button>
               </span>
             </div>
           </div>
-          <div v-if="!sites.length" class="empty">暂无站点，点击左上「＋」添加</div>
+          <div v-if="!sites.length" class="empty">暂无站点，点左上「＋」新建，或点「⟳」扫描本机 Shell</div>
         </div>
       </div>
 
       <div class="main">
-        <div class="tabbar" v-if="tabs.length">
-          <div v-for="(t, i) in tabs" :key="i" class="tab" :class="{ on: i === active }" @click="setActive(i)">
-            <span class="tdot" :class="t.status"></span>
-            <span class="ttitle" :title="t.title">{{ t.title }}</span>
-            <span class="tclose" @click.stop="closeTab(i)">✕</span>
-          </div>
-        </div>
         <div class="viewport" ref="viewport" />
         <div v-if="!tabs.length" class="welcome">
           <h2>FTRW · Wails 3</h2>
@@ -561,19 +771,28 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
     <SchemeDialog v-if="schemeDlg.show" :schemes="schemes" @close="schemeDlg.show = false"
                   @changed="async () => { schemes = await api.ListSchemes(); applySchemeToActive() }" />
     <ZmodemDialog v-if="zm.show" :info="zm" @cancel="onZmCancel" @close="zm.show = false" />
-    <KeymapDialog v-if="kmDlg.show" :km="km" @save="onKeymapSave" @close="kmDlg.show = false" />
+    <KeymapDialog v-if="kmDlg.show" :km="km" :gk="gk" @save="onKeymapSave" @close="kmDlg.show = false" />
   </div>
 </template>
 
 <style scoped>
 .app { display: flex; flex-direction: column; height: 100%; width: 100%; overflow: hidden; background: #1b1d22; color: #c8ccd4; font-family: system-ui, "Segoe UI", sans-serif; }
-.toolbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #24272e; border-bottom: 1px solid #33373f; --wails-draggable: drag; }
-.toolbar button, .toolbar select, .wctl { --wails-draggable: no-drag; }
+.topbar { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #24272e; border-bottom: 1px solid #33373f; --wails-draggable: drag; }
+.topbar button, .topbar select, .topbar .wctl, .topbar .tabs { --wails-draggable: no-drag; }
+/* 右侧控件不参与收缩：标签再多也只能挤压标签区自己滚动，不能把关闭/最小化按钮顶出窗口 */
+.topbar > button, .topbar > select, .topbar .wctl { flex: 0 0 auto; }
 .brand { font-weight: 700; color: #6ab0f3; margin-right: 12px; letter-spacing: 1px; }
-.toolbar button, .toolbar select { background: #2f333b; color: #c8ccd4; border: 1px solid #3d424b; border-radius: 5px; padding: 4px 10px; cursor: pointer; font-size: 13px; }
-.toolbar button:hover:not(:disabled) { background: #3a3f49; }
-.toolbar button:disabled { opacity: .4; cursor: default; }
-.spacer { flex: 1; }
+.topbar button, .topbar select { background: #2f333b; color: #c8ccd4; border: 1px solid #3d424b; border-radius: 5px; padding: 4px 10px; cursor: pointer; font-size: 13px; }
+.topbar button:hover:not(:disabled) { background: #3a3f49; }
+.topbar button:disabled { opacity: .4; cursor: default; }
+/* quake 模式下的形态开关高亮：窗口已是置顶下拉，需要一眼看出当前形态 */
+.topbar button.mode-on { background: #2f74c0; border-color: #2f74c0; color: #fff; }
+.spacer { flex: 1; min-width: 6px; }
+/* quake：合成一行后把这一行整条放到窗口最下面，终端从屏幕顶部垂下来；
+   状态条夹在中间，两道上边框把三层分开。靠 flex order 实现，不搬 DOM。*/
+.app.quake .body { order: 1; }
+.app.quake .statusbar { order: 2; }
+.app.quake .topbar { order: 3; border-bottom: none; border-top: 1px solid #33373f; }
 .wctl { display: flex; gap: 2px; margin-left: 8px; }
 .wctl .wc { width: 32px; height: 26px; padding: 0; line-height: 1; font-size: 14px; border-radius: 4px; background: transparent; border: 1px solid transparent; color: #c8ccd4; }
 .wctl .wc:hover { background: #3a3f49 !important; border-color: #3d424b; }
@@ -583,14 +802,16 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 .sidebar { position: absolute; left: 0; top: 0; bottom: 0; width: 260px; z-index: 20; background: #202329f2; border-right: 1px solid #33373f; box-shadow: 6px 0 18px rgba(0, 0, 0, .45); display: flex; flex-direction: column; transform: translateX(-260px); transition: transform .16s ease-out; outline: none; }
 .side-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; font-size: 12px; color: #8a919e; border-bottom: 1px solid #2c2f36; }
 .side-head .tip { font-style: normal; margin-left: 8px; color: #5d6472; font-size: 11px; }
+.head-acts { display: flex; gap: 2px; }
 .tree { overflow-y: auto; flex: 1; }
 .group-name { padding: 6px 10px 2px; font-size: 12px; color: #6a7180; font-weight: 600; }
+.group-name.shell { color: #d7b45a; }
 .site { display: flex; align-items: center; gap: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; border-radius: 4px; margin: 1px 4px; }
 .site:focus { background: #2f3644; outline: 1px solid #4a6b96; outline-offset: -1px; }
 .site:focus .sname { color: #fff; }
 .site:hover { background: #2b2f37; }
 .dot { width: 8px; height: 8px; border-radius: 50%; }
-.dot.tel { background: #4ec9b0; } .dot.ssh { background: #6ab0f3; }
+.dot.tel { background: #4ec9b0; } .dot.ssh { background: #6ab0f3; } .dot.local { background: #d7b45a; }
 .sname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sproto { font-size: 11px; color: #6a7180; }
 .acts { display: none; gap: 2px; } .site:hover .acts { display: flex; }
@@ -598,9 +819,11 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 .mini:hover { color: #fff !important; }
 .empty { padding: 20px; text-align: center; color: #555a64; font-size: 12px; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
-.tabbar { display: flex; background: #202329; border-bottom: 1px solid #33373f; overflow-x: auto; }
-.tab { display: flex; align-items: center; gap: 6px; padding: 6px 12px; cursor: pointer; border-right: 1px solid #2c2f36; font-size: 13px; max-width: 200px; }
-.tab.on { background: #1b1d22; color: #fff; }
+/* 标签 chips 内联在工具栏行里：只占自己需要的宽度，不够就横向滚动 */
+.tabs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+.tab { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; max-width: 180px; padding: 3px 8px; font-size: 13px; cursor: pointer; background: #2f333b; color: #b5bac4; border: 1px solid #3d424b; border-radius: 5px; }
+.tab:hover { background: #3a3f49; }
+.tab.on { background: #1b1d22; border-color: #4a6b96; color: #fff; }
 .tab .ttitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tdot { width: 8px; height: 8px; border-radius: 50%; background: #d0d0d0; }
 .tdot.connected { background: #57d25a; } .tdot.connecting { background: #e0b341; } .tdot.error { background: #e05c5c; } .tdot.closed { background: #777; }

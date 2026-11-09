@@ -9,9 +9,8 @@ import (
 	"sync"
 )
 
-// localConn runs the user's interactive shell as a "Local" session. It uses
-// plain pipes (no PTY), which is adequate for cmd.exe on Windows and a basic
-// shell on POSIX systems.
+// localConn 把交互 shell 接成一路 “Local” 会话：普通管道，没有 PTY。
+// 这只用在非 Windows 系统上；Windows 侧必须走 ConPTY，见 conpty_windows.go。
 type localConn struct {
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
@@ -19,22 +18,31 @@ type localConn struct {
 	one   sync.Once
 }
 
-func newLocalShell() (protoConn, error) {
-	var cmd *exec.Cmd
+// newLocalShell 起一个本地 shell 会话，具体怎么接终端由平台决定。
+//
+// Windows 交给 ConPTY：管道下 bash/pwsh 发现 stdin 不是 TTY 会关掉 readline（敲字不回显，
+// 看着像卡死），cmd 也没有方向键和 Tab 补全；ConPTY 让 conhost 在中间充当终端驱动，
+// 顺便把输出统一成 UTF-8。其它平台继续用管道。
+func newLocalShell(site Site) (protoConn, error) {
 	if runtime.GOOS == "windows" {
-		shell := os.Getenv("COMSPEC")
-		if shell == "" {
-			shell = "cmd.exe"
-		}
-		cmd = exec.Command(shell)
-	} else {
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		cmd = exec.Command(shell, "-i")
+		return newConptyShell(site)
 	}
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	return newPipeShell(site)
+}
+
+// newPipeShell 按站点配置起 shell，两边接管道。
+func newPipeShell(site Site) (protoConn, error) {
+	argv := shellArgv(site)
+	// 老配置里没有 shellArgs，而 POSIX 的 bash/zsh 不带 -i 会把_pipe_ 当脚本读到 EOF 就退，
+	// 给它们补上交互开关。
+	if len(argv) == 1 {
+		argv = append(argv, interactiveArgs(exeBase(argv[0]))...)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	if dir := shellWorkingDir(); dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = envWithTerm()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

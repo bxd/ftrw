@@ -28,13 +28,14 @@
  *     以免半个序列漏进 BBS 命令行。
  *
  * ── 与终端共存 ────────────────────────────────────────────────────────
- *   默认绑定表只占一条序列（M-x p → 显示/隐藏浮动站点栏），其余按键照常透传远端。
- *   scope='terminal' 的绑定只在终端有焦点时由 xterm 的 customKeyEventHandler 拦截；
- *   scope='global' 的绑定由 window 捕获阶段的 keydown 拦截（此时终端不会收到该键）。
+ *   整张绑定表都是「应用内」的：只要本应用窗口有焦点就生效，不管焦点在终端、工具栏还是
+ *   站点栏，两个入口共用同一棵树：
+ *     · 焦点在终端 → xterm 的 customKeyEventHandler 调 feed
+ *     · 焦点在窗口其它位置 → window 捕获阶段的 keydown 调 feed（正在往输入框打字时不拦）
+ *   系统级（跨应用）热键是另一套东西，由后端 AppService 注册，不在这张表里。
  */
 import type { KeyBinding } from './api'
 
-export type Scope = 'terminal' | 'global'
 /** feed 的结论：swallow=已被框架消费（不透传终端），pass=交还正常输入 */
 export type Verdict = 'swallow' | 'pass'
 
@@ -229,14 +230,13 @@ class KeySeqEngine {
     this.emit('warn', `未注册的命令：${spec}`)
   }
 
-  // 两棵树：global 绑定同时入两棵（终端里也能用），terminal 绑定只入终端树，
-  // 这样焦点不在终端时绝不触发仅终端生效的绑定。
-  private trees: Record<Scope, KTNode> = { terminal: { kids: new Map() }, global: { kids: new Map() } }
+  // 单棵树：所有绑定都是应用内生效，不区分焦点位置。早先分成 terminal/global 两棵，
+  // 导致只要焦点不在终端里（比如刚点过工具栏按钮）应用内序列就全部失效。
+  private tree: KTNode = { kids: new Map() }
   private node: KTNode | null = null
   private typed: string[] = []
   private timer = 0
   private describeMode = false
-  private describeScope: Scope = 'terminal'
 
   /** 只改动传进来的字段：省略的字段保持现值，否则“只想翻转开关”会默默把超时打回默认。 */
   configure(cfg: { enabled?: boolean; timeoutMs?: number; echo?: boolean }) {
@@ -248,18 +248,16 @@ class KeySeqEngine {
     if (!this.enabled) this.cancel('热键序列已停用')
   }
 
-  /** 重建整张绑定表（幂等，重复序列后写覆盖先写）。 */
+  /** 重建绑定树（幂等，重复序列后写覆盖先写）。 */
   load(list: KeyBinding[]) {
-    this.trees = { terminal: { kids: new Map() }, global: { kids: new Map() } }
+    this.tree = { kids: new Map() }
     this.cancel('')
     for (const b of list || []) {
       if (!b || !b.keys || !b.command) continue
       if (b.enabled === false) continue
       const { tokens, error } = parseSeq(b.keys)
       if (error) continue // 由绑定表界面负责提示
-      const scope: Scope = b.scope === 'global' ? 'global' : 'terminal'
-      this.insert(this.trees[scope], tokens, b)
-      if (scope === 'global') this.insert(this.trees.terminal, tokens, b)
+      this.insert(this.tree, tokens, b)
     }
   }
 
@@ -290,29 +288,28 @@ class KeySeqEngine {
   startDescribe() {
     this.cancel('')
     this.describeMode = true
-    this.describeScope = 'terminal' // 查询用超集树（终端作用域含 global 绑定）
     this.emit('info', '请按下要查询的键')
   }
 
   /**
-   * 主入口。scope 指这次调用来自哪里（终端内 / 全局）。
-   * 返回 swallow 表示框架已消费该键，调用方必须阻止其抵达终端。
+   * 主入口。调用方是谁无关紧要（终端回调或 window 捕获），两边看到同一棵树、
+   * 共用同一份 pending 状态。返回 swallow 表示框架已消费该键，调用方必须阻止其抵达终端。
    */
-  feed(ev: KeyboardEvent, scope: Scope): Verdict {
+  feed(ev: KeyboardEvent): Verdict {
     if (!this.enabled) return 'pass'
     const tok = eventToken(ev)
     if (!tok) return 'pass' // 单纯按 Ctrl/Alt/Shift 不影响序列
 
     if (this.describeMode) {
       this.describeMode = false
-      const r = this.lookupFrom(this.trees[this.describeScope], tok)
+      const r = this.lookupFrom(this.tree, tok)
       if (r.kind === 'match' && r.binding) this.emit('info', `${tok} → ${r.binding.command}`)
       else if (r.kind === 'prefix') this.emit('info', `${tok} 是前缀（后续还有绑定）`)
       else this.emit('info', `${tok} 未绑定`)
       return 'swallow'
     }
 
-    const from = this.node || this.trees[scope]
+    const from = this.node || this.tree
     const r = this.lookupFrom(from, tok)
     if (r.kind === 'none') {
       if (this.node) {
@@ -376,7 +373,7 @@ class KeySeqEngine {
   /** 查询某个序列当前绑到什么（describe-key / 编辑界面用）。 */
   findBinding(seq: string): KeyBinding | undefined {
     const { tokens } = parseSeq(seq)
-    let n = this.trees.terminal
+    let n = this.tree
     for (const t of tokens) {
       const k = n.kids.get(cacheKey(t))
       if (!k) return undefined
@@ -388,7 +385,7 @@ class KeySeqEngine {
   /** 节点是否为前缀（有子但没有命令）。 */
   isPrefix(seq: string): boolean {
     const { tokens } = parseSeq(seq)
-    let n = this.trees.terminal
+    let n = this.tree
     for (const t of tokens) {
       const k = n.kids.get(cacheKey(t))
       if (!k) return false
@@ -398,7 +395,7 @@ class KeySeqEngine {
   }
 }
 
-/** 全局单例：终端与全局两个入口共用同一 pending 状态（Emacs 的 unread events 语义）。 */
+/** 全局单例：终端与窗口两个入口共用同一 pending 状态（Emacs 的 unread events 语义）。*/
 export const keyseq = new KeySeqEngine()
 
 /* --------------------------------------------------------------------------- */
