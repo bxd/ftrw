@@ -141,3 +141,43 @@ func (cs *ConfigService) DeleteScheme(name string) error {
 	cs.store.mu.Unlock()
 	return cs.store.saveJSON("schemes.json", out)
 }
+
+// --- Keymap (Emacs-style key sequences) ---
+
+// GetKeymap returns the persisted key table. Sequence syntax is parsed on the
+// frontend, so the backend only guarantees sane numeric bounds and a non-nil slice.
+func (cs *ConfigService) GetKeymap() KeymapConfig {
+	cs.store.mu.RLock()
+	defer cs.store.mu.RUnlock()
+	return normalizeKeymap(cs.store.Keymap)
+}
+
+// DefaultKeymap exposes the factory table so the editor's「清空为出厂状态」button
+// can rebuild it without duplicating the binding list on the frontend.
+func (cs *ConfigService) DefaultKeymap() KeymapConfig { return normalizeKeymap(DefaultKeymap()) }
+
+func (cs *ConfigService) SaveKeymap(km KeymapConfig) error {
+	km = normalizeKeymap(km)
+	cs.store.mu.Lock()
+	cs.store.Keymap = km
+	cs.store.mu.Unlock()
+	return cs.store.SaveKeymap()
+}
+
+func normalizeKeymap(km KeymapConfig) KeymapConfig {
+	if km.TimeoutMs < 200 || km.TimeoutMs > 10000 {
+		km.TimeoutMs = 1000
+	}
+	out := make([]KeyBinding, 0, len(km.Bindings))
+	for _, b := range km.Bindings {
+		if b.Keys == "" || b.Command == "" {
+			continue // 残缺条目（手改文件）直接丢弃，不让它遮蔽其他序列
+		}
+		if b.Scope != "global" {
+			b.Scope = "terminal"
+		}
+		out = append(out, b)
+	}
+	km.Bindings = out
+	return km
+}

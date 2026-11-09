@@ -7,11 +7,11 @@
 		"0409": {
 			"FileVersion": "0.1.0",
 			"ProductVersion": "0.1.0",
-			"CompanyName": "FQTerm",
+			"CompanyName": "FTRW",
 			"FileDescription": "Telnet/SSH BBS Terminal",
-			"LegalCopyright": "© 2026, My Company",
-			"ProductName": "FQTerm",
-			"Comments": "This is a comment"
+			"LegalCopyright": "© 2026, FTRW",
+			"ProductName": "FTRW",
+			"Comments": "FQTerm rewrite on Wails 3"
 		}
 	}
 }

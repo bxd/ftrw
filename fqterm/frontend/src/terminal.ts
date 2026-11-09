@@ -6,6 +6,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import * as api from './api'
+import { keyseq } from './keyseq'
 
 /**
  * 中英分别字体：xterm.js 只有一个 fontFamily，但 CSS 字体栈是按字符逐个回退的
@@ -31,7 +32,7 @@ export function lineHeightOf(fontSize: number, lineSpacing: number): number {
   return Math.max(0.8, Math.min(3, 1 + (lineSpacing || 0) / fs))
 }
 
-const AA_STYLE_ID = 'fqterm-font-smoothing'
+const AA_STYLE_ID = 'ftrw-font-smoothing'
 
 /** 抗锯齿开关：xterm 5.5 默认 DOM 渲染器，字符是真实 DOM 文本，CSS 可直接控制。 */
 function ensureAAStyle() {
@@ -102,6 +103,18 @@ export class TermTab {
     this.term.open(container)
     this.applyScheme(null)
     this.applyAntiAlias()
+
+    // Emacs 式键序列：命中绑定就吞掉该键（不发往远端），未命中一律透传给终端。
+    // 吞键时还要顶掉浏览器的默认行为：否则 xterm 自己不处理，由“普通字母”开头的
+    // 前缀（如绑定了 `x y` 后按下的 x）会被浏览器写进辅助 textarea，漏进远端输入。
+    this.term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== 'keydown') return true
+      if (keyseq.feed(ev as KeyboardEvent, 'terminal') === 'swallow') {
+        ev.preventDefault()
+        return false
+      }
+      return true
+    })
 
     // User input -> backend
     this.term.onData((data) => {

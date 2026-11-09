@@ -72,6 +72,23 @@ export interface SessionInfo {
   host: string
 }
 
+// ---- Keymap (Emacs 风格键序列) ----
+
+export interface KeyBinding {
+  keys: string      // 序列表示法：“C-x C-f”、“C-c <ESC> o”
+  command: string   // 命令 id（可用 "id:参数"）
+  scope: string     // 'terminal' | 'global'
+  enabled: boolean
+  note: string
+}
+
+export interface KeymapConfig {
+  enabled: boolean
+  timeoutMs: number
+  echo: boolean
+  bindings: KeyBinding[]
+}
+
 // ---- Config service ----
 
 const cfg = 'main.ConfigService'
@@ -87,6 +104,9 @@ export const ListSchemes = (): Promise<ColorScheme[]> => Call.ByName(`${cfg}.Lis
 export const SaveScheme = (s: ColorScheme): Promise<void> => Call.ByName(`${cfg}.SaveScheme`, s)
 export const DeleteScheme = (name: string): Promise<void> => Call.ByName(`${cfg}.DeleteScheme`, name)
 export const ListSystemFonts = (): Promise<string[]> => Call.ByName(`${cfg}.ListSystemFonts`)
+export const GetKeymap = (): Promise<KeymapConfig> => Call.ByName(`${cfg}.GetKeymap`)
+export const DefaultKeymap = (): Promise<KeymapConfig> => Call.ByName(`${cfg}.DefaultKeymap`)
+export const SaveKeymap = (km: KeymapConfig): Promise<void> => Call.ByName(`${cfg}.SaveKeymap`, km)
 
 // ---- Terminal service ----
 

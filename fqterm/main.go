@@ -26,7 +26,7 @@ func main() {
 	terminalService := NewTerminalService(store)
 
 	app := application.New(application.Options{
-		Name:        "FQTerm",
+		Name:        "FTRW",
 		Description: "Telnet/SSH BBS Terminal (Wails 3 rewrite)",
 		Services: []application.Service{
 			application.NewService(configService),
@@ -41,7 +41,7 @@ func main() {
 	})
 
 	app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "FQTerm - BBS 终端",
+		Title:            "FTRW - BBS 终端",
 		Width:            1120,
 		Height:           720,
 		Frameless:        true,

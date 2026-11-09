@@ -62,6 +62,48 @@ type Preferences struct {
 	ConfirmClose       bool   `json:"confirmClose"`
 }
 
+// KeyBinding maps an Emacs-style key sequence to a command id. Parsing and
+// matching happen entirely on the frontend (see frontend/src/keyseq.ts for the
+// notation grammar); the backend only persists the table.
+type KeyBinding struct {
+	Keys    string `json:"keys"`    // 序列：“C-x C-f”、“C-c <ESC> o”
+	Command string `json:"command"` // 命令 id
+	Scope   string `json:"scope"`   // "terminal"（仅终端获得焦点时拦截）/ "global"；留空视为 terminal
+	Enabled bool   `json:"enabled"`
+	Note    string `json:"note"` // 备注（可选，仅供绑定表展示）
+}
+
+// KeymapConfig is the whole keymap file (keybindings.json).
+type KeymapConfig struct {
+	Enabled   bool         `json:"enabled"`   // 总开关
+	TimeoutMs int          `json:"timeoutMs"` // 前缀后等待续键的超时
+	Echo      bool         `json:"echo"`      // 在状态区回显已按下的序列
+	Bindings  []KeyBinding `json:"bindings"`
+}
+
+// DefaultKeymap is the factory table: the framework ships enabled but claims
+// only the sequences whose features actually expect a floating, overlay UI
+// (the site sidebar), so ordinary typing still passes straight through to the BBS.
+// Users can rebind or unbind these in the keymap editor (⌨ 热键).
+func DefaultKeymap() KeymapConfig {
+	return KeymapConfig{
+		Enabled:   true,
+		TimeoutMs: 1000,
+		Echo:      true,
+		Bindings: []KeyBinding{
+			{
+				Keys:    "M-x p",
+				Command: "app.toggle-sidebar",
+				// Global scope: with the sidebar floating over the terminal, focus may
+				// sit on a toolbar button instead, and the hotkey must work either way.
+				Scope:   "global",
+				Enabled: true,
+				Note:    "显示/隐藏浮动态站点栏（也可把鼠标移到窗口左缘唤出）",
+			},
+		},
+	}
+}
+
 // ColorScheme defines terminal palette (16 ANSI colors + defaults).
 type ColorScheme struct {
 	Name       string     `json:"name"`
