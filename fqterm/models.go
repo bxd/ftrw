@@ -12,28 +12,33 @@ type Site struct {
 	AutoLogin    bool   `json:"autoLogin"`
 	UserName     string `json:"userName"`
 	Password     string `json:"password"`
-	PreLogin     string `json:"preLogin"`
-	PostLogin    string `json:"postLogin"`
+	// SSH 公钥认证：KeyFile 非空即走私钥（见 sshAuthFor），Passphrase 是私钥自己的口令，
+	// 可空。原版靠 ssh-agent 转发公钥，没有这两个字段；这里填了私钥就不再尝试密码认证。
+	KeyFile    string `json:"keyFile"`
+	Passphrase string `json:"passphrase"`
+	PreLogin   string `json:"preLogin"`
+	PostLogin  string `json:"postLogin"`
 
 	// Display / encoding
 	ServerEncodingID int    `json:"serverEncodingID"` // 0=GBK 1=BIG5 2=UTF8 3=HKSCS 4=UAO
 	ColorScheme      string `json:"colorScheme"`      // scheme name
 	FontName         string `json:"fontName"`         // 英文字体（原版 englishFontName_）
 	FontSize         int    `json:"fontSize"`
-	FontNameCJK      string `json:"fontNameCjk"` // 中文/宽字符字体（原版 otherFontName_）
-	CharSpacing      int    `json:"charSpacing"` // 英文字符额外字距 px（原版 charSpacing_）
-	LineSpacing      int    `json:"lineSpacing"` // 额外行距 px（原版 lineSpacing_）
-	AntiAlias        bool   `json:"antiAlias"`   // 抗锯齿（原版 global/antialias）
-	FontAutoFit      int    `json:"fontAutoFit"` // 0=随窗口改行列 1=随窗口改字号（原版默认）2=固定行列
-	UseANSIColor     bool   `json:"useAnsiColor"`
+	FontNameCJK      string `json:"fontNameCjk"`     // 中文/宽字符字体（原版 otherFontName_）
+	CharSpacing      int    `json:"charSpacing"`     // 英文字符额外字距 px（原版 charSpacing_）
+	LineSpacing      int    `json:"lineSpacing"`     // 额外行距 px（原版 lineSpacing_）
+	AntiAlias        bool   `json:"antiAlias"`       // 抗锯齿（原版 global/antialias）
+	FontAutoFit      int    `json:"fontAutoFit"`     // 0=随窗口改行列 1=随窗口改字号（原版默认）2=固定行列
+	UseANSIColor     bool   `json:"useAnsiColor"`    // 原版 isAnsiColor_：关掉则全画面退成黑白反相
+	AlwaysHighlight  bool   `json:"alwaysHighlight"` // 原版 isAlwaysHighlight_：所有前景色取调色板亮色半区
 
 	// Terminal
 	TermType   string `json:"termType"` // vtnt / xterm / vt100
-	KeyType    int    `json:"keyType"`  // 0=BBS 1=XTERM 2=VT100
+	KeyType    int    `json:"keyType"`  // 0=BBS 1=XTERM 2=VT100，生效处见 frontend/src/keymap.ts
 	NumColumns int    `json:"numColumns"`
 	NumRows    int    `json:"numRows"`
 	CursorType int    `json:"cursorType"` // 0=Block 1=Underline 2=I-Beam
-	Backspace  int    `json:"backspace"`  // 0=^H 1=^?
+	Backspace  int    `json:"backspace"`  // 0=^H 1=^?，同由 keymap.ts 消费
 
 	// Connection / misc
 	MaxIdleSeconds   int    `json:"maxIdleSeconds"`
@@ -44,6 +49,15 @@ type Site struct {
 	ReconnectRetries int    `json:"reconnectRetries"` // 重连重试次数；-1 = 无限（对齐原版 retryTimes_）
 	EnableZmodem     bool   `json:"enableZmodem"`
 	Group            string `json:"group"` // site manager folder/group
+
+	// 网络代理（D3）：站点级覆盖，编号沿用原版 fqterm.h 但含义多一档 ——
+	// 0=跟随全局设置（旧 sites.json 缺键即此，行为与升级前一致）、1=本站点强制直连、
+	// 2=SOCKS4 3=SOCKS5 4=HTTP（见 proxy.go）。地址为空等于不用代理。
+	ProxyType int    `json:"proxyType"`
+	ProxyHost string `json:"proxyHost"`
+	ProxyPort int    `json:"proxyPort"`
+	ProxyUser string `json:"proxyUser"`
+	ProxyPass string `json:"proxyPass"`
 
 	// Local shell（ProtocolType==3 专用）
 	// ShellID 是探测结果的稳定标识（cmd / pwsh / wsl:Ubuntu），补种与清理都靠它认人，
@@ -68,6 +82,21 @@ type Preferences struct {
 	OpenWarnOnClose    bool   `json:"openWarnOnClose"`
 	ScrollbackLines    int    `json:"scrollbackLines"`
 	ConfirmClose       bool   `json:"confirmClose"`
+	MenuClickEnabled   bool   `json:"menuClickEnabled"` // 鼠标点 BBS 菜单/清单（原版 detectPageState + processLClick）
+
+	// IP 归属地（原版 openUrlCheck_ + qqwry.dat）：悬停命中屏幕上的 IPv4 就查本地纯真库。
+	// IPLocationDb 空则用自动下载落点（配置目录）；IPLocationUrl 空则用内置镜像地址。
+	IPLocationEnabled bool   `json:"ipLocationEnabled"` // 总开关，关掉就不再扫屏幕也不会下库
+	IPLocationDb      string `json:"ipLocationDb"`      // qqwry.dat 路径或所在目录，可空
+	IPLocationUrl     string `json:"ipLocationUrl"`     // 自定义库下载地址，可空
+
+	// 网络代理（D3）：全局一份，站点可按 proxyForSite 覆盖。它同时管住终端连接
+	// （telnet/ssh）与两条 HTTP 出路（IP 库下载、链接预览）。
+	ProxyType int    `json:"proxyType"` // 0=不用代理 2=SOCKS4 3=SOCKS5 4=HTTP
+	ProxyHost string `json:"proxyHost"`
+	ProxyPort int    `json:"proxyPort"` // 0 时按类型补默认端口（见 proxyDefaultPort）
+	ProxyUser string `json:"proxyUser"` // 留空即不做认证
+	ProxyPass string `json:"proxyPass"`
 
 	// 窗口形态：普通窗口与 quake 下拉共用同一个 HWND，只切换几何与置顶策略。
 	// 下拉尺寸按工作区（已扣除任务栏）的百分比给，因此换显示器、改缩放比都自动适配。
@@ -243,6 +272,9 @@ func DefaultSite() Site {
 		AntiAlias:    true,
 		FontAutoFit:  1,
 		UseANSIColor: true,
+		// 总是高亮默认关（原版 fqterm_param.cpp:22 isAlwaysHighlight_=0）：开着会把整屏前景
+		// 抬到亮色半区，水木那种已经用亮色的版面会过曝，所以留给用户自己选。
+		AlwaysHighlight: false,
 	}
 }
 
@@ -262,10 +294,15 @@ func defaultPreferences() Preferences {
 		OpenWarnOnClose:    false,
 		ScrollbackLines:    2000,
 		ConfirmClose:       true,
-		QuakeWidthPct:      100,
-		QuakeHeightPct:     40,
-		QuakeHideOnBlur:    true,
-		TrayEnabled:        true,
-		CloseToTray:        false,
+		// 点菜单默认开着：判定只在悬停已命中（手型光标 + 整行高亮）时才响应点击，
+		// 判错的表现只是「这一点没反应」，不会把按键误发给 BBS。
+		MenuClickEnabled: true,
+		// IP 归属地默认开着：没库时只会静默地去下一次，不会往屏幕上弹东西。
+		IPLocationEnabled: true,
+		QuakeWidthPct:     100,
+		QuakeHeightPct:    40,
+		QuakeHideOnBlur:   true,
+		TrayEnabled:       true,
+		CloseToTray:       false,
 	}
 }

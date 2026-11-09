@@ -58,14 +58,30 @@ function trimURL(raw: string): string {
   return u
 }
 
-/** 从一行（或任意一段）文本里取出 URL，保持出现顺序。 */
-export function extractURLs(text: string): string[] {
-  const out: string[] = []
+/** 一行文本里的 URL，带列区间。区间是给「点在哪」用的，清单只用地址本身。 */
+function urlMatches(text: string): Array<{ url: string; start: number; end: number }> {
+  const out: Array<{ url: string; start: number; end: number }> = []
   for (const m of text.matchAll(URL_RE)) {
     const u = trimURL(m[0])
-    if (u.length > 'https://'.length) out.push(u)
+    if (u.length > 'https://'.length) out.push({ url: u, start: m.index, end: m.index + u.length })
   }
   return out
+}
+
+/** 从一行（或任意一段）文本里取出 URL，保持出现顺序。 */
+export function extractURLs(text: string): string[] {
+  return urlMatches(text).map((m) => m.url)
+}
+
+/**
+ * 一行文本里所有 URL 的 [起, 止) 列区间。
+ *
+ * 鼠标点菜单要靠它避让：URL 字符全在 ASCII 内（宽度 1），所以区间下标就是终端的
+ * 显示列，能跟 menuclick.ts 的单元格坐标直接比。点在链接上应当开链接，
+ * 不该被当成菜单项。
+ */
+export function extractURLSpans(text: string): Array<[number, number]> {
+  return urlMatches(text).map((m) => [m.start, m.end])
 }
 
 function extOf(u: string): string {
@@ -124,6 +140,72 @@ export function scanLines(lines: string[]): PreviewItem[] {
     }
   }
   return out
+}
+
+/* ---------------- IPv4 采集（IP 归属地查询的输入端） ---------------- */
+
+// 地址样式：四段，数字段严格 0-255。打码写法 `[xX*]` 两种都认（* 与 x），而且
+// 任何一段都可以是打码（水木末段打码 202.38.64.*，也有站端打中间段 114.242.*.*、
+// 或者用 x 写成 114.242.x.x）；但头一段必须是数字，不然 *.*.*.* 这种问不出东西的
+// 也会进来。只认一种的结果就是鼠标停在地址上什么也不弹，而用户无从知道为什么不弹。
+// 左右各加一道「邻居不能是数字或点」的护栏：不这样就会从 1.2.3.4.5 里抠出
+// 一个看起来很合法的 1.2.3.4，报出一个根本不存在的归属地。
+//
+// 字节段写成字面量再拿 .source 组合，不直接拼字符串：`'\d'` 在 JS 字符串里会把
+// 反斜杠丢掉、只剩一个 d（这个坑很阴：拼错了照样能编译、能跑，就是永远匹配不上）。
+const OCT_RE = /25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d/
+const MASK = '[xX*]'
+const IP_RE = new RegExp(
+  `(?<![\\d.])(${OCT_RE.source})\\.(?:${OCT_RE.source}|${MASK})\\.(?:${OCT_RE.source}|${MASK})\\.(?:${OCT_RE.source}|${MASK})(?![\\d.])`,
+  'g',
+)
+
+/**
+ * 一行文本里所有 IPv4 的 [起, 止) 列区间（跟 extractURLSpans 同形）。
+ *
+ * 地址只含 ASCII，宽度必为 1，所以下标就是终端的显示列，能跟 menuclick.ts 的
+ * 单元格坐标直接比。
+ */
+export function extractIPSpans(text: string): Array<[number, number]> {
+  const out: Array<[number, number]> = []
+  for (const m of text.matchAll(IP_RE)) out.push([m.index, m.index + m[0].length])
+  return out
+}
+
+/** 某列上正好压着的 IPv4 及其起始列（浮层要按地址开头对齐，不是按鼠标所在列）。 */
+export function ipSpanAt(text: string, col: number): { text: string; start: number } | null {
+  for (const m of text.matchAll(IP_RE)) {
+    if (col >= m.index && col < m.index + m[0].length) return { text: m[0], start: m.index }
+  }
+  return null
+}
+
+/** 某列上正好压着的 IPv4 文本；不在地址上就返空串。 */
+export function ipTextAt(text: string, col: number): string {
+  return ipSpanAt(text, col)?.text ?? ''
+}
+
+// 主机名（域名）样式。写成字面量再拿 .source 组合，同 IP_RE（字符串里的
+// '\d'、'\w' 会丢反斜杠，vue-tsc 一声不响，结果就是正则永远匹配不上）。
+// 要点：至少两段，最后一段必须命中常见顶级域名单。不这么收敛会在 BBS 正文里
+// 把 att.php / index.html / xterm.js / main.go 这些文件名当成域名，鼠标扫过去弹一排
+// 查不到的红字。名单拿不准时宁可漏，不要误判。
+const HOST_LABEL_RE = /[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/
+const HOST_TLD_RE = /net|com|org|cn|edu|gov|io|cc|me|info|biz|tv|name|us|uk|jp|hk|tw|sg|co|xyz|top|vip|club|site|online|tech|app|int|mil|museum|ac/
+const HOST_RE = new RegExp(
+  `(?<![\\w.\\-])(${HOST_LABEL_RE.source}(?:\\.${HOST_LABEL_RE.source})*\\.(?:${HOST_TLD_RE.source}))(?![\\w.\\-])`,
+  'g',
+)
+
+/**
+ * 某列上正好压着的主机名。域名要发一次 DNS 才知道归属地，所以只在两种场合用：
+ * 悬停（有 5 分钟前端的缓存与后端 DNS 缓存兜着）与主动点击。
+ */
+export function hostSpanAt(text: string, col: number): { text: string; start: number } | null {
+  for (const m of text.matchAll(HOST_RE)) {
+    if (col >= m.index && col < m.index + m[0].length) return { text: m[0], start: m.index }
+  }
+  return null
 }
 
 /** 只保留媒体项（图片/音频/视频）：网页不参与「上一个 / 下一个」。 */

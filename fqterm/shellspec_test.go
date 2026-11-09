@@ -94,6 +94,11 @@ func TestNormalizeSiteLeavesLocalAlone(t *testing.T) {
 	if !old.AntiIdle || old.MaxIdleSeconds != 120 || old.AntiIdleMessage != "^@" {
 		t.Errorf("远程旧站点没补默认保活：antiIdle=%v idle=%d msg=%q", old.AntiIdle, old.MaxIdleSeconds, old.AntiIdleMessage)
 	}
+	// 同样在「旧站点」分支里补的两个显示开关：useAnsiColor 出厂为开，缺键拿到 false 会让
+	// 整个版面默默变黑白；alwaysHighlight 出厂为关，零值正好，不应当被补成开。
+	if !old.UseANSIColor || old.AlwaysHighlight {
+		t.Errorf("旧站点显示开关默认值错：useAnsiColor=%v alwaysHighlight=%v", old.UseANSIColor, old.AlwaysHighlight)
+	}
 }
 
 func TestShellSource(t *testing.T) {

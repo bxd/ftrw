@@ -17,6 +17,10 @@ export interface KeymapDeps {
   echo: (msg: string, kind?: 'info' | 'warn') => void
   /** 当前活动会话 id，无会话时返回空串 */
   activeSessionId: () => string
+  /** 查一个地址的归属地，结果自己进状态区（与悬停查走同一条路） */
+  ipLookup: (addr: string) => void
+  /** 起一轮 IP 库在线更新，进度靠 ip:update 事件回报 */
+  ipUpdate: () => void
   /** 内存里的当前配置（用于原地翻转开关） */
   getConfig: () => api.KeymapConfig
   /** 配置变更后同步给引擎 */
@@ -78,6 +82,24 @@ export function registerBuiltinCommands(deps: KeymapDeps) {
       if (!arg) { deps.echo('term.send 缺少文本参数', 'warn'); return }
       void api.Write(id, arg.replace(/\\n/g, '\r').replace(/\\t/g, '\t'))
     },
+  })
+
+  registerCommand({
+    id: 'ip.lookup',
+    title: 'IP：查归属地（命令写成 ip.lookup:地址）',
+    description: '参数可以是 IPv4、打码末段的 202.38.64.* 或主机名',
+    handler: (arg) => {
+      const q = (arg || '').trim()
+      if (!q) { deps.echo('ip.lookup 缺少地址，例如 ip.lookup:202.38.64.1', 'warn'); return }
+      deps.ipLookup(q)
+    },
+  })
+
+  registerCommand({
+    id: 'ip.update',
+    title: 'IP：立即更新纯真库',
+    description: '不等每天一轮的自动更新，立刻去镜像重下',
+    handler: () => deps.ipUpdate(),
   })
 
   registerCommand({

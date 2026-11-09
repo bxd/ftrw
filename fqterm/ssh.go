@@ -2,15 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
+
+// sshHandshakeTimeout 罩住 TCP 通了之后的 SSH 版本协商与 KEX。对端是个不该连的端口
+// （比如代理把 HTTP 口当成了目标）时对方就是不应答，没这个值会永远挂住。
+const sshHandshakeTimeout = 20 * time.Second
 
 // SSHConn drives an SSH2 session (PTY shell) and exposes a uniform byte stream.
 type SSHConn struct {
@@ -24,7 +30,9 @@ type SSHConn struct {
 }
 
 // ConnectSSH establishes an SSH session. termType/cols/rows configure the PTY.
-func ConnectSSH(host string, port int, user string, auth AuthMethod, termType string, cols, rows int, hostKeyCallback ssh.HostKeyCallback) (*SSHConn, error) {
+// pc 非空时先把 TCP 经代理打到对端，再在已拨好的连接上做 SSH 握手 —— 代理必须发生
+// 在传输层，否则只是把「连代理」当成了「连上了 BBS」。
+func ConnectSSH(host string, port int, user string, auth AuthMethod, termType string, cols, rows int, hostKeyCallback ssh.HostKeyCallback, pc ProxyConfig) (*SSHConn, error) {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	cfg := &ssh.ClientConfig{
 		User:            user,
@@ -65,10 +73,23 @@ func ConnectSSH(host string, port int, user string, auth AuthMethod, termType st
 		rows = 24
 	}
 
-	client, err := ssh.Dial("tcp", addr, cfg)
+	// 自己拨 TCP 而不是用 ssh.Dial：代理拨号在这里才能接进去。代价是握手也得自己
+	// 管 deadline —— 原先 ssh.Dial 连 cfg.Timeout 都没设，对端不回 banner 就能把
+	// 一次 RPC 永久挂住。
+	dctx, cancel := context.WithTimeout(context.Background(), proxyDialTimeout)
+	conn, err := proxyDial(dctx, pc, "tcp", addr)
+	cancel()
 	if err != nil {
+		return nil, fmt.Errorf("连 %s 失败：%w", addr, err)
+	}
+	conn.SetDeadline(time.Now().Add(sshHandshakeTimeout))
+	nConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
+	conn.SetDeadline(time.Time{})
+	if err != nil {
+		conn.Close()
 		return nil, err
 	}
+	client := ssh.NewClient(nConn, chans, reqs)
 	sess, err := client.NewSession()
 	if err != nil {
 		client.Close()

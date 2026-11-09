@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -856,13 +855,9 @@ const previewUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const saveTimeout = 10 * time.Minute
 
 var previewHTTP = &http.Client{
-	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		MaxIdleConnsPerHost:   4,
-	},
+	// 与 IP 库下载同一个 transport：设置里那一个代理同时管住这两条出站路，
+	// 不需要在预览里再配一次。
+	Transport: proxyAwareTransport(4),
 }
 
 // downloadToFile 先写 .part 再改名覆盖：os.Create 会把目标截断，万一下载到一半

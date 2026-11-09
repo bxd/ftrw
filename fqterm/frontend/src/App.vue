@@ -10,7 +10,7 @@ import ZmodemDialog from './components/ZmodemDialog.vue'
 import KeymapDialog from './components/KeymapDialog.vue'
 import { keyseq, registerCommand, type EchoInfo } from './keyseq'
 import { registerBuiltinCommands } from './keymapcmds'
-import { applyProbe, asKind, classifyURL, linkName, looksGenericName, mediaOnly, probeTargets, type PreviewItem } from './linkscan'
+import { applyProbe, asKind, classifyURL, hostSpanAt, ipSpanAt, linkName, looksGenericName, mediaOnly, probeTargets, type PreviewItem } from './linkscan'
 
 interface TabMeta { id: string; title: string; status: string }
 
@@ -201,11 +201,12 @@ const echoKind = ref<EchoInfo['kind']>('info')
 let echoTimer: number | undefined
 
 /** echo area：对应 Emacs 底部临时消息区，pending 不自动消失（由下一个事件接管）。 */
-function showEcho(text: string, kind: EchoInfo['kind'] = 'info') {
+function showEcho(text: string, kind: EchoInfo['kind'] = 'info', sticky = false) {
   echoMsg.value = text
   echoKind.value = kind
   if (echoTimer) { clearTimeout(echoTimer); echoTimer = undefined }
-  if (kind !== 'pending') echoTimer = window.setTimeout(() => { echoMsg.value = '' }, 4000)
+  // sticky：文案长到 4 秒读不完（带路径的手动下载提示）时不自动抹，等下一个事件接管
+  if (!sticky && kind !== 'pending') echoTimer = window.setTimeout(() => { echoMsg.value = '' }, 4000)
 }
 
 function applyKeymap(c: api.KeymapConfig) {
@@ -253,6 +254,11 @@ registerBuiltinCommands({
   openEditor: () => { kmDlg.show = true },
   echo: (m, k) => showEcho(m, k || 'info'),
   activeSessionId: () => insts[active.value]?.id || '',
+  // 手查与悬停查共用一套：同一个缓存、同一个提示位置（没会话时只进底部状态区）
+  ipLookup: (addr) => void onIPHover(insts[active.value] ?? null, addr),
+  ipUpdate: () => void api.StartIPUpdate()
+    .then(() => showEcho('正在更新 IP 库…', 'pending'))
+    .catch((e: any) => showEcho(`IP 库更新启不起来：${e?.message || e}`, 'error')),
   getConfig: () => km.value,
   applyConfig: applyKeymap,
 })
@@ -361,6 +367,88 @@ const statusText = (s: string) =>
 
 function idxOf(tab: TermTab): number { return insts.indexOf(tab) }
 
+/* ---------------- IP 归属地（B8） ---------------- */
+
+// 提示统一前缀：离开地址时靠它判断 echo 区那一行还是不是自己的，
+// 已经被菜单、zmodem 接管的提示区就不该由我们收走。
+const IP_HINT_HEAD = 'IP 归属地：'
+// 一屏里常有好几个相同地址，悬停会反复撞上同一个查询。5 分钟 TTL 是给后台换库
+// 留的出口：新库写进来之后旧结论不该一直挂着（库本身也是一天一轮）。
+const ipCache = new Map<string, { at: number; text: string }>()
+const IP_CACHE_MS = 5 * 60 * 1000
+// 只认最新一次悬停：查询是异步的，慢回来的旧结果不该盖住已经切走的地址。
+let ipSeq = 0
+
+/** 同一句话写两个地方：底部状态区（一眼扫过）与鼠标旁浮层（就地能看到）。 */
+function ipSay(tab: TermTab | null, text: string, kind: 'info' | 'warn' | 'error') {
+  showEcho(`${IP_HINT_HEAD}${text}`, kind)
+  tab?.setIPOsd(text, kind)
+}
+
+/** 悬停命中 / 离开一个 IPv4。ip 为空串表示离开，只收自己发出去的那条提示。 */
+async function onIPHover(tab: TermTab | null, ip: string) {
+  if (!ip) {
+    tab?.setIPOsd('')
+    if (echoMsg.value.startsWith(IP_HINT_HEAD)) showEcho('', 'info')
+    return
+  }
+  const hit = ipCache.get(ip)
+  if (hit && Date.now() - hit.at < IP_CACHE_MS) {
+    ipSay(tab, hit.text, 'info')
+    return
+  }
+  const seq = ++ipSeq
+  let res: api.IPLocationResult
+  try {
+    res = await api.IPLocation(ip)
+  } catch (e: any) {
+    // 失败也要写到浮层上：「没检测到」与「检测到了但查失败」在界面上必须分得开，
+    // 不然用户只能看到一个“没反应”，而两者该修的地方完全不同。
+    if (seq === ipSeq) ipSay(tab, `${ip} 查询失败：${e?.message || e}`, 'error')
+    return
+  }
+  if (seq !== ipSeq) return
+  if (res.found) {
+    ipCache.set(ip, { at: Date.now(), text: res.detail })
+    ipSay(tab, res.detail, 'info')
+    return
+  }
+  // 查不到不进缓存：库可能正在后台下、或者用户刚把文件放进目录，下次悬停就该拿到结果
+  ipSay(tab, res.error || `${ip} 库里没有这条记录`, 'warn')
+}
+
+/**
+ * 后端更新事件。失败那条里带着「手动下载 qqwry.dat 放到哪儿」，4 秒抹掉就等于没说，
+ * 所以用 sticky；成功与进度正常自动消失。
+ */
+function onIPProgress(d: api.IPUpdateProgress) {
+  if (d.state === 'downloading') {
+    showEcho(d.message || '正在更新 IP 库…', 'pending')
+    return
+  }
+  ipCache.clear() // 库可能刚被换掉，旧结论一律作废
+  if (d.state === 'error') {
+    showEcho(`${d.error || d.message || 'IP 库更新失败'}（可在设置里点「立即更新」重试）`, 'warn', true)
+    return
+  }
+  showEcho(d.message || 'IP 库已更新', 'info')
+}
+
+/**
+ * 只读调试钩子。鼠标坐标、缓冲区文本、浮层元素这类事只能拿运行时数据判断（日志里
+ * 一条查询都没发出去，而代码看上去完全正确，已经连着猜了两轮），所以把应用自己的
+ * 对象交给 WebView2 的远程调试端口：
+ *
+ *	$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9444'
+ *	Start-Process .\bin\ftrw.exe
+ *
+ * 不新增任何能力（这个窗口本来就能开 DevTools），也不绑进 Wails 接口。
+ */
+function installDebugHook() {
+  const w = window as any
+  w.__ftrw = { insts, TermTab, onIPHover, showEcho, api, ipSpanAt, hostSpanAt, prefs }
+}
+
 async function newTab(site: api.Site) {
   if (!viewport.value) await nextTick()
   const container = document.createElement('div')
@@ -377,8 +465,23 @@ async function newTab(site: api.Site) {
   container.style.display = 'none'
   viewport.value!.appendChild(container)
 
-  const tab = new TermTab(site, container)
+  const tab = new TermTab(site, container, { scrollback: prefs.value?.scrollbackLines })
   tab.onLink = (uri) => void onLinkClick(tab, uri)
+  // 鼠标点菜单：开关取偏好（旧 prefs.json 没这个键时算开），悬停命中的提示进 echo 区
+  tab.menuClick = prefs.value?.menuClickEnabled !== false
+  tab.onMenuHint = (label) => showEcho(`点菜单：${label}`, 'info')
+  // 悬停查 IP 归属地：旧 prefs.json 没这个键时算开（与点菜单同一套兼容写法）
+  tab.ipHoverEnabled = prefs.value?.ipLocationEnabled !== false
+  tab.onIPHint = (ip) => void onIPHover(tab, ip)
+  // Alt+单击的诊断：界面已经就地弹了，这里再往文件日志写一份，这样就算
+  // 浮层本身坏了（另一种坏法）也能从日志里看出前端到底跑到了哪一步。
+  tab.onIPProbe = (msg) => {
+    api.IPNote(msg).catch(() => { /* 日志通路掉了不该影响界面 */ })
+  }
+  // 配色按站点设置立即套用：以前只有去动下拉框才会 applyScheme，新标签一直顶着
+  // 内置默认色跑；而「总是高亮 / ANSI 颜色」要靠调色板算默认前景，不套用就判错。
+  const sc = schemes.value.find((x) => x.name === site.colorScheme) || schemes.value[0]
+  if (sc) tab.applyScheme(sc)
   insts.push(tab)
   tabs.value.push({ id: '', title: tab.title, status: 'connecting' })
   const myIdx = insts.length - 1
@@ -574,6 +677,7 @@ function grouped(): { name: string; items: { site: api.Site; index: number }[] }
 // zmodemEngine.promptUploadFiles 会自己弹原生选文件框，手动入口反而容易误操作。
 
 let offData: () => void, offStatus: () => void, offZ: () => void, offMode: (() => void) | undefined
+let offIP: (() => void) | undefined
 
 onMounted(async () => {
   prefs.value = await api.GetPreferences()
@@ -581,6 +685,7 @@ onMounted(async () => {
   schemes.value = await api.ListSchemes()
   // 首次扫描放后台：WSL 探针最长要 3 秒，不能让它挡在第一帧之前。扫完自动刷新列表。
   void scanShells(false)
+  installDebugHook()
 
   offData = api.onTermData((d) => { byId.get(d.id)?.write(d.data) })
   offStatus = api.onTermStatus((d) => {
@@ -621,6 +726,7 @@ onMounted(async () => {
       setTimeout(() => { if (zmodemMsg.value === d.message) zmodemMsg.value = '' }, 5000)
     }
   })
+  offIP = api.onIPUpdate(onIPProgress)
   window.addEventListener('resize', onWinResize)
   window.addEventListener('blur', onWindowBlur)
   try { applyKeymap(await api.GetKeymap()) } catch { /* 读不到就用出厂默认表 */ }
@@ -641,7 +747,7 @@ onMounted(async () => {
   })
 })
 
-onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
+onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
 
 function onWinResize() {
   insts[active.value]?.fitNow()
@@ -668,6 +774,15 @@ async function savePrefs(p: api.Preferences) {
   await api.SetPreferences(p)
   prefs.value = p
   prefsDlg.show = false
+  // 点菜单开关与回滚行数对手上已经开着的标签立即生效，不必重开
+  for (const t of insts) {
+    t.menuClick = p.menuClickEnabled !== false
+    t.ipHoverEnabled = p.ipLocationEnabled !== false
+    t.setScrollback(p.scrollbackLines)
+  }
+  ipCache.clear()
+  // 库路径 / 下载地址可能刚改过：让后端重找一次，不然这一轮还是拿着旧文件
+  await api.IPReload().catch(() => { /* 重读失败不影响偏好已保存 */ })
   // 托盘显隐等原生侧设置需要推给 AppService 重放
   await api.ApplyAppPreferences().catch(() => { /* 不影响偏好已保存 */ })
 }

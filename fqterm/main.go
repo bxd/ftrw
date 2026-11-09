@@ -4,10 +4,24 @@ import (
 	"embed"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 )
+
+// browserArgsFromEnv 把 FTRW_BROWSER_ARGS 里的空格分隔参数交给 WebView2（只在环境变量
+// 设了的时候才起作用，平时零影响）。常用一条：--remote-debugging-port=9444，然后用
+// CDP 在真进程里看运行时数据（页内钩子是前端 App.vue 的 window.__ftrw）。
+func browserArgsFromEnv() []string {
+	raw := strings.TrimSpace(os.Getenv("FTRW_BROWSER_ARGS"))
+	if raw == "" {
+		return nil
+	}
+	args := strings.Fields(raw)
+	log.Printf("调试浏览器参数：%v", args)
+	return args
+}
 
 //go:embed all:frontend/dist
 var assets embed.FS
@@ -44,11 +58,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("init config store: %v", err)
 	}
+	// 全局代理先落到内存里那一份：两个 http.Transport 的 DialContext 只看它，不看 store。
+	setGlobalProxy(proxyFromPrefs(store.Prefs))
 
 	configService := NewConfigService(store)
 	terminalService := NewTerminalService(store)
 	appService := NewAppService(store)
 	previewService := NewPreviewService()
+	ipService := NewIPService(store)
+	// 代理没配好之前 IP 库注定下不来，失败一轮就要等满一天闸门。用户刚刚把代理填对的
+	// 那一刻就是「该再试一次」的信号，不能让他等到明天。
+	configService.OnProxyChanged(func() { ipService.MaybeUpdate() })
 
 	exe, _ := os.Executable()
 	log.Printf("FTRW 启动 pid=%d exe=%s log=%s", os.Getpid(), exe, logger.Path())
@@ -57,11 +77,19 @@ func main() {
 		Name:        "FTRW",
 		Description: "Telnet/SSH BBS Terminal (Wails 3 rewrite)",
 		Logger:      newSystemLogger(out),
+		// 调试通路：FTRW_BROWSER_ARGS="--remote-debugging-port=9444" 时把参数直接交给
+		// WebView2。鼠标坐标、单元格像素、缓冲区文本这些只在运行时才有的事实，靠读代码
+		// 已经连着猜了两轮，留一条能用 CDP 亲眼看的路子比再猜一轮便宜。
+		// 注：这项一旦显式设上，WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 环境变量会被顶掉，所以走这里。
+		Windows: application.WindowsOptions{
+			AdditionalBrowserArgs: browserArgsFromEnv(),
+		},
 		Services: []application.Service{
 			application.NewService(configService),
 			application.NewService(terminalService),
 			application.NewService(appService),
 			application.NewService(previewService),
+			application.NewService(ipService),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
@@ -84,6 +112,7 @@ func main() {
 	appService.Bind(app, win)
 	appService.SetTrayIcons(trayIconLight, trayIconDark)
 	previewService.Bind(app, win, appService)
+	ipService.Bind(win)
 
 	// 跨应用热键不在这里注册：低级键盘钩子要等应用跑起来之后才能安全地往主线程投递动作，
 	// 见 AppService.Start 里的 startGlobalKeys。
@@ -92,6 +121,8 @@ func main() {
 	appService.SetupTray()
 	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		appService.Start()
+		// 库过期或缺过一次就后台补一轮：开在启动路径上是白等，而且失败也不该拦人。
+		go ipService.MaybeUpdate()
 	})
 
 	if err := app.Run(); err != nil {

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { reactive, ref, computed, onMounted } from 'vue'
 import * as api from '../api'
+import { KEY_TYPE_NAMES } from '../keymap'
 
 const props = defineProps<{
   site: api.Site
@@ -26,6 +27,19 @@ const s = reactive<api.Site>({
   lineSpacing: raw.lineSpacing ?? 0,
   antiAlias: raw.antiAlias ?? true,
   fontAutoFit: raw.fontAutoFit ?? 1,
+  // useAnsiColor 不在这里兜底：后端 normalizeSite 已经按「旧站点」补成开，而用户真关掉时
+  // 这里再补一次就会把「ANSI 颜色」永远锁在开。alwaysHighlight 出厂为关，缺键正好。
+  alwaysHighlight: raw.alwaysHighlight ?? false,
+  // 按键方案出厂 BBS（与后端 defaultSite 一致）；SSH 私钥两个字段旧站点根本没有。
+  keyType: raw.keyType ?? 0,
+  keyFile: raw.keyFile ?? '',
+  passphrase: raw.passphrase ?? '',
+  // 代理（D3）：旧站点根本没这几个字段，缺键就是「跟随全局设置」，行为与升级前逐字节一致。
+  proxyType: raw.proxyType ?? 0,
+  proxyHost: raw.proxyHost ?? '',
+  proxyPort: raw.proxyPort ?? 0,
+  proxyUser: raw.proxyUser ?? '',
+  proxyPass: raw.proxyPass ?? '',
 })
 
 // 系统可用字体列表（点击字体下拉时展示全部供选择）
@@ -34,8 +48,31 @@ onMounted(() => {
   api.ListSystemFonts().then((f) => { fonts.value = f || [] }).catch(() => { fonts.value = [] })
 })
 
+// 按键方案的下拉文案住在 keymap.ts（判定处），这里只拿过来用。
+const kmNames = KEY_TYPE_NAMES
+
 // 本地 shell：host 存可执行文件路径，port/保活/重连/ZMODEM 都没有意义。
 const isLocal = computed(() => s.protocolType === 3)
+
+// SSH 认证方式只是个界面开关：后端看的是 keyFile 有没有填（选「密码」时下面 doSave 会清掉）。
+// 不再加一个 authMode 字段，免得两处状态对不上时没人说得清到底听谁的。
+const authKind = ref(s.keyFile ? 'key' : 'pass')
+
+function onAuthKind() {
+  if (authKind.value !== 'key') { s.keyFile = ''; s.passphrase = '' }
+}
+
+const pickErr = ref('')
+
+/** 走原生选文件框（后端 AppService.PickKeyFile，默认落在 ~/.ssh）。取消时后端返空串，不动已填的值。 */
+async function pickKeyFile() {
+  try {
+    const p = await api.PickKeyFile()
+    if (p) s.keyFile = p
+  } catch (e: any) {
+    pickErr.value = String(e?.message || e)
+  }
+}
 
 // 启动参数在界面上是一行空格分隔的文本，内部是 string[]。带空格的路径或发行版名用
 // 双引号括起来就能当成一个参数（"Ubuntu 24.04 LTS"）。
@@ -75,6 +112,18 @@ function onHostType() {
   else { s.termType = 'xterm-256color'; s.serverEncodingID = 2 }
 }
 
+// 代理那一栏的提示跟着选择变：这里只解释「这一档是什么意思」，全局那份的详情在偏好设置里。
+const proxyHint = computed(() => {
+  switch (s.proxyType) {
+    case 0:
+      return '跟「偏好设置 → 网络代理」里那一份一致；那里没配就是直连。绝大多数站点选这个。'
+    case 1:
+      return '即使全局配了代理，这一条也直接连出去 —— 内网机器、局域网 BBS 走代理反而不通。'
+    default:
+      return '只影响这一条连接，不回填到全局设置。地址留空等于不用代理；端口留空按类型补默认（SOCKS 1080 / HTTP 8080）。'
+  }
+})
+
 function doSave() {
   if (isLocal.value) {
     // 本地 shell 不参与下面那套「旧站点缺字段」兼容归一化：它的 maxIdleSeconds=0 是
@@ -84,6 +133,7 @@ function doSave() {
     return
   }
   // 字段归一化：避免旧站点数据缺项导致后端拿到 0 值而行为错乱。
+  if (authKind.value !== 'key') { s.keyFile = ''; s.passphrase = '' }
   if (!s.maxIdleSeconds || s.maxIdleSeconds < 10) s.maxIdleSeconds = 120
   if (!s.reconnectInterval || s.reconnectInterval < 1) s.reconnectInterval = 3
   if (s.reconnectRetries === undefined || s.reconnectRetries === null) s.reconnectRetries = -1
@@ -131,8 +181,25 @@ function doSave() {
           <legend>SSH 登录</legend>
           <div class="grid">
             <label>用户名</label><input v-model="s.userName" />
-            <label>密码</label><input type="password" v-model="s.password" />
+            <label>认证方式</label>
+            <select v-model="authKind" @change="onAuthKind">
+              <option value="pass">密码</option>
+              <option value="key">公钥（私钥文件）</option>
+            </select>
+            <template v-if="authKind === 'pass'">
+              <label>密码</label><input type="password" v-model="s.password" />
+            </template>
+            <template v-else>
+              <label>私钥文件</label>
+              <div class="row2">
+                <input v-model="s.keyFile" placeholder="C:\Users\me\.ssh\id_ed25519" />
+                <button class="pick" @click="pickKeyFile">浏览…</button>
+              </div>
+              <label>私钥口令</label><input type="password" v-model="s.passphrase" placeholder="无口令留空" />
+            </template>
           </div>
+          <p class="hint">私钥要 OpenSSH / PEM 格式（PuTTY 的 .ppk 不认）。读不到文件或口令错会在状态栏直接报「read key / parse key」。选了公钥就不再拿密码去做密码认证，也不再往远端 shell 灌凭据。</p>
+          <p class="hint" v-if="pickErr">选文件失败：{{ pickErr }}</p>
         </fieldset>
 
         <fieldset v-if="!isLocal">
@@ -165,6 +232,33 @@ function doSave() {
           </div>
         </fieldset>
 
+        <fieldset v-if="!isLocal">
+          <legend>网络代理</legend>
+          <div class="grid">
+            <label>代理</label>
+            <select v-model.number="s.proxyType">
+              <option :value="0">跟随全局设置</option>
+              <option :value="1">本站点强制直连</option>
+              <option :value="2">SOCKS4 / 4a</option>
+              <option :value="3">SOCKS5</option>
+              <option :value="4">HTTP（CONNECT）</option>
+            </select>
+          </div>
+          <div class="grid" v-if="s.proxyType >= 2">
+            <label>地址</label>
+            <div class="row2">
+              <input v-model="s.proxyHost" placeholder="127.0.0.1" />
+              <input type="number" v-model.number="s.proxyPort" class="port" placeholder="端口" />
+            </div>
+            <label>认证</label>
+            <div class="row2">
+              <input v-model="s.proxyUser" placeholder="用户名（可空）" />
+              <input type="password" v-model="s.proxyPass" placeholder="口令（可空）" />
+            </div>
+          </div>
+          <p class="hint">{{ proxyHint }} SOCKS5 与 HTTP 会把域名原样交给代理去解析，本地 DNS 不通也不影响连接。</p>
+        </fieldset>
+
         <fieldset>
           <legend>显示 / 编码</legend>
           <div class="grid">
@@ -180,6 +274,10 @@ function doSave() {
             <select v-model="s.termType">
               <option v-for="t in api.TERM_TYPES" :key="t" :value="t">{{ t }}</option>
             </select>
+            <label>按键方案</label>
+            <select v-model.number="s.keyType">
+              <option v-for="(n, i) in kmNames" :key="i" :value="i">{{ n }}</option>
+            </select>
             <label>列×行</label>
             <div class="row2">
               <input type="number" v-model.number="s.numColumns" min="20" /> ×
@@ -191,6 +289,12 @@ function doSave() {
             </select>
           </div>
           <label class="chk"><input type="checkbox" v-model="s.enableZmodem" /> 启用 ZMODEM 文件传输</label>
+          <div class="chkrow">
+            <label class="chk"><input type="checkbox" v-model="s.alwaysHighlight" /> 总是高亮</label>
+            <label class="chk"><input type="checkbox" v-model="s.useAnsiColor" /> ANSI 颜色</label>
+          </div>
+          <p class="hint">总是高亮：所有文字按调色板的亮色半区绘制（等价于原版把每一格前景都当加粗），暗色版面更醒目。ANSI 颜色关掉后只分黑白：带底色的地方黑字白底，其余白字铺默认底，专治配色花哨看不清。</p>
+          <p class="hint">按键方案只管与终端原生编码不同的那几个键：BBS 把 Home/End 改成老式 \x1b[1~ / \x1b[4~、F1-F4 改成 \x1b[11~…（水木的输入行只认这套）；XTERM 一个键都不接管；VT100 则不管远端怎么设，方向键/Home/End 一律发应用光标键，小键盘走 \x1bOp… 转义。退格键：^H 给只认 0x08 的老站，^? 是绝大多数系统的标准。</p>
         </fieldset>
 
         <fieldset>
@@ -247,7 +351,10 @@ fieldset { border: 1px solid #33373f; border-radius: 6px; margin-top: 12px; padd
 legend { color: #6a7180; font-size: 12px; padding: 0 6px; }
 .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #b5bac4; margin: 8px 0; }
 .chk input { width: auto; }
+.chkrow { display: flex; gap: 28px; }
 .row2 { display: flex; align-items: center; gap: 6px; }
+.row2 input.port { flex: 0 0 88px; width: 88px; }
+.pick { flex: none; padding: 5px 10px; }
 .unit { color: #6a7180; font-size: 12px; white-space: nowrap; }
 .hint { color: #6a7180; font-size: 12px; line-height: 1.5; margin: 6px 0 0; }
 .tabs { padding: 8px 16px 0; } .tb { font-size: 13px; color: #6ab0f3; border-bottom: 2px solid #6ab0f3; padding-bottom: 6px; }

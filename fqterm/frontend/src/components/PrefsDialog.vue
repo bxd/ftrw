@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, onMounted } from 'vue'
+import { computed, reactive, ref, onMounted, onBeforeUnmount } from 'vue'
 import * as api from '../api'
 
 const props = defineProps<{ prefs: api.Preferences }>()
@@ -15,6 +15,15 @@ if (p.quakeHeightPct == null || p.quakeHeightPct < 20) p.quakeHeightPct = 40
 if (p.quakeHideOnBlur == null) p.quakeHideOnBlur = true
 if (p.trayEnabled == null) p.trayEnabled = true
 if (p.closeToTray == null) p.closeToTray = false
+if (p.menuClickEnabled == null) p.menuClickEnabled = true
+if (p.ipLocationEnabled == null) p.ipLocationEnabled = true
+if (p.ipLocationDb == null) p.ipLocationDb = ''
+if (p.ipLocationUrl == null) p.ipLocationUrl = ''
+if (p.proxyType == null) p.proxyType = 0
+if (p.proxyHost == null) p.proxyHost = ''
+if (p.proxyPort == null) p.proxyPort = 0
+if (p.proxyUser == null) p.proxyUser = ''
+if (p.proxyPass == null) p.proxyPass = ''
 
 // 随系统启动不进 Preferences：它的唯一事实来源是注册表（HKCU\...\Run），
 // 在应用里存一份镜像会导致用户从「启动」里手工删掉后又被偷偷写回来。
@@ -24,6 +33,9 @@ const autostartNote = ref('')
 
 // 系统可用字体列表
 const fonts = ref<string[]>([])
+
+// 更新进度事件：这个窗口与主窗口都听 ip:update，互不干扰
+let offIPU: (() => void) | undefined
 
 // 下拉尺寸的实时估算：screen.avail* 给的是当前屏幕扣除任务栏后的区域（CSS 像素），
 // 与后端 quakeBounds 用的 WorkArea 是同一个基准；多显示器时按窗口所在屏算，仅作提示。
@@ -37,11 +49,75 @@ const quakeNote = computed(() => {
   return `工作区约 ${avail.value.w}×${avail.value.h} → 下拉 ${w}×${h}${mid}；改动在下次进入 quake 时生效`
 })
 
+/* ---------------- IP 归属地库 ---------------- */
+
+// 状态行直接拿后端 Status() 的一行字（路径 + 大小 + 更新日期）。库不存在时
+// Status() 是报错返回：那句错文本身就写明了「该去哪儿找库」，正好是要给用户看的。
+const ipStatusText = ref('')
+const ipUpdating = ref(false)
+
+function refreshIPStatus() {
+  api.IPStatus()
+    .then((s) => { ipStatusText.value = s || '未找到本地库' })
+    .catch((e: any) => { ipStatusText.value = e?.message || String(e) })
+}
+
+async function doIPUpdate() {
+  ipUpdating.value = true
+  ipStatusText.value = '正在发起更新…'
+  try {
+    await api.StartIPUpdate()
+  } catch (e: any) {
+    ipUpdating.value = false
+    ipStatusText.value = `更新启动失败：${e?.message || e}`
+  }
+  // 进度与结果靠 ip:update 事件收（下面挂了监听），这里不等返回
+}
+
+/* ---------------- 网络代理 ---------------- */
+
+const proxyOn = computed(() => p.proxyType !== 0)
+const proxyTesting = ref(false)
+const proxyTestText = ref('')
+
+// 测的是界面上这份还没存盘的设置：改完就能验，不必先保存再等下一次启动才看出效果。
+async function doProxyTest() {
+  proxyTesting.value = true
+  proxyTestText.value = '正在经代理连 api.github.com…'
+  try {
+    proxyTestText.value = await api.TestProxy({
+      type: p.proxyType,
+      host: p.proxyHost.trim(),
+      port: p.proxyPort,
+      user: p.proxyUser.trim(),
+      pass: p.proxyPass,
+    })
+  } catch (e: any) {
+    proxyTestText.value = `测试失败：${e?.message || e}`
+  } finally {
+    proxyTesting.value = false
+  }
+}
+
 onMounted(() => {
   avail.value = { w: window.screen.availWidth, h: window.screen.availHeight }
   api.ListSystemFonts().then((f) => { fonts.value = f || [] }).catch(() => { fonts.value = [] })
   api.GetAutostart().then((v) => { autostart.value = !!v; autostartInit.value = !!v }).catch(() => {})
+  refreshIPStatus()
+  offIPU = api.onIPUpdate((d) => {
+    if (d.state === 'downloading') {
+      ipUpdating.value = true
+      ipStatusText.value = d.message || '正在下载 IP 库…'
+      return
+    }
+    ipUpdating.value = false
+    if (d.state === 'error') { ipStatusText.value = d.error || d.message || 'IP 库更新失败'; return }
+    // 成功：重新读一次，让状态行换成新库的路径与日期
+    refreshIPStatus()
+  })
 })
+
+onBeforeUnmount(() => { offIPU?.() })
 
 function doSave() {
   if (autostart.value !== autostartInit.value) {
@@ -86,6 +162,44 @@ function doSave() {
           <legend>行为</legend>
           <label class="chk"><input type="checkbox" v-model="p.confirmClose" /> 关闭连接时确认</label>
           <label class="chk"><input type="checkbox" v-model="p.imageViewerEnabled" /> 点击超链接时在预览窗口中打开（关闭则交给系统浏览器）</label>
+          <label class="chk"><input type="checkbox" v-model="p.menuClickEnabled" /> 鼠标点击 BBS 菜单与文章列表（悬停出现高亮才可点）</label>
+        </fieldset>
+        <fieldset>
+          <legend>网络代理</legend>
+          <div class="grid grid-in">
+            <label>类型</label>
+            <select v-model.number="p.proxyType">
+              <option :value="0">不用代理</option>
+              <option :value="2">SOCKS4 / 4a</option>
+              <option :value="3">SOCKS5</option>
+              <option :value="4">HTTP（CONNECT）</option>
+            </select>
+            <label>地址</label>
+            <div class="row2">
+              <input v-model="p.proxyHost" placeholder="127.0.0.1" :disabled="!proxyOn" />
+              <input type="number" v-model.number="p.proxyPort" class="port" placeholder="端口" :disabled="!proxyOn" />
+            </div>
+            <label>认证</label>
+            <div class="row2">
+              <input v-model="p.proxyUser" placeholder="用户名（可空）" :disabled="!proxyOn" />
+              <input type="password" v-model="p.proxyPass" placeholder="口令（可空）" :disabled="!proxyOn" />
+            </div>
+          </div>
+          <button class="mini" :disabled="!proxyOn || proxyTesting" @click="doProxyTest">{{ proxyTesting ? '测试中…' : '测试连通' }}</button>
+          <div class="hint">{{ proxyTestText || '代理同时管住终端连接（Telnet/SSH）、IP 库下载与链接预览三条出站路；端口留空按类型补默认（SOCKS 1080 / HTTP 8080）。单个站点要直连或换代理，在站点编辑里另有设置。' }}</div>
+        </fieldset>
+        <fieldset>
+          <legend>IP 归属地</legend>
+          <label class="chk"><input type="checkbox" v-model="p.ipLocationEnabled" /> 鼠标悬停屏幕上的 IPv4 时显示归属地（只读本地纯真库，不把地址发给在线接口）</label>
+          <div class="grid grid-in">
+            <label>库文件</label>
+            <input v-model="p.ipLocationDb" placeholder="留空自动查找：程序目录 → 配置目录" />
+            <label>下载地址</label>
+            <input v-model="p.ipLocationUrl" placeholder="留空用内置镜像 metowolf/qqwry.dat" />
+          </div>
+          <button class="mini" :disabled="ipUpdating" @click="doIPUpdate">{{ ipUpdating ? '更新中…' : '立即更新' }}</button>
+          <div class="hint">{{ ipStatusText || '正在读取库状态…' }}</div>
+          <div class="hint">本地库缺失或距上次尝试超一天时，后台自动更新一轮。自动更新失败（无网、镜像不可达）可自行下载 qqwry.dat 存到上面“库文件”的路径或配置目录，保存后立即生效。</div>
         </fieldset>
         <fieldset>
           <legend>系统集成</legend>
@@ -141,6 +255,8 @@ legend { color: #6a7180; font-size: 12px; padding: 0 6px; }
 .hint { color: #6a7180; font-size: 12px; margin-top: 6px; }
 .hint code { color: #b5bac4; background: #1b1d22; border: 1px solid #3d424b; border-radius: 3px; padding: 0 4px; }
 .row2 { display: flex; align-items: center; gap: 6px; }
+button.mini { margin-top: 10px; padding: 4px 12px; font-size: 12px; }
+.row2 input.port { flex: 0 0 84px; width: 84px; }
 .foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid #33373f; }
 button { background: #2f333b; color: #d5d9e0; border: 1px solid #3d424b; border-radius: 5px; padding: 6px 16px; cursor: pointer; font-size: 13px; }
 button.primary { background: #2f74c0; border-color: #2f74c0; color: #fff; }

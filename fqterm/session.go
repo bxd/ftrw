@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -208,21 +210,43 @@ func (ts *TerminalService) Connect(site Site) (string, error) {
 }
 
 func (ts *TerminalService) dial(site Site) (protoConn, error) {
+	pc := ts.proxyFor(site)
 	switch site.ProtocolType {
 	case 1, 2: // SSH1/SSH2 — we use SSH2 transport
-		auth := AuthMethod{Kind: AuthPassword, Password: site.Password}
-		return ConnectSSH(site.Host, portOr(site.Port, 22), site.UserName, auth, sshTermType(site), site.NumColumns, site.NumRows, ts.khosts.Callback())
+		return ConnectSSH(site.Host, portOr(site.Port, 22), site.UserName, sshAuthFor(site), sshTermType(site), site.NumColumns, site.NumRows, ts.khosts.Callback(), pc)
 	case 3: // Local shell
 		return newLocalShell(site)
 	default: // Telnet
 		addr := net.JoinHostPort(site.Host, strconv.Itoa(portOr(site.Port, 23)))
-		d := net.Dialer{Timeout: 15 * time.Second}
-		c, err := d.Dial("tcp", addr)
+		c, err := proxyDial(context.Background(), pc, "tcp", addr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("连 %s 失败：%w", addr, err)
 		}
 		return NewTelnet(c, site.TermType), nil
 	}
+}
+
+// proxyFor 取这个站点该用的代理（站点覆盖全局）。每次拨号现读 store，所以改完设置
+// 不必重启就能生效（重连一次即可）。
+func (ts *TerminalService) proxyFor(site Site) ProxyConfig {
+	if ts.store == nil {
+		return globalProxy()
+	}
+	ts.store.mu.RLock()
+	prefs := ts.store.Prefs
+	ts.store.mu.RUnlock()
+	return proxyForSite(site, prefs)
+}
+
+// sshAuthFor 按站点配置挑 SSH 认证方式：填了私钥路径就走公钥（口令可空），否则回到用户名+密码。
+// 判据只看 keyFile，没有再开一个 authMode 枚举：两个字段意见不一时没人说得清听谁的，
+// 而且老 sites.json 没有 keyFile，解码拿到空串 —— 行为与以前逐字节一致。
+func sshAuthFor(site Site) AuthMethod {
+	key := strings.TrimSpace(site.KeyFile)
+	if key != "" {
+		return AuthMethod{Kind: AuthPublicKey, KeyFile: key, Passphrase: site.Passphrase}
+	}
+	return AuthMethod{Kind: AuthPassword, Password: site.Password}
 }
 
 func sshTermType(site Site) string {

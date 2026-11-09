@@ -5,7 +5,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -449,6 +451,44 @@ func (s *AppService) SetAutostart(enabled bool) error {
 // 防止 quake 模式被自己的对话框抢焦点后误收起。
 func (s *AppService) SetDialogGuard(on bool) {
 	s.dialogGuard.Store(on)
+}
+
+// PickKeyFile 弹原生选文件框挑 SSH 私钥，起始目录给 ~/.ssh（多数人的钥匙都在那儿）。
+// 取消返空串而不是错误；guard 在后端自己兜住，免得前端前后各调一次还忘了后一半。
+func (s *AppService) PickKeyFile() (string, error) {
+	if s.app == nil {
+		return "", errors.New("应用尚未就绪")
+	}
+	s.dialogGuard.Store(true)
+	defer s.dialogGuard.Store(false)
+
+	opts := &application.OpenFileDialogOptions{
+		Title:                   "选择 SSH 私钥",
+		Message:                 "选择私钥文件（id_ed25519 / id_rsa / *.pem；PuTTY 的 .ppk 不认）",
+		CanChooseFiles:          true,
+		CanChooseDirectories:    false,
+		AllowsMultipleSelection: false,
+		AllowsOtherFileTypes:    true,
+		ShowHiddenFiles:         true,
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		opts.Directory = home
+		if fi, err := os.Stat(filepath.Join(home, ".ssh")); err == nil && fi.IsDir() {
+			opts.Directory = filepath.Join(home, ".ssh")
+		}
+	}
+	if s.win != nil {
+		opts.Window = s.win
+	}
+	path, err := s.app.Dialog.OpenFileWithOptions(opts).PromptForSingleSelection()
+	if err != nil {
+		// Windows 取消对话框会把 ERROR_CANCELLED 当错误丢回来：那不是故障，就是用户没选。
+		if strings.Contains(strings.ToLower(err.Error()), "cancel") {
+			return "", nil
+		}
+		return "", err
+	}
+	return path, nil
 }
 
 // ApplyPreferences 在偏好保存后重放与原生侧相关的设置（目前是托盘显隐）。

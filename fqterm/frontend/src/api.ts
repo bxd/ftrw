@@ -13,6 +13,9 @@ export interface Site {
   autoLogin: boolean
   userName: string
   password: string
+  // SSH 公钥认证：keyFile 非空即走私钥（passphrase 是私钥口令，可空），后端只看这个字段。
+  keyFile: string
+  passphrase: string
   preLogin: string
   postLogin: string
   serverEncodingID: number // 0=GBK 1=BIG5 2=UTF8 3=HKSCS 4=UAO
@@ -24,7 +27,8 @@ export interface Site {
   lineSpacing: number    // 额外行距 px
   antiAlias: boolean     // 抗锯齿
   fontAutoFit: number    // 0=随窗口改行列 1=随窗口改字号 2=固定行列
-  useAnsiColor: boolean
+  useAnsiColor: boolean // 关掉则全画面退成黑白反相（原版 isAnsiColor_）
+  alwaysHighlight: boolean // 所有前景色取亮色半区（原版 isAlwaysHighlight_）
   termType: string
   keyType: number
   numColumns: number
@@ -39,6 +43,13 @@ export interface Site {
   reconnectRetries: number // 重连重试次数，-1 = 无限
   enableZmodem: boolean
   group: string
+  // 网络代理（D3）站点级覆盖：0=跟随全局设置（旧站点缺键即此） 1=本站点强制直连
+  // 2=SOCKS4 3=SOCKS5 4=HTTP。选了类型但地址为空等于不用代理。
+  proxyType: number
+  proxyHost: string
+  proxyPort: number
+  proxyUser: string
+  proxyPass: string
   // 本机 shell（protocolType===3）专用：shellID 是探测结果的稳定标识，shellArgs 是启动
   // 参数，auto 表示这条由扫描生成（允许被自动清理/更新）。
   shellID?: string
@@ -59,12 +70,33 @@ export interface Preferences {
   openWarnOnClose: boolean
   scrollbackLines: number
   confirmClose: boolean
+  menuClickEnabled: boolean
   // 窗口形态：quake 下拉与普通窗口共用同一个原生窗口，尺寸按工作区（已扣除任务栏）百分比算
   quakeWidthPct: number
   quakeHeightPct: number
   quakeHideOnBlur: boolean
   trayEnabled: boolean
   closeToTray: boolean
+  // IP 归属地（B8）：总开关 + 库位置 + 自定义下载地址，后两个留空即用默认
+  ipLocationEnabled: boolean
+  ipLocationDb: string
+  ipLocationUrl: string
+  // 网络代理（D3）：0=不用代理 2=SOCKS4 3=SOCKS5 4=HTTP；端口留空按类型补默认值。
+  // 它同时管住终端连接、IP 库下载与链接预览三条出站路。
+  proxyType: number
+  proxyHost: string
+  proxyPort: number
+  proxyUser: string
+  proxyPass: string
+}
+
+// 一份代理设置（与后端 ProxyConfig 同形）。测试连通时传的是界面上还没存盘的那一份。
+export interface ProxyConfig {
+  type: number
+  host: string
+  port: number
+  user: string
+  pass: string
 }
 
 export interface ColorScheme {
@@ -107,6 +139,7 @@ const cfg = 'main.ConfigService'
 const term = 'main.TerminalService'
 const appsvc = 'main.AppService'
 const pvsvc = 'main.PreviewService'
+const ipsvc = 'main.IPService'
 
 export const ListSites = (): Promise<Site[]> => Call.ByName(`${cfg}.ListSites`)
 export const SaveSite = (index: number, site: Site): Promise<void> => Call.ByName(`${cfg}.SaveSite`, index, site)
@@ -114,6 +147,9 @@ export const DeleteSite = (index: number): Promise<void> => Call.ByName(`${cfg}.
 export const DefaultSite = (): Promise<Site> => Call.ByName(`${cfg}.DefaultSite`)
 export const GetPreferences = (): Promise<Preferences> => Call.ByName(`${cfg}.GetPreferences`)
 export const SetPreferences = (p: Preferences): Promise<void> => Call.ByName(`${cfg}.SetPreferences`, p)
+// TestProxy 经该代理建一条到 GitHub API 的隧道（只握手不下载），返一句成功文案，
+// 失败时 reject 的原因里写清了卡在代理本身还是卡在建隧。
+export const TestProxy = (c: ProxyConfig): Promise<string> => Call.ByName(`${cfg}.TestProxy`, c)
 export const ListSchemes = (): Promise<ColorScheme[]> => Call.ByName(`${cfg}.ListSchemes`)
 export const SaveScheme = (s: ColorScheme): Promise<void> => Call.ByName(`${cfg}.SaveScheme`, s)
 export const DeleteScheme = (name: string): Promise<void> => Call.ByName(`${cfg}.DeleteScheme`, name)
@@ -180,6 +216,8 @@ export const ListGlobalActions = (): Promise<GlobalAction[]> => Call.ByName(`${a
 export const SetGlobalKeysPaused = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetGlobalKeysPaused`, on)
 // 原生对话框会抢走主窗口焦点，quake 的「失焦即收起」需要这道护栏才不会误伤
 export const SetDialogGuard = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetDialogGuard`, on)
+// SSH 私钥选择：弹原生选文件框，起始目录落在 ~/.ssh；取消返空串（不是错误）
+export const PickKeyFile = (): Promise<string> => Call.ByName(`${appsvc}.PickKeyFile`)
 // 偏好保存后重放与原生侧相关的设置（目前是托盘显隐）
 export const ApplyAppPreferences = (): Promise<void> => Call.ByName(`${appsvc}.ApplyPreferences`)
 
@@ -224,6 +262,38 @@ export const SavePreviewItem = (url: string, name: string): Promise<string> =>
 export const TogglePreviewMaximise = (): Promise<boolean> =>
   Call.ByName(`${pvsvc}.ToggleMaximise`)
 
+// ---- IP 归属地（B8） ----
+
+// 一次查询的回执。detail 是后端已经拼好的一行字，界面直接显示即可，
+// 不需要自己拼「国家 城市」，也不需要知道错误是怎么分级的。
+export interface IPLocationResult {
+  query: string
+  ip: string
+  country: string
+  city: string
+  detail: string
+  found: boolean
+  error: string
+}
+
+// 更新过程的事件载荷。state: downloading | done | error；message 就是该显示的那
+// 一行字（下载时带百分比，结束时是结果说明），前端不需要自己拼进度。
+export interface IPUpdateProgress {
+  state: string
+  message: string
+  error: string
+}
+
+export const IPLocation = (query: string): Promise<IPLocationResult> =>
+  Call.ByName(`${ipsvc}.Lookup`, query)
+// 前端诊断行写进后端日志（Alt+单击那一格看到了什么）。界面上什么都看不到的时候，
+// 这是唯一能分清「没识别 / 没坐标 / 没显示」的取证通道。
+export const IPNote = (msg: string): Promise<void> => Call.ByName(`${ipsvc}.Note`, msg)
+export const StartIPUpdate = (): Promise<number> => Call.ByName(`${ipsvc}.StartUpdate`)
+export const IPStatus = (): Promise<string> => Call.ByName(`${ipsvc}.Status`)
+// 改完库路径/地址后叫一次：后端会重新找库、重新读盘。
+export const IPReload = (): Promise<void> => Call.ByName(`${ipsvc}.Reload`)
+
 // ---- Terminal service ----
 
 export const Connect = (site: Site): Promise<string> => Call.ByName(`${term}.Connect`, site)
@@ -255,6 +325,9 @@ export const onWindowMode = (cb: (d: WindowModeState) => void) =>
 // 监听者，主窗口那边没人听这一条，所以不必再按 sender 过滤。
 export const onPreviewLoad = (cb: (d: PreviewRequest) => void) =>
   Events.On('preview:load', (e: any) => cb(e.data))
+// IP 库自动更新（启动后一天一轮）与手动「立即更新」都往这里报。
+export const onIPUpdate = (cb: (d: IPUpdateProgress) => void) =>
+  Events.On('ip:update', (e: any) => cb(e.data))
 
 // ---- Encoding labels (mirror fqterm) ----
 

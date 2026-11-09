@@ -8,10 +8,19 @@ import (
 // and color scheme operations to the frontend.
 type ConfigService struct {
 	store *Store
+	// onProxyChanged 在代理设置真的改了之后被叫一次（异步）。存在的理由很具体：
+	// IP 库下载失败过一轮就要等一天再去碰，而用户刚刚才把代理填对——这时候不能让他
+	// 等到明天。见 main.go 里的接线。
+	onProxyChanged func()
 }
 
 func NewConfigService(store *Store) *ConfigService {
 	return &ConfigService{store: store}
+}
+
+// OnProxyChanged 接上「代理改了」的回调（只能构造之后设：要通知的 IPService 比 ConfigService 晚建）。
+func (cs *ConfigService) OnProxyChanged(fn func()) {
+	cs.onProxyChanged = fn
 }
 
 // --- Site manager ---
@@ -44,6 +53,9 @@ func normalizeSite(site Site) Site {
 		// 只能在“旧站点”分支里按原版默认补齐（字号自适应 + 开抗锯齿）。
 		site.FontAutoFit = 1
 		site.AntiAlias = true
+		// UseANSIColor 同理：出厂是开（原版 isAnsiColor_=1），老文件缺键拿到 false 会让整个
+		// 版面默默变黑白。AlwaysHighlight 出厂为关，缺键正好，不需要补。
+		site.UseANSIColor = true
 		if site.FontNameCJK == "" {
 			site.FontNameCJK = "SimSun"
 		}
@@ -101,11 +113,24 @@ func (cs *ConfigService) GetPreferences() Preferences {
 }
 
 func (cs *ConfigService) SetPreferences(prefs Preferences) error {
+	old := cs.GetPreferences()
 	prefs = normalizePreferences(prefs)
 	cs.store.mu.Lock()
 	cs.store.Prefs = prefs
 	cs.store.mu.Unlock()
+	// 代理住在两个 http.Transport 的 DialContext 回调里（那里拿不到 store），所以改完
+	// 必须把内存里那一份同步掉，否则改设置要重启才生效。
+	setGlobalProxy(proxyFromPrefs(prefs))
+	if proxyFromPrefs(old) != proxyFromPrefs(prefs) && cs.onProxyChanged != nil {
+		go cs.onProxyChanged()
+	}
 	return cs.store.SavePrefs()
+}
+
+// TestProxy 拿一份还没存盘的代理设置去试连：界面上改完就能测，不必先保存、再等下一次
+// 启动才看出效果。成功返一句给人看的话，失败时 error 里写清了卡在代理本身还是卡在建隧。
+func (cs *ConfigService) TestProxy(pc ProxyConfig) (string, error) {
+	return proxyTest(pc)
 }
 
 // normalizePreferences 守住 quake 宽/高的合法区间：前端传回的是整个 Preferences 对象，
@@ -115,6 +140,10 @@ func normalizePreferences(p Preferences) Preferences {
 	def := defaultPreferences()
 	p.QuakeWidthPct = quakePct(p.QuakeWidthPct, def.QuakeWidthPct)
 	p.QuakeHeightPct = quakePct(p.QuakeHeightPct, def.QuakeHeightPct)
+	// 代理字段归一（端口越界补默认值、认不出的类型当没配），存盘与生效用同一份，
+	// 免得界面里看着是 SOCKS5、实际拨号时走了另一套解释。
+	pc := proxyFromPrefs(p).normalized()
+	p.ProxyType, p.ProxyHost, p.ProxyPort, p.ProxyUser, p.ProxyPass = pc.Type, pc.Host, pc.Port, pc.User, pc.Pass
 	return p
 }
 
