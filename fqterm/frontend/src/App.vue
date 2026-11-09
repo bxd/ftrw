@@ -860,7 +860,7 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       <div class="main">
         <div class="viewport" ref="viewport" />
         <div v-if="!tabs.length" class="welcome">
-          <h2>FTRW · Wails 3</h2>
+          <h2>FTRW</h2>
           <p>Telnet / SSH / BBS 终端</p>
           <div class="hint">点击「＋ 连接」新建会话；把鼠标移到窗口左缘、或按 Alt+X P 唤出站点栏（失焦自动收起）</div>
         </div>
