@@ -48,6 +48,55 @@ export function scrollbackOf(n?: number): number {
 
 const AA_STYLE_ID = 'ftrw-font-smoothing'
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+/**
+ * 按码点把一行切成不超过 n 个字符的片段（代理对不会被切开）。
+ * 空行返回空数组，调用方因此不会为一个空段发一次无用的 Write。
+ */
+function chunkCells(s: string, n: number): string[] {
+  const chars = Array.from(s)
+  if (!chars.length) return []
+  const out: string[] = []
+  for (let i = 0; i < chars.length; i += n) out.push(chars.slice(i, i + n).join(''))
+  return out
+}
+
+/** 一次原地替换最多删多少字：再大就退格上千次，站端一吞字就把草稿搅残，不如让用户分段。 */
+const SEL_MAX_CHARS = 2000
+
+/**
+ * 选区读取结果。state 不是 ok 时其余字段都只是占位，调用方按 state 给用户说清楚为什么。
+ *
+ * · empty 没会话可读 · offscreen 光标/选区落在回滚历史里 · before 光标在选区之前
+ * · far 光标跟选区末格不同行 · blank 光标处和选区都是空白 · toolarge 超上限
+ *
+ * 有选区按选区读（fromCursor=false），没选区则从光标往回括住连续正文（fromCursor=true，
+ * 见 cursorAnchored）—— 所以正常打字后直接按热键不会再报 empty。
+ */
+export type SelState = 'empty' | 'offscreen' | 'before' | 'far' | 'blank' | 'toolarge' | 'ok'
+
+export interface SelRead {
+  state: SelState
+  /** text 的来源：鼠标选区，还是「没有选区时从光标往回括住那一段」 */
+  fromCursor: boolean
+  /** 选中的文字，真实回车以 \n 表示，行尾空白与折行的假换行已经剔掉 */
+  text: string
+  /** text 的码点数，也就是需要退格删除的字符数 */
+  chars: number
+  /** 替换前要先补发的左方向键次数（光标落在选区后面那段上） */
+  leftToMove: number
+  /** 选区比光标靠后，已截到光标为止 */
+  truncated: boolean
+  rows: number
+  /** 删完之后光标该落在的格子（缓冲区绝对坐标），走位后就拿它验证 */
+  endCol: number
+  endRow: number
+  /** 删干净后光标应退到的左边界（缓冲区绝对坐标）；eraseRegion 拿它校验有没有被站端吞掉退格键 */
+  startCol: number
+  startRow: number
+}
+
 /** 抗锯齿开关：xterm 5.5 默认 DOM 渲染器，字符是真实 DOM 文本，CSS 可直接控制。 */
 function ensureAAStyle() {
   if (document.getElementById(AA_STYLE_ID)) return
@@ -158,6 +207,8 @@ export class TermTab {
   // 点一下就钉住：鼠标离开也不收浮层。悬停只适合「瞄一眼」，而「挪开鼠标慢慢看」
   // 需要一次明确的动作 —— 顺带也让「浮层到底有没有画出来」变成一个能主动复现的操作。
   private ipPinned = false
+  // 灌入正文期间置真：两次触发挤在一起会让两批字节互相穿插，成品是乱码。
+  private inserting = false
 
   /** 悬停查 IP 归属地的开关，由 App.vue 按偏好设置；关掉就不再扫行。 */
   ipHoverEnabled = true
@@ -440,6 +491,300 @@ export class TermTab {
   }
 
   focus() { this.term.focus() }
+
+  /* ---------------------------- 编辑区灌入 ---------------------------- */
+
+  /** 终端列数：竖排的栅格要按实际宽度算，前端不该自己猜 80。 */
+  get termCols(): number { return this.term.cols }
+
+  /**
+   * 把文本送进远端的文章编辑器。
+   *
+   * 走 api.Write，而不是 term.input / term.paste，两个理由：
+   * - 字符模式编辑器的回显是服务器发回来的，客户端再本地画一遍就是双影；
+   * - term.input 会连带 xterm 的「真用户输入」副作用（清选区、滚到底），
+   *   用户为引用原文刚圈好的那段会被抹掉。
+   *
+   * 逐行发、行间补 \r：编辑器把 \r 当回车，折行交给站端自己算，我们按源文本的
+   * 段落断行即可。每行之间停一下：一次 write 塞几 KB 时，慢速 PTY 上的编辑器会
+   * 来不及处理而吞字，25ms 足够喂完整篇又不卡手。超长单行再切一段，出错时至少
+   * 保住已经发出去的那部分。
+   */
+  async insertText(text: string): Promise<{ lines: number; chars: number }> {
+    if (!this.id) throw new Error('没有活动会话，送不进编辑区')
+    if (this.inserting) throw new Error('上一次灌入还没结束，请稍候')
+    this.inserting = true
+    try {
+      return await this.writeLines(text)
+    } finally {
+      this.inserting = false
+    }
+  }
+
+  /** insertText 的内层：已经在 inserting 保护下时可以直接调（原地替换删完接着送）。 */
+  private async writeLines(text: string): Promise<{ lines: number; chars: number }> {
+    const lines = text.split('\n')
+    let chars = 0
+    for (let i = 0; i < lines.length; i++) {
+      for (const seg of chunkCells(lines[i]!, 180)) {
+        await api.Write(this.id, seg)
+        chars += seg.length
+      }
+      if (i < lines.length - 1) await api.Write(this.id, '\r')
+      await sleep(25)
+    }
+    return { lines: lines.length, chars }
+  }
+
+  /* -------------------------- 选区原地替换 -------------------------- */
+
+  /**
+   * 读回鼠标框选的那段屏幕文字，并判断能不能安全地原地替换。
+   *
+   * 一切以光标为准：字符模式编辑器没有「删除选区」这种操作，客户端能做的只有从光标
+   * 往回退格，所以选中的文字必须紧贴光标才有意义。
+   *   · 光标正好在选区末格 —— 就是要处理的那段；
+   *   · 光标落在选区当中 —— 只处理到光标为止的那一段（多选比少选好收拾，少选删不着）；
+   *   · 光标在同一行、但在选区后面 —— 先补几个左方向键挪回去，挪完对不上就地放弃；
+   *   · 光标在选区之前，或者跟选区末格不同行 —— 一个字节都不动。跨行找位置一旦算错，
+   *     退格吃掉的就是用户没选中的正文，那种代价不该靠赌站点行为来换。
+   */
+  readSelection(): SelRead {
+    const blank: SelRead = {
+      state: 'empty', fromCursor: false, text: '', chars: 0, leftToMove: 0, truncated: false, rows: 0,
+      endCol: 0, endRow: 0, startCol: 0, startRow: 0,
+    }
+    if (!this.id) return blank
+    if (!this.term.hasSelection()) return this.cursorAnchored()
+    const p = this.term.getSelectionPosition() as unknown as
+      { start?: { x?: number; col?: number; y?: number; row?: number }, end?: { x?: number; col?: number; y?: number; row?: number } } | undefined
+    if (!p?.start || !p?.end) return blank
+    // 公开类型写的是 col/row，这一版实际给的是 x/y，两边都是缓冲区绝对坐标；认不出来就当没选
+    const sx = p.start.col ?? p.start.x
+    const sy = p.start.row ?? p.start.y
+    const ex = p.end.col ?? p.end.x
+    const ey = p.end.row ?? p.end.y
+    if (sx === undefined || sy === undefined || ex === undefined || ey === undefined) return blank
+
+    const b = this.term.buffer.active
+    const top = this.viewportTop(b)
+    if (sy < top || ey >= top + this.term.rows) return { ...blank, state: 'offscreen' }
+
+    // 光标那对（baseY + cursorY）确实要相加：公开 API 的 cursorY 是相对 baseY 的页内行号
+    const cx = b.cursorX
+    const cy = b.baseY + b.cursorY
+    if (cy < sy || (cy === sy && cx <= sx)) return { ...blank, state: 'before' }
+
+    let ax = ex
+    let ay = ey
+    let leftToMove = 0
+    let truncated = false
+    const afterEnd = cy > ey || (cy === ey && cx > ex)
+    if (!afterEnd && (cy < ey || cx < ex)) {
+      // 光标在选区当中：截到光标为止
+      ax = cx
+      ay = cy
+      truncated = true
+    } else if (afterEnd) {
+      if (cy !== ey) return { ...blank, state: 'far' }
+      // 中间全是没写过的空格格子时算出 0：那是用户往选区右边拖多了，等同于截到光标
+      leftToMove = this.countCells(ey, ex, cx)
+      if (leftToMove === 0) {
+        ax = cx
+        ay = cy
+        truncated = true
+      }
+    }
+
+    const text = this.readRange(sx, sy, ax, ay)
+    const chars = Array.from(text).length
+    if (!text.replace(/[\s\n]+/g, '')) return { ...blank, state: 'blank' }
+    if (chars > SEL_MAX_CHARS) return { ...blank, state: 'toolarge', chars }
+    return { state: 'ok', fromCursor: false, text, chars, leftToMove, truncated, rows: ay - sy + 1, endCol: ax, endRow: ay, startCol: sx, startRow: sy }
+  }
+
+  /**
+   * 没框选时的兜底：拿光标当锚，从光标往回括住整段连续的正文。
+   *
+   * 为什么安全：删除只能从光标往回退格，而光标就摆在那里 —— 括住的区间与退格能吃到的
+   * 区间是同一个，不需要猜任何站点行为；光标后面的列一律不算。站端编辑器里光标本来
+   * 就停在用户刚打完的那行末尾，所以这一步正好接住“打完字直接按热键”这个最自然的用法。
+   *
+   * 从光标那行往上走，遇到空行（空行 = 段落分隔，跨过去要删换行、算错就把段落糊在一
+   * 起）或未折行的正文行就停；只把 isWrapped 的续行并回去。
+   */
+  private cursorAnchored(): SelRead {
+    const blank: SelRead = {
+      state: 'empty', fromCursor: true, text: '', chars: 0, leftToMove: 0, truncated: false, rows: 0,
+      endCol: 0, endRow: 0, startCol: 0, startRow: 0,
+    }
+    if (!this.id) return blank
+    const b = this.term.buffer.active
+    const cx = b.cursorX
+    const cy = b.baseY + b.cursorY
+    const top = this.viewportTop(b)
+    if (cy < top || cy >= top + this.term.rows) return { ...blank, state: 'offscreen' }
+    const cap = (y: number): string => this.readLineTo(y, y === cy ? cx : this.term.cols)
+    if (!cap(cy).trim()) {
+      if (cy <= top || !b.getLine(cy - 1)?.isWrapped) return { ...blank, state: 'blank' }
+    }
+    const parts: string[] = [cap(cy)]
+    let y0 = cy
+    // 只要当前行是软折行的续行，它上面那行就还是同一段正文，继续并进来；走到段首
+    // （isWrapped=false）自然停。旧写法判断的是「上面那行」的 isWrapped，永远漏掉段首
+    // 那一行，跨软折行的正文只括到最后一屏（分隔符只改了尾巴）。
+    while (y0 > top && b.getLine(y0)?.isWrapped) {
+      const prev = cap(y0 - 1)
+      if (!prev.trim()) break
+      parts.unshift(prev)
+      y0--
+    }
+    // 并进来的是同一段被软折行切开的分片，直接首尾相接，不能补 \n（那不是真回车）
+    const text = parts.join('')
+    const chars = Array.from(text.replace(/[ \t]+$/g, '')).length
+    if (!text.trim()) return { ...blank, state: 'blank' }
+    if (chars > SEL_MAX_CHARS) return { ...blank, state: 'toolarge', chars }
+    return {
+      state: 'ok', fromCursor: true, text, chars, leftToMove: 0, truncated: false,
+      rows: cy - y0 + 1, endCol: cx, endRow: cy, startCol: 0, startRow: y0,
+    }
+  }
+
+  /** 读一行到 endCol 为止，按字宽走格（宽字符只出一个码点），末尾空白裁掉。 */
+  private readLineTo(row: number, endCol: number): string {
+    const b = this.term.buffer.active
+    const line = b.getLine(row)
+    if (!line) return ''
+    const cell = b.getNullCell()
+    const limit = Math.min(endCol, this.term.cols)
+    let s = ''
+    for (let x = 0; x < limit; ) {
+      if (!line.getCell(x, cell)) break
+      const w = cell.getWidth()
+      if (w > 0) s += cell.getChars() || ' '
+      x += w > 0 ? w : 1
+    }
+    return s.replace(/[ \t]+$/, '')
+  }
+
+  /**
+   * 删掉 readSelection 认定的那段文字，再把变换结果送回原位。
+   *
+   * 顺序不能换：先走位、再验证、然后才敢删 —— 验证不过就一个字节都不发出去。
+   * 删完还要再验一次（eraseRegion）：站端会吞退格键，没删净就绝不往下灌字，免得
+   * 残留的半句和新字叠在一起。调用方负责在事前把原文备份走（见 postactions 的内存备份）。
+   */
+  async replaceSelection(sel: SelRead, text: string): Promise<{ erased: number; lines: number; chars: number }> {
+    if (sel.state !== 'ok') throw new Error('选区状态已经变了，请重新框选')
+    if (!this.id) throw new Error('没有活动会话')
+    if (this.inserting) throw new Error('上一次灌入还没结束，请稍候')
+    this.inserting = true
+    try {
+      if (sel.leftToMove > 0) {
+        const seq = this.leftSeq()
+        for (let i = 0; i < sel.leftToMove; i++) await api.Write(this.id, seq)
+        await sleep(120)
+        const b = this.term.buffer.active
+        const cy = b.baseY + b.cursorY
+        if (cy !== sel.endRow || b.cursorX !== sel.endCol) {
+          throw new Error(`光标没能挪回选区末尾（停在 行${cy + 1} 列${b.cursorX + 1}），没有删任何字，请重新框选`)
+        }
+      }
+      const erase = this.site.backspace === 0 ? '\x08' : '\x7f'
+      // 退格会被站端吞（正是这套功能要对抗的丢字），删不净就停在半路绝不能接着灌 ——
+      // 否则残留的半句会和新灌的字叠在一起。删到头才写，删不到就放弃、交调用方报错。
+      if (!(await this.eraseRegion(sel, erase))) {
+        const b = this.term.buffer.active
+        throw new Error(`退格被站端吞了、没能删净 ${sel.chars} 字（光标停在 行${b.baseY + b.cursorY + 1} 列${b.cursorX + 1}），为不叠字没有继续灌入；原文已存内存备份，按 M-x i 可原样灌回`)
+      }
+      const r = await this.writeLines(text)
+      return { erased: sel.chars, lines: r.lines, chars: r.chars }
+    } finally {
+      this.inserting = false
+      this.term.clearSelection()
+    }
+  }
+
+  /**
+   * 从光标往回退格删到左边界（sel.startRow/startCol），逐个字确认光标真的退了。
+   *
+   * 一次只发一个退格、发完就等回声把光标挪动：站端吞键（正是这套功能要对抗的丢字）时
+   * 没动就重发、动了就继续；正文跨了软折行也靠这个循环一格一格退过去（旧的一次发 8 个
+   * 只在同一行补发，跨行时直接放弃 → 少删半行）。退过头（光标越过左边界）或连续多轮纹丝
+   * 不动就返回 false —— 让调用方停手，绝不把新字灌在删了一半的行上。
+   */
+  private async eraseRegion(sel: SelRead, erase: string): Promise<boolean> {
+    const read = () => {
+      const b = this.term.buffer.active
+      return { cy: b.baseY + b.cursorY, cx: b.cursorX }
+    }
+    const at = (p: { cy: number; cx: number }) => p.cy === sel.startRow && p.cx === sel.startCol
+    if (at(read())) return true
+    let stuck = 0
+    // 每个字最多发两次（留吞键重发余量），再加几步跨软折行的缓冲
+    for (let i = 0; i < sel.chars * 2 + 8; i++) {
+      const before = read()
+      if (before.cy < sel.startRow) return false
+      if (before.cy === sel.startRow && before.cx < sel.startCol) return false
+      if (at(before)) return true
+      await api.Write(this.id!, erase)
+      // 等回声：光标动了就进下一轮，500ms 内没动算这次被站端吞了
+      const t0 = Date.now()
+      let moved = false
+      while (Date.now() - t0 < 500) {
+        const p = read()
+        if (p.cy !== before.cy || p.cx !== before.cx || at(p)) { moved = true; break }
+        await sleep(40)
+      }
+      if (moved) {
+        stuck = 0
+        if (at(read())) return true
+      } else if (++stuck >= 5) {
+        return at(read())
+      }
+    }
+    return at(read())
+  }
+
+  /** 左方向键该发什么：与用户手按时一致，否则站点编辑器认不出来。 */
+  private leftSeq(): string {
+    // VT100 方案无视应用光标键模式恒发 \x1bOD；其余交给远端切的光标键模式（原生口径）
+    if ((this.site.keyType ?? 0) === 2) return '\x1bOD'
+    return this.term.modes.applicationCursorKeysMode ? '\x1bOD' : '\x1b[D'
+  }
+
+  /**
+   * 取缓冲区 [start, end] 之间的文字。行尾空白裁掉（那些格子在编辑器里根本不是字符），
+   * 被站端自动折行的一行并回上一行、不补换行 —— 只有真回车才占一个字符。
+   */
+  private readRange(sx: number, sy: number, ex: number, ey: number): string {
+    const b = this.term.buffer.active
+    const parts: string[] = []
+    for (let y = sy; y <= ey; y++) {
+      const line = b.getLine(y)
+      if (!line) break
+      if (y > sy && !line.isWrapped) parts.push('\n')
+      parts.push(line.translateToString(true, y === sy ? sx : 0, y === ey ? ex : this.term.cols))
+    }
+    return parts.join('')
+  }
+
+  /** 数一段列区间里有几个「字符」：宽字符占两格算一个，空格子与右半格不算。 */
+  private countCells(row: number, from: number, to: number): number {
+    if (to <= from) return 0
+    const b = this.term.buffer.active
+    const line = b.getLine(row)
+    if (!line) return 0
+    const cell = b.getNullCell()
+    let n = 0
+    for (let x = from; x < to; ) {
+      if (!line.getCell(x, cell)) break
+      const w = cell.getWidth()
+      if (w > 0) n++
+      x += w > 0 ? w : 1
+    }
+    return n
+  }
 
   /* ---------------------------- 鼠标点菜单 ---------------------------- */
 

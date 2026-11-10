@@ -84,6 +84,10 @@ type Preferences struct {
 	ConfirmClose       bool   `json:"confirmClose"`
 	MenuClickEnabled   bool   `json:"menuClickEnabled"` // 鼠标点 BBS 菜单/清单（原版 detectPageState + processLClick）
 
+	// 发帖分隔符（编辑工具栏）：上一次选用的那个字符，热键 M-x s 直接复用。
+	// 空串表示没选过，前端退回出厂默认 ^；只存能安全往返的可见字符。
+	PostSepChar string `json:"postSepChar"`
+
 	// IP 归属地（原版 openUrlCheck_ + qqwry.dat）：悬停命中屏幕上的 IPv4 就查本地纯真库。
 	// IPLocationDb 空则用自动下载落点（配置目录）；IPLocationUrl 空则用内置镜像地址。
 	IPLocationEnabled bool   `json:"ipLocationEnabled"` // 总开关，关掉就不再扫屏幕也不会下库
@@ -164,6 +168,52 @@ func DefaultKeymap() KeymapConfig {
 			Command: "tab.next",
 			Enabled: true,
 			Note:    "切到下一个标签（循环；只有一个标签时无动作）",
+		},
+		// 发帖动作一族：除 post.insert 外都是「读鼠标选区 → 变换 → 原地替换」。
+		// 源头不用剪贴板：水木那类站的编辑器跑在服务器上，剪贴板里躺着什么客户端猜不到，
+		// 而用户要改的是他刚在编辑区敲下去的那段字 —— 选区同时供了内容和位置。
+		// 键位收在 M-x 前缀的同一族里，避开已被占用的 M-x p 与 M-x M-q。
+		{
+			Keys:    "M-x s",
+			Command: "post.sep",
+			Enabled: true,
+			Note:    "选中文字字间插入上次选用的分隔符（可写成 post.sep:符号 固定某个）",
+		},
+		{
+			Keys:    "M-x r",
+			Command: "post.sep-random",
+			Enabled: true,
+			Note:    "从预置集合里随机挑一种符号，把选中那段插字间",
+		},
+		{
+			Keys:    "M-x m",
+			Command: "post.sep-mixed",
+			Enabled: true,
+			Note:    "逐字随机：选中那段里每两个字之间抽一个不同的预置符号",
+		},
+		{
+			Keys:    "M-x l",
+			Command: "post.sep-pick",
+			Enabled: true,
+			Note:    "打开分隔符选择面板（预置符号 / 自定义 / 随机都在里头）",
+		},
+		{
+			Keys:    "M-x v",
+			Command: "post.vertical",
+			Enabled: true,
+			Note:    "选中文字转竖排后原地替换（栅格按当前终端列数算）",
+		},
+		{
+			Keys:    "M-x i",
+			Command: "post.insert",
+			Enabled: true,
+			Note:    "剪贴板原样逐行灌入光标处（不删任何东西，也是替换失败时的后路）",
+		},
+		{
+			Keys:    "M-x t",
+			Command: "post.toolbar-toggle",
+			Enabled: true,
+			Note:    "钉住 / 收起终端顶部的编辑工具栏（平时把鼠标移到顶缘唤出）",
 		},
 	}
 	return KeymapConfig{

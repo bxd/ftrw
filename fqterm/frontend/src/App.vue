@@ -8,8 +8,13 @@ import PrefsDialog from './components/PrefsDialog.vue'
 import SchemeDialog from './components/SchemeDialog.vue'
 import ZmodemDialog from './components/ZmodemDialog.vue'
 import KeymapDialog from './components/KeymapDialog.vue'
+import EditToolbar from './components/EditToolbar.vue'
 import { keyseq, registerCommand, type EchoInfo } from './keyseq'
 import { registerBuiltinCommands } from './keymapcmds'
+import {
+  configurePost, openSepPicker, runRaw, runSep, runVertical, sepPickerOpen,
+  toolbarPinned, toggleToolbarPin,
+} from './postactions'
 import { applyProbe, asKind, classifyURL, hostSpanAt, ipSpanAt, linkName, looksGenericName, mediaOnly, probeTargets, type PreviewItem } from './linkscan'
 
 interface TabMeta { id: string; title: string; status: string }
@@ -62,7 +67,13 @@ function onBodyMove(ev: MouseEvent) {
   if (dialogOpen.value) return
   const host = ev.currentTarget as HTMLElement | null
   if (!host) return
-  const x = ev.clientX - host.getBoundingClientRect().left
+  const rect = host.getBoundingClientRect()
+  feedSidebar(ev.clientX - rect.left)
+  feedToolbar(ev.clientY - rect.top)
+}
+
+/** 站点栏那一半：判定依旧带迟滞，收起时只认左缘 EDGE_PX，展开后整块面板宽度都算。 */
+function feedSidebar(x: number) {
   const over = x <= (sidebarShown.value ? SIDEBAR_W : EDGE_PX)
   if (over === sidebarHover.value) return
   if (over) {
@@ -74,16 +85,57 @@ function onBodyMove(ev: MouseEvent) {
   }
 }
 
+/* ---------------- 编辑工具栏（终端顶部的浮条） ---------------- */
+// 与左侧站点栏同一套坐标判定：浮条自身是透明的，再铺一层会吃掉点击的 mouseenter
+// 热区不划算；而它贴着 .body 顶边，y 坐标一算就知道进没进。
+// 迟滞与侧栏同理：收起时只认顶缘 TB_EDGE_PX，展开后整条高度都算“还在上面”。
+const TB_EDGE_PX = 6
+const TB_H = 30            // 与 EditToolbar 里 .ebt-bar 的实际高度对齐（运行量得 29px，留 1px 免得贴底那一排抽抖）
+const tbHover = ref(false)
+let tbHideTimer: number | undefined
+
+function clearTbHide() {
+  if (tbHideTimer) { clearTimeout(tbHideTimer); tbHideTimer = undefined }
+}
+
+function scheduleTbHide(ms = 350) {
+  clearTbHide()
+  tbHideTimer = window.setTimeout(() => { tbHover.value = false; tbHideTimer = undefined }, ms)
+}
+
+/**
+ * 展开条件里为什么单独留着 sepPickerOpen：符号面板比工具栏高得多，鼠标往下够到
+ * 「随机一种」时早就出了这条热区，只看 hover 会在半路把面板收掉，看起来像它自己关了。
+ */
+const tbShown = computed(() => !dialogOpen.value && active.value >= 0
+  && (toolbarPinned.value || tbHover.value || sepPickerOpen.value))
+
+function feedToolbar(y: number) {
+  const over = y <= (tbShown.value ? TB_H : TB_EDGE_PX)
+  if (over) {
+    clearTbHide()
+    tbHover.value = true
+    return
+  }
+  if (tbHover.value && !toolbarPinned.value && !sepPickerOpen.value) scheduleTbHide()
+}
+
 function onBodyLeave() {
-  if (!sidebarHover.value || sidebarFocused.value) return
-  sidebarHover.value = false
-  scheduleSideHide()
+  if (sidebarHover.value && !sidebarFocused.value) {
+    sidebarHover.value = false
+    scheduleSideHide()
+  }
+  if (tbHover.value && !toolbarPinned.value && !sepPickerOpen.value) scheduleTbHide()
 }
 
 function onWindowBlur() {
   // 离开应用（Alt+Tab）也算失焦，收起悬浮面板
   sidebarFocused.value = false
   scheduleSideHide(120)
+  if (!toolbarPinned.value && !sepPickerOpen.value) {
+    tbHover.value = false
+    clearTbHide()
+  }
 }
 
 /** 焦点真正离开侧栏内部才置假（在侧栏子元素之间移动不算）。 */
@@ -292,6 +344,77 @@ registerCommand({
   handler: () => cycleTab(1),
 })
 
+/* ---------------- 发帖动作（编辑工具栏背后那套） ---------------- */
+// 动作本体住在 postactions.ts（读鼠标选区 → 变换 → 原地替换），这里只把界面接上：
+// 目标会话、状态区、以及“上次用过哪个分隔符”那份偏好。
+configurePost({
+  target: () => {
+    const t = active.value >= 0 ? insts[active.value] : null
+    return t && t.id ? t : null // 还没连上的标签不算目标（送不进去）
+  },
+  echo: (m, k) => showEcho(m, k || 'info'),
+  getSep: () => prefs.value?.postSepChar || '',
+  setSep: (ch) => {
+    if (!prefs.value || prefs.value.postSepChar === ch) return
+    prefs.value.postSepChar = ch
+    // 为一个字符走整圈“保存设置”的重活不值，直接整份回写（后端会自己归一代理那些字段）；
+    // 写失败也只是下次记不住，不该打断这一次的插入
+    api.SetPreferences(prefs.value).catch(() => { /* noop */ })
+  },
+})
+
+// 七条命令里除 post.insert 外都是“鼠标选区 → 原地替换”这一个动作的不同做法，默认键位收在
+// M-x 前缀的同一族里（s 用上次符号 / r 随机一种 / m 逐字随机 / l 打开面板 / v 竖排 / i 灌剪贴板 / t 钉住）。
+// post.sep 允许带参（写成 post.sep:·），用户想给常用符号单独配一键就能配。
+registerCommand({
+  id: 'post.sep',
+  title: '发帖：选中文字字间插入分隔符（可写成 post.sep:符号）',
+  description: '默认 M-x s；先鼠标框住编辑区那段字，不带参就用上次选定的那个，参数字符会顺手记成新的默认',
+  handler: (arg) => { void runSep('fixed', arg || undefined) },
+})
+
+registerCommand({
+  id: 'post.sep-random',
+  title: '发帖：选中文字随机挑一种分隔符插入',
+  description: '默认 M-x r；从预置集合里选一个，选中那段全文用同一个',
+  handler: () => { void runSep('randomOne') },
+})
+
+registerCommand({
+  id: 'post.sep-mixed',
+  title: '发帖：选中文字逐字随机分隔符',
+  description: '默认 M-x m；每两个字之间抽一个不同的',
+  handler: () => { void runSep('randomMixed') },
+})
+
+registerCommand({
+  id: 'post.sep-pick',
+  title: '发帖：打开分隔符选择面板',
+  description: '默认 M-x l；预置符号、自定义一个、随机一种、逐字随机都从这里进',
+  handler: () => { openSepPicker() },
+})
+
+registerCommand({
+  id: 'post.vertical',
+  title: '发帖：选中文字转竖排',
+  description: '默认 M-x v；栅格按当前终端列数算，ASCII 全角化，原地替换掉框住的那段',
+  handler: () => { void runVertical() },
+})
+
+registerCommand({
+  id: 'post.insert',
+  title: '发帖：原样送入（优先灌回内存备份，没有才读剪贴板；逐行限速，不删任何东西）',
+  description: '默认 M-x i；优先把上一次原地替换存进内存的原文备份灌回（不碰系统剪贴板），内存里没有才逐行限速读并送入剪贴板（只读不写）',
+  handler: () => { void runRaw() },
+})
+
+registerCommand({
+  id: 'post.toolbar-toggle',
+  title: '发帖：钉住 / 收起编辑工具栏',
+  description: '默认 M-x t；钉住后鼠标移开也不收起，反复点按钮时方便',
+  handler: () => { toggleToolbarPin() },
+})
+
 // 窗口形态（普通 / quake）。与后端共用同一个原生窗口，这里只镜像状态供界面使用。
 const winMode = ref<api.WindowModeState>({ mode: 'window', visible: true })
 const isQuake = computed(() => winMode.value.mode === 'quake')
@@ -446,7 +569,18 @@ function onIPProgress(d: api.IPUpdateProgress) {
  */
 function installDebugHook() {
   const w = window as any
-  w.__ftrw = { insts, TermTab, onIPHover, showEcho, api, ipSpanAt, hostSpanAt, prefs }
+  w.__ftrw = {
+    insts, TermTab, onIPHover, showEcho, api, ipSpanAt, hostSpanAt, prefs, sites,
+    // 切标签 / 读当前标签：CDP 取证必须对指定的那个会话动手，
+    // 否则鼠标事件会落到屏幕上正显示的那个标签（隐藏标签的容器是 display:none）
+    setActive, active,
+    // 开标签也递出去：工具栏只在有标签时挂载，调试时得先有一个标签才能看到它
+    // （只走现成的 newTab，不绕过任何校验）
+    newTab,
+    // 发帖这一套一并交给调试口：灌入的时序（逐行 + 限速）只能拿真会话验，
+    // 把这层递出去就能从 CDP 直接驱动，不必用鼠标去碰那条自动隐藏的浮条
+    post: { runSep, runVertical, runRaw, openSepPicker, sepPickerOpen, toolbarPinned, tbShown },
+  }
 }
 
 async function newTab(site: api.Site) {
@@ -821,7 +955,11 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       </div>
     </div>
 
-    <div class="body" @mousemove="onBodyMove" @mouseleave="onBodyLeave">
+    <!-- 顶缘/左缘热区靠 mousemove 算坐标，必须用 capture：xterm 在 .xterm 根元素上
+         对 mousemove 第一行就 stopImmediatePropagation，冒泡阶段的监听在鼠标落到
+         屏幕正文上时根本收不到事件——面板能弹出来（首屏那几像素落在容器的 padding
+         上）但再也收不回，看起来就像“工具栏卡在屏幕上了”。 -->
+    <div class="body" @mousemove.capture="onBodyMove" @mouseleave="onBodyLeave">
       <!-- 浮动侧栏：收起时整块滑到左缘外，不占据布局 → 终端视口宽度不变 -->
       <div class="sidebar" ref="sidebarEl" tabindex="-1" :style="{ transform: sidebarTransform }"
            @click.self="focusSidebar" @focusin="sidebarFocused = true" @focusout="onSidebarFocusOut"
@@ -859,10 +997,12 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 
       <div class="main">
         <div class="viewport" ref="viewport" />
+        <EditToolbar v-if="tabs.length" :shown="tbShown" />
         <div v-if="!tabs.length" class="welcome">
           <h2>FTRW</h2>
           <p>Telnet / SSH / BBS 终端</p>
           <div class="hint">点击「＋ 连接」新建会话；把鼠标移到窗口左缘、或按 Alt+X P 唤出站点栏（失焦自动收起）</div>
+          <div class="hint">连上之后把鼠标移到终端顶缘会滑出「编辑工具栏」：先用鼠标框住编辑区里要处理的文字，再一键插分隔符或转竖排（Alt+X 后按 S / V）</div>
         </div>
       </div>
     </div>

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 出厂绑定补种的回归重点在两件事：新版新增的绑定要能进到老用户的表里，
 // 而老用户已经改过/删掉的绝不能在下次启动时复活。
@@ -75,6 +78,42 @@ func TestDefaultKeymapSeedsTabCycling(t *testing.T) {
 		if got[cmd] != keys {
 			t.Fatalf("出厂绑定 %s = %q, want %q", cmd, got[cmd], keys)
 		}
+	}
+}
+
+func TestDefaultKeymapSeedsPostActions(t *testing.T) {
+	// 编辑工具栏那七个动作要开箱即用，靠的就是出厂绑定被正确补种；
+	// 键位都收在 M-x 一族里，且不能把已经占用的 M-x p / M-x M-q / S-<方向键> 撞掉。
+	want := map[string]string{
+		"post.sep":            "M-x s",
+		"post.sep-random":     "M-x r",
+		"post.sep-mixed":      "M-x m",
+		"post.sep-pick":       "M-x l",
+		"post.vertical":       "M-x v",
+		"post.insert":         "M-x i",
+		"post.toolbar-toggle": "M-x t",
+	}
+	got := map[string]string{}
+	for _, b := range DefaultKeymap().Bindings {
+		got[b.Command] = b.Keys
+	}
+	for cmd, keys := range want {
+		if got[cmd] != keys {
+			t.Fatalf("出厂绑定 %s = %q, want %q", cmd, got[cmd], keys)
+		}
+	}
+}
+
+func TestDefaultKeymapHasNoDuplicateKeys(t *testing.T) {
+	// 一个序列只能落到一个命令：两条出厂绑定撞键时后一条永远不会被触发，
+	// 而界面上看上去就是“那个功能的热键按了没反应”，所以在这里拦死。
+	seen := map[string]string{}
+	for _, b := range DefaultKeymap().Bindings {
+		k := strings.ToLower(b.Keys)
+		if other, dup := seen[k]; dup {
+			t.Fatalf("键位冲突：%q 同时给了 %s 和 %s", b.Keys, other, b.Command)
+		}
+		seen[k] = b.Command
 	}
 }
 

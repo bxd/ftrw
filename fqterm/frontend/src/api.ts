@@ -71,6 +71,8 @@ export interface Preferences {
   scrollbackLines: number
   confirmClose: boolean
   menuClickEnabled: boolean
+  // 发帖分隔符（编辑工具栏）：上一次选用的那个字符，空串表示没选过
+  postSepChar: string
   // 窗口形态：quake 下拉与普通窗口共用同一个原生窗口，尺寸按工作区（已扣除任务栏）百分比算
   quakeWidthPct: number
   quakeHeightPct: number
