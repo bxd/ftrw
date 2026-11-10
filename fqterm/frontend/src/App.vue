@@ -344,6 +344,13 @@ registerCommand({
   handler: () => cycleTab(1),
 })
 
+registerCommand({
+  id: 'tab.close',
+  title: '标签：关闭当前标签',
+  description: '默认 M-x k；连着线时按偏好可能弹确认，断开态直接关',
+  handler: () => { if (active.value >= 0) void closeTab(active.value) },
+})
+
 /* ---------------- 发帖动作（编辑工具栏背后那套） ---------------- */
 // 动作本体住在 postactions.ts（读鼠标选区 → 变换 → 原地替换），这里只把界面接上：
 // 目标会话、状态区、以及“上次用过哪个分隔符”那份偏好。
@@ -601,6 +608,10 @@ async function newTab(site: api.Site) {
 
   const tab = new TermTab(site, container, { scrollback: prefs.value?.scrollbackLines })
   tab.onLink = (uri) => void onLinkClick(tab, uri)
+  // 断线后的按键出口：空格关掉本标签（用 idxOf 现取现算，免得标签前后变动时关错），
+  // 回车重连（复用 api.Connect 起新会话、api.Disconnect 清掉旧的死会话）。
+  tab.onDisconnectedSpace = () => { const i = idxOf(tab); if (i >= 0) void closeTab(i) }
+  tab.onDisconnectedEnter = () => { void reconnectTab(tab) }
   // 鼠标点菜单：开关取偏好（旧 prefs.json 没这个键时算开），悬停命中的提示进 echo 区
   tab.menuClick = prefs.value?.menuClickEnabled !== false
   tab.onMenuHint = (label) => showEcho(`点菜单：${label}`, 'info')
@@ -734,6 +745,39 @@ async function closeTab(i: number) {
   tabs.value.splice(i, 1)
   if (active.value >= insts.length) active.value = insts.length - 1
   if (insts.length) setActive(active.value)
+}
+
+/**
+ * 重连一个已断开的标签：先 Disconnect 清掉旧的死会话（顺带停掉它的自动重连协程），
+ * 再用站点参数 api.Connect 起一个新会话换上 id；标签本身、滚动缓冲、窗口都不动。
+ * 若从没连上过（tab.id 为空，首连就抛错、后端已自行移除），则直接 Connect 补上。
+ */
+async function reconnectTab(tab: TermTab) {
+  const mi = idxOf(tab)
+  if (mi < 0) return
+  if (tab.status === 'connected' || tab.status === 'connecting') return
+  tab.setStatus('connecting')
+  if (tabs.value[mi]) tabs.value[mi].status = 'connecting'
+  const old = tab.id
+  if (old) { api.Disconnect(old).catch(() => { /* 死会话断开失败无所谓 */ }); byId.delete(old) }
+  tab.write('\r\n\x1b[90m[正在重连…]\x1b[0m\r\n')
+  try {
+    const id = await api.Connect(tab.site)
+    tab.id = id
+    byId.set(id, tab)
+    // 新会话的尺寸是按站点默认（80x25）起步的；标签已经 fit 到位、重连时不会再生
+    // onResize，不主动补一刀的话远端会按默认尺寸排版、菜单分栏错位。
+    api.Resize(id, tab.term.cols, tab.term.rows).catch(() => { /* noop */ })
+    // 同 newTab：Connect 返回前的 connected 事件早于 byId.set 会被丢弃，这里补一次。
+    tab.setStatus('connected')
+    if (tabs.value[mi]) { tabs.value[mi].id = id; tabs.value[mi].status = 'connected' }
+    showEcho('已重连', 'info')
+  } catch (e: any) {
+    tab.write(`\r\n\x1b[31m重连失败: ${e?.message || e}\x1b[0m\r\n`)
+    tab.setStatus('error')
+    if (tabs.value[mi]) tabs.value[mi].status = 'error'
+    showEcho(`重连失败: ${e?.message || e}`, 'error')
+  }
 }
 
 function openQuickConnect() {

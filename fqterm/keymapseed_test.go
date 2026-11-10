@@ -69,7 +69,7 @@ func TestSeedFactoryBindingsRespectsUserRebindAndUnbind(t *testing.T) {
 func TestDefaultKeymapSeedsTabCycling(t *testing.T) {
 	// 标签循环切换靠出厂绑定开箱即用，但它们的键是终端选区扩展正在用的键，
 	// 所以这两条必须能在绑定表里看到、能改、能停用 —— 前提是先被正确补种。
-	want := map[string]string{"tab.prev": "S-<LEFT>", "tab.next": "S-<RIGHT>"}
+	want := map[string]string{"tab.prev": "S-<LEFT>", "tab.next": "S-<RIGHT>", "tab.close": "M-x k"}
 	got := map[string]string{}
 	for _, b := range DefaultKeymap().Bindings {
 		got[b.Command] = b.Keys

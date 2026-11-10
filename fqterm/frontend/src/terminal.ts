@@ -163,6 +163,14 @@ export class TermTab {
   container: HTMLDivElement
   encoderID: number
 
+  /**
+   * 失去连接时的按键去处：空格走 onDisconnectedSpace 关掉当前标签，回车走
+   * onDisconnectedEnter 重连。只在 status 为 closed/error 时拦截（见
+   * attachCustomKeyEventHandler），由 App.vue 注入到每个活标签。
+   */
+  onDisconnectedSpace?: () => void
+  onDisconnectedEnter?: () => void
+
   // FQTerm 式拉伸：固定行数，把字号放大到刚好填满高度，再让列数随宽度回流填满，
   // 上下左右都填满；若有少量残余空隙则居中。
   // 对齐原版 isFontAutoFit_ 三态：1=字号随窗口（默认）0=行列随窗口 2=固定行列。
@@ -258,6 +266,23 @@ export class TermTab {
       if (keyseq.feed(ev as KeyboardEvent) === 'swallow') {
         ev.preventDefault()
         return false
+      }
+      // 断线态（closed/error）下把裸空格/回车当作“关标签 / 重连”的出口：热键
+      // 框架（上面 feed）已优先过，若这键没落进任何绑定，且没夹带 Ctrl/Alt/Meta，
+      // 就在 keydown 阶段拦下——既不发给已死的远端，也不让 xterm 把它当普通输入。
+      if (this.status === 'closed' || this.status === 'error') {
+        if (!ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          if (ev.key === ' ') {
+            ev.preventDefault()
+            this.onDisconnectedSpace?.()
+            return false
+          }
+          if (ev.key === 'Enter') {
+            ev.preventDefault()
+            this.onDisconnectedEnter?.()
+            return false
+          }
+        }
       }
       // 按键方案（keyType）+ 退格键（backspace）：接管与原生编码不同的那几个键。
       // 放在键序列之后，热键绑定永远优先于站点的按键方案。
