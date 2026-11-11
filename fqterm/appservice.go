@@ -104,6 +104,7 @@ func (s *AppService) prefs() Preferences {
 func (s *AppService) Start() {
 	s.installCloseHook()
 	s.installBlurHook()
+	s.installQuakeOnTop()
 	s.startGlobalKeys()
 	s.publish()
 }
@@ -154,6 +155,16 @@ func (s *AppService) installBlurHook() {
 		}
 		s.win.Hide()
 		s.publish()
+	})
+}
+
+// installQuakeOnTop 给 quake 模式再加一道保险：窗口每次获得焦点都重申置顶，
+// 覆盖「被其它置顶应用短暂压住后点回来」等场景，让下拉始终浮在最上层。
+func (s *AppService) installQuakeOnTop() {
+	s.win.OnWindowEvent(events.Common.WindowFocus, func(*application.WindowEvent) {
+		if s.Mode() == ModeQuake {
+			s.win.SetAlwaysOnTop(true)
+		}
 	})
 }
 
@@ -268,6 +279,7 @@ func (s *AppService) TrayClick() {
 		s.win.Hide()
 	} else {
 		s.win.Show()
+		s.raiseQuake()
 		s.win.Focus()
 	}
 	s.publish()
@@ -307,7 +319,9 @@ func (s *AppService) ToggleWindowMode() WindowModeState {
 	if !s.win.IsVisible() {
 		s.win.Show()
 	}
+	s.raiseQuake()
 	s.win.Focus()
+	s.publish()
 	return s.GetWindowMode()
 }
 
@@ -321,6 +335,7 @@ func (s *AppService) HotkeyToggleQuake() {
 	}
 	s.SetMode(ModeQuake)
 	s.win.Show()
+	s.raiseQuake()
 	s.win.Focus()
 	s.publish()
 }
@@ -364,6 +379,7 @@ func (s *AppService) SetMode(target string) {
 		s.win.SetBounds(qb)
 		// quake 必须置顶，否则「呼出」出来的下拉会被当前活动应用盖住。
 		s.win.SetAlwaysOnTop(true)
+		s.publish()
 		return
 	}
 
@@ -372,6 +388,17 @@ func (s *AppService) SetMode(target string) {
 		s.win.SetBounds(saved)
 	}
 	s.publish()
+}
+
+// raiseQuake 在 quake 模式下把窗口重新钉到最上层。
+// WS_EX_TOPMOST 只在 SetMode「切换到 quake」那一次设置；「失焦收起 → 再呼出」时模式
+// 没变、SetMode 提前 return 不重申，就可能被收起期间冒出来的其它置顶窗口压住。各呼出
+// 路径统一补一次，保证 quake 下拉永远浮在最上层。
+func (s *AppService) raiseQuake() {
+	if s.Mode() != ModeQuake {
+		return
+	}
+	s.win.SetAlwaysOnTop(true)
 }
 
 // quakeBounds 按当前屏幕工作区与配置百分比算下拉几何。
