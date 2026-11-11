@@ -80,8 +80,11 @@ type PreviewRequest struct {
 
 // dialogGuarder 是 AppService 的一小面：预览窗口是独立 HWND，弹出必然让主窗口失焦，
 // quake 模式「失焦即收起」不加这道护栏就会把自己的弹窗当成「用户切走了」。
+// Mode 用来判断主窗口当下是不是 quake 下拉形态，决定预览窗要不要同步置顶。
 type dialogGuarder interface {
 	SetDialogGuard(on bool)
+	Mode() string
+	RestoreMainFocus()
 }
 
 type PreviewService struct {
@@ -157,8 +160,7 @@ func (s *PreviewService) openMedia(req *PreviewRequest, item PreviewItem) error 
 		win.SetTitle(title)
 		win.EmitEvent(previewEventLoad, req)
 	}
-	win.Show()
-	win.Focus()
+	s.frontPreview(win)
 	return nil
 }
 
@@ -177,8 +179,7 @@ func (s *PreviewService) openPage(rawURL string, item PreviewItem) error {
 	win.SetURL(rawURL)
 	win.SetTitle(title)
 	s.setMode(PreviewPage)
-	win.Show()
-	win.Focus()
+	s.frontPreview(win)
 	log.Printf("预览窗口导航到网页：%s", rawURL)
 	return nil
 }
@@ -233,21 +234,37 @@ func (s *PreviewService) newWindow(startURL, title, mode string) error {
 	s.mode = mode
 	s.mu.Unlock()
 
+	// 护栏赶在抢焦点之前置位：AttachModal 内部的 SetForegroundWindow 会在主线程上
+	// 同步触发主窗口的 WindowLostFocus，护栏晚一步置位，quake 收起钩子就把自家预览
+	// 当成「用户切走了」，下拉直接被藏掉。
+	if s.ctl != nil {
+		s.ctl.SetDialogGuard(true)
+	}
 	// 真模态：把预览设成主窗口的 owner 并 EnableWindow(main, false)，
 	// 关窗时 Wails 自己把主窗口放回来（见 windowsWebviewWindow 的 parentHWND 清理）。
 	s.main.AttachModal(win)
-	win.Show()
-	win.Focus()
+	s.frontPreview(win)
 	if hwnd != 0 {
 		armEscWatch(hwnd, func() { s.ClosePreview() })
 	} else {
 		log.Printf("预览窗口未取得 HWND，ESC 只能靠页面内按键处理（网页模式下会失灵）")
 	}
-	if s.ctl != nil {
-		s.ctl.SetDialogGuard(true)
-	}
 	log.Printf("预览窗口已打开（%s 模式，%dx%d，hwnd=%#x）：%s", mode, w, h, hwnd, title)
 	return nil
+}
+
+// frontPreview 把预览窗提到前面并聚焦。quake 下主窗是 WS_EX_TOPMOST，非 topmost
+// 的预览窗哪怕有 owner 关系也永远压不过它，故同步置顶；复用路径也要先设护栏：
+// 主窗（quake）持有焦点时，Show/Focus 抢焦点同样会触发失焦收起钩子。
+func (s *PreviewService) frontPreview(win *application.WebviewWindow) {
+	if s.ctl != nil {
+		s.ctl.SetDialogGuard(true)
+		if s.ctl.Mode() == ModeQuake {
+			win.SetAlwaysOnTop(true)
+		}
+	}
+	win.Show()
+	win.Focus()
 }
 
 // ClosePreview 关掉预览窗口。✕、ESC、页面按钮都汇到这里，可重复调用。
@@ -284,6 +301,14 @@ func (s *PreviewService) onWindowClosed(win *application.WebviewWindow, hwnd uin
 	}
 	if s.ctl != nil {
 		s.ctl.SetDialogGuard(false)
+		// 焦点还给主窗：Wails 的模态清理只重新启用主窗、不还前台（见
+		// RestoreMainFocus）。本回调在 WindowClosing 里、主窗还没销毁完，窗口 API
+		// 又全是 InvokeSync，故起 goroutine 略等一下，免得抢完前台又被销毁流程把
+		// 焦点交出去（同 installCloseHook 的线程考量）。
+		go func() {
+			time.Sleep(120 * time.Millisecond)
+			s.ctl.RestoreMainFocus()
+		}()
 	}
 	log.Printf("预览窗口已关闭")
 }

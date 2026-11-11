@@ -280,6 +280,7 @@ func (s *AppService) TrayClick() {
 	} else {
 		s.win.Show()
 		s.raiseQuake()
+		s.forceShowFront()
 		s.win.Focus()
 	}
 	s.publish()
@@ -320,6 +321,7 @@ func (s *AppService) ToggleWindowMode() WindowModeState {
 		s.win.Show()
 	}
 	s.raiseQuake()
+	s.forceShowFront()
 	s.win.Focus()
 	s.publish()
 	return s.GetWindowMode()
@@ -336,6 +338,7 @@ func (s *AppService) HotkeyToggleQuake() {
 	s.SetMode(ModeQuake)
 	s.win.Show()
 	s.raiseQuake()
+	s.forceShowFront()
 	s.win.Focus()
 	s.publish()
 }
@@ -399,6 +402,32 @@ func (s *AppService) raiseQuake() {
 		return
 	}
 	s.win.SetAlwaysOnTop(true)
+}
+
+// forceShowFront 把主窗口强行提到 OS 前台，抢在 Wails 的 Focus() 之前破掉「前台锁」。
+// 全局热键/托盘从别的 app 手里呼出 quake 时，单靠 win.Focus() 内部的 SetForegroundWindow
+// 会被焦点窃取防护拦下（窗口显示但键盘进不来）；forceForeground 用 AttachThreadInput
+// 绕开后，紧随的 win.Focus() 才能真正把焦点送进 webview，前端再 term.focus() 落到终端。
+func (s *AppService) forceShowFront() {
+	var hwnd uintptr
+	application.InvokeSync(func() {
+		if p := s.win.NativeWindow(); p != nil {
+			hwnd = uintptr(p)
+		}
+	})
+	forceForeground(hwnd)
+}
+
+// RestoreMainFocus 在预览这类独立弹窗关闭后把前台收回主窗口：Wails 的模态清理
+// 只做 EnableWindow(main, true)，不还前台——弹窗销毁那一刻系统按 z 序把前台交给
+// 别的应用，主窗口就这么丢了焦点。不可见时不抢：焦点还回来不该顺手把窗口呼出。
+func (s *AppService) RestoreMainFocus() {
+	if s.win == nil || !s.win.IsVisible() {
+		return
+	}
+	s.raiseQuake()
+	s.forceShowFront()
+	s.win.Focus()
 }
 
 // quakeBounds 按当前屏幕工作区与配置百分比算下拉几何。

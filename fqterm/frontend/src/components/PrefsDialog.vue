@@ -12,7 +12,7 @@ if (!p.zmodemDir) p.zmodemDir = ''
 // 进入半选中 / NaN 状态，先把它们落到出厂默认上。
 if (p.quakeWidthPct == null || p.quakeWidthPct < 20) p.quakeWidthPct = 100
 if (p.quakeHeightPct == null || p.quakeHeightPct < 20) p.quakeHeightPct = 40
-if (p.quakeHideOnBlur == null) p.quakeHideOnBlur = true
+if (p.quakeHideOnBlur == null) p.quakeHideOnBlur = false
 if (p.trayEnabled == null) p.trayEnabled = true
 if (p.closeToTray == null) p.closeToTray = false
 if (p.menuClickEnabled == null) p.menuClickEnabled = true

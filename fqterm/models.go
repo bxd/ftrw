@@ -358,7 +358,7 @@ func defaultPreferences() Preferences {
 		IPLocationEnabled: true,
 		QuakeWidthPct:     100,
 		QuakeHeightPct:    40,
-		QuakeHideOnBlur:   true,
+		QuakeHideOnBlur:   false,
 		TrayEnabled:       true,
 		CloseToTray:       false,
 	}
