@@ -136,6 +136,83 @@ function onWindowBlur() {
     tbHover.value = false
     clearTbHide()
   }
+  hideTbFloat()
+}
+
+/* ---------------- 全屏（工具条改浮在底缘） ---------------- */
+// 全屏要的是「终端吃满整屏」：顶部工具条不再占布局（改成 fixed 浮层）、底部状态条
+// 收起。工具条平时整条沉到屏幕下沿外，鼠标在最底几像素停满 1 秒才滑出，往上抬开就收回。
+// 1 秒的停留而不是一碰就弹：拖滚动条、选到行尾、右键菜单这类动作都会频繁扫过底缘，
+// 路过就弹会把终端最下面几行反复盖住。
+const TB_FULL_EDGE = 8        // 收起时「够到底缘」的判定高度
+const TB_FULL_H = 40          // 与 .topbar 实际高度对齐（含上下 padding）
+const TB_FULL_DWELL_MS = 1000 // 停满 1 秒才浮出
+const isFull = ref(false)
+const tbFloat = ref(false)
+let tbDwellTimer: number | undefined
+let tbFloatHideTimer: number | undefined
+
+function clearTbFloatTimers() {
+  if (tbDwellTimer) { clearTimeout(tbDwellTimer); tbDwellTimer = undefined }
+  if (tbFloatHideTimer) { clearTimeout(tbFloatHideTimer); tbFloatHideTimer = undefined }
+}
+
+/** 收起浮动工具条：退出全屏、失焦、指针离开窗口、对话框打开都走它，两个定时器一起清。 */
+function hideTbFloat() {
+  clearTbFloatTimers()
+  tbFloat.value = false
+}
+
+/**
+ * fromBottom 是光标到窗口底缘的距离。判定带迟滞（与侧栏、编辑工具栏同一套）：
+ * 收起时只认最底 TB_FULL_EDGE，浮出后整条高度都算「还在上面」。
+ *
+ * 停留计时一旦开始就不被后续 mousemove 重置：只要光标还在判定带里，微抖不该把已累计的时间清零。
+ */
+function feedTbFloat(fromBottom: number) {
+  if (!isFull.value) return
+  if (dialogOpen.value) { hideTbFloat(); return } // 滑到遮罩后面就是鬼影
+  if (tbFloat.value) {
+    if (fromBottom <= TB_FULL_H) { clearTbFloatTimers(); return }
+    if (!tbFloatHideTimer) tbFloatHideTimer = window.setTimeout(() => { tbFloat.value = false; tbFloatHideTimer = undefined }, 350)
+    return
+  }
+  if (fromBottom <= TB_FULL_EDGE) {
+    if (tbDwellTimer) return
+    tbDwellTimer = window.setTimeout(() => { tbDwellTimer = undefined; tbFloat.value = true }, TB_FULL_DWELL_MS)
+    return
+  }
+  if (tbDwellTimer) { clearTimeout(tbDwellTimer); tbDwellTimer = undefined }
+}
+
+/**
+ * 全屏下工具条浮层的判定挂在根节点（而不是 .body）的 capture 上：
+ * 浮条本身是 .app 的直接子节点、盖在 .body 上方，光标落到它身上时事件根本不经过
+ * .body 那一路；只在 .body 上听会在浮条弹出的瞬间把它判成「已离开」而当场收回。
+ */
+function onAppMove(ev: MouseEvent) {
+  if (!isFull.value) return
+  feedTbFloat(window.innerHeight - ev.clientY)
+}
+
+function onAppLeave() {
+  if (isFull.value) hideTbFloat()
+}
+
+async function toggleFullscreen() {
+  try {
+    if (isFull.value) await Window.UnFullscreen()
+    else await Window.Fullscreen()
+    isFull.value = await Window.IsFullscreen()
+  } catch (e) {
+    showEcho(`全屏切换失败：${e}`, 'error')
+    return
+  }
+  if (!isFull.value) hideTbFloat()
+  // 布局里少了工具条与状态条、窗口又换了尺寸，主动重 fit 一次（不等 resize 事件）。
+  nextTick(() => { const t = insts[active.value]; if (t) t.fitNow() })
+  window.setTimeout(() => { const t = insts[active.value]; if (t) t.fitNow() }, 260)
+  showEcho(isFull.value ? '全屏：工具条已收进底缘，鼠标停 1 秒浮出（M-x f 退出）' : '已退出全屏', 'info')
 }
 
 /** 焦点真正离开侧栏内部才置假（在侧栏子元素之间移动不算）。 */
@@ -277,6 +354,13 @@ function onGlobalKey(ev: KeyboardEvent) {
   const el = document.activeElement
   if (el && viewport.value && viewport.value.contains(el)) return // 焦点在终端，交给 xterm 的回调，不查两遍
   if (isTextEditing(el)) return // 正在往输入框打字，按键一律属于输入内容
+  // 全屏下的退出出口：只认「焦点不在终端」这条路径。终端里 ESC 是 vim/BBS 的命根子，
+  // 在 xterm 那一路抢走会把输终端打残，所以故意不做「按 ESC 处处退出」。
+  if (isFull.value && ev.key === 'Escape') {
+    ev.preventDefault()
+    void toggleFullscreen()
+    return
+  }
   if (keyseq.feed(ev) === 'swallow') {
     ev.preventDefault()
     ev.stopPropagation()
@@ -328,6 +412,13 @@ registerCommand({
   title: '窗口：普通 / quake 下拉模式互切',
   description: '默认序列 M-x M-q；跨应用呼出走系统全局热键 Alt+`（两种键位都认）',
   handler: () => { toggleWindowMode() },
+})
+
+registerCommand({
+  id: 'app.toggle-fullscreen',
+  title: '窗口：全屏 / 退出全屏（工具条浮在底缘）',
+  description: '默认序列 M-x f；全屏时顶部工具条不再占布局，鼠标在底缘停 1 秒浮出；焦点不在终端时 ESC 也可退出',
+  handler: () => { void toggleFullscreen() },
 })
 
 registerCommand({
@@ -636,6 +727,7 @@ async function newTab(site: api.Site) {
     const id = await api.Connect(site)
     tab.id = id
     byId.set(id, tab)
+    tab.syncSize() // 首连前 fit 完的 onResize 被丢了，不补这一刀后端一直按 80x25 排版
     // 后端在 Connect() 返回前就已 emitStatus(connected)，但该事件早于上面的 byId.set，
     // 会被 handler 因查不到 tab 而丢弃，导致状态栏永远停在初始「连接中」。Connect 未抛异常
     // 即代表连接已建立，这里手动补一次 connected 状态。
@@ -767,7 +859,7 @@ async function reconnectTab(tab: TermTab) {
     byId.set(id, tab)
     // 新会话的尺寸是按站点默认（80x25）起步的；标签已经 fit 到位、重连时不会再生
     // onResize，不主动补一刀的话远端会按默认尺寸排版、菜单分栏错位。
-    api.Resize(id, tab.term.cols, tab.term.rows).catch(() => { /* noop */ })
+    tab.syncSize()
     // 同 newTab：Connect 返回前的 connected 事件早于 byId.set 会被丢弃，这里补一次。
     tab.setStatus('connected')
     if (tabs.value[mi]) { tabs.value[mi].id = id; tabs.value[mi].status = 'connected' }
@@ -911,6 +1003,7 @@ onMounted(async () => {
   try { gk.value = await api.GetGlobalKeys() } catch { /* 全局表读不到不影响应用内绑定 */ }
   window.addEventListener('keydown', onGlobalKey, true)
   Window.IsMaximised().then((v) => { isMax.value = v }).catch(() => {})
+  Window.IsFullscreen().then((v) => { isFull.value = v }).catch(() => {})
 
   // 窗口形态：先拉一次快照，再订阅后端变更（全局热键与托盘都会广播）。
   // 从 quake 热键呼出时 webview 可能刚从隐藏中恢复，终端需要一次重新 fit + 聚焦，
@@ -930,6 +1023,7 @@ onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP
 function onWinResize() {
   insts[active.value]?.fitNow()
   Window.IsMaximised().then((v) => { isMax.value = v }).catch(() => {})
+  Window.IsFullscreen().then((v) => { isFull.value = v }).catch(() => {})
 }
 
 function applySchemeToActive() {
@@ -969,8 +1063,9 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 </script>
 
 <template>
-  <div class="app" :class="{ quake: isQuake }">
-    <div class="topbar">
+  <div class="app" :class="{ quake: isQuake, full: isFull }"
+       @mousemove.capture="onAppMove" @mouseleave="onAppLeave">
+    <div class="topbar" :class="{ 'tb-float-on': isFull && tbFloat }">
       <span class="brand">FTRW</span>
       <button @click="toggleSidebar" :title="sidebarShown ? '隐藏站点栏（Alt+X P）' : '显示站点栏（Alt+X P，或鼠标移到窗口左缘）'">☰ 站点</button>
       <button @click="openQuickConnect" title="新建连接">＋ 连接</button>
@@ -983,9 +1078,13 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
           <span class="tclose" @click.stop="closeTab(i)">✕</span>
         </div>
       </div>
+      <!-- 全屏时状态条收起了，热键/按钮的回显改住在工具条里，否则提示没了落点 -->
+      <span class="echo fb-echo" :class="'echo-' + echoKind" v-if="isFull && echoMsg">{{ echoMsg }}</span>
       <div class="spacer" />
       <button @click="toggleWindowMode()" :class="{ 'mode-on': isQuake }"
               :title="isQuake ? '回到普通窗口（M-x M-q）' : '切到 quake 下拉窗口（M-x M-q / 全局 Alt+`）'">{{ isQuake ? '▾ quake' : '▢ 普通' }}</button>
+      <button @click="toggleFullscreen" :class="{ 'mode-on': isFull }"
+              :title="isFull ? '退出全屏（M-x f；焦点不在终端时 ESC 也退出）' : '全屏（M-x f；工具条收进底缘，鼠标停 1 秒浮出）'">{{ isFull ? '⛶ 退出全屏' : '⛶ 全屏' }}</button>
       <select v-model="activeScheme" :disabled="active < 0" title="配色方案">
         <option v-for="s in schemes" :key="s.name" :value="s.name">{{ s.name }}</option>
       </select>
@@ -994,7 +1093,7 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       <button @click="prefsDlg.show = true" title="偏好设置">⚙ 设置</button>
       <div class="wctl">
         <button class="wc" @click="winMin" title="最小化">&#8722;</button>
-        <button class="wc" @click="winToggleMax" v-if="!isQuake" :title="isMax ? '还原' : '最大化'">{{ isMax ? '❐' : '□' }}</button>
+        <button class="wc" @click="winToggleMax" v-if="!isQuake && !isFull" :title="isMax ? '还原' : '最大化'">{{ isMax ? '❐' : '□' }}</button>
         <button class="wc wc-close" @click="winClose" :title="prefs?.closeToTray ? '收起至托盘' : '关闭'">&#10005;</button>
       </div>
     </div>
@@ -1092,6 +1191,21 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 .app.quake .body { order: 1; }
 .app.quake .statusbar { order: 2; }
 .app.quake .topbar { order: 3; border-bottom: none; border-top: 1px solid #33373f; }
+/* 全屏：顶部工具条改为贴在底缘的浮层，状态条收起，终端吃满整屏。
+   必须用 fixed 而不是像 quake 那样靠 flex order —— 工具条一旦还占布局，终端就少一行，
+   「全屏」就白做了。收起态整条沉到屏幕下沿外（translateY 超出自身高度），
+   只留最底几像素当唤出判定带；z-index 故意压在对话框遮罩（50/60）下面。*/
+.app.full .topbar { position: fixed; left: 0; right: 0; top: auto; bottom: 0; order: 0; z-index: 30;
+  border-bottom: none; border-top: 1px solid #33373f; background: #24272ef2; box-shadow: 0 -6px 18px rgba(0, 0, 0, .4);
+  transform: translateY(110%); transition: transform .16s ease-out; }
+.app.full .topbar.tb-float-on { transform: none; }
+.app.full .statusbar { display: none; }
+/* 工具条里的回显文本：只能占自己剩下来的宽度，长了就省略，不能把右边按钮顶出窗口 */
+.fb-echo { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.topbar .echo-pending { color: #d9a441; font-family: Consolas, monospace; }
+.topbar .echo-info { color: #8fb5e8; }
+.topbar .echo-warn { color: #d9a441; }
+.topbar .echo-error { color: #e06c5b; }
 .wctl { display: flex; gap: 2px; margin-left: 8px; }
 .wctl .wc { width: 32px; height: 26px; padding: 0; line-height: 1; font-size: 14px; border-radius: 4px; background: transparent; border: 1px solid transparent; color: #c8ccd4; }
 .wctl .wc:hover { background: #3a3f49 !important; border-color: #3d424b; }

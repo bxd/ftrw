@@ -319,6 +319,18 @@ export class TermTab {
     }
   }
 
+  /**
+   * 把前端当前尺寸强制推给后端。会话挂上 id 之后必须补这一刀：
+   * 标签是先在 display:none 的容器里 fit 到位、再去等 Connect 返回的，
+   * 那期间的 onResize 因为 this.id 还是空而被丢掉。尺寸不补，后端就按
+   * 初始 80x25 排版：cmd 的 TAB 补全发的是绝对定位（\E[25;19H），在高 40 行的
+   * 视口里落点就凭空往上挪 15 行，看上去是「光标漂到上面去了」；远端则是菜单分栏错位。
+   */
+  syncSize() {
+    if (!this.id) return
+    api.Resize(this.id, this.term.cols, this.term.rows).catch(() => { /* noop */ })
+  }
+
   /** 偏好里的回滚行数改了：套到已经开着的标签，不必重开（xterm 自己截断超出的历史）。 */
   setScrollback(n?: number) {
     this.term.options.scrollback = scrollbackOf(n)

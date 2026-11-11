@@ -104,6 +104,23 @@ func TestDefaultKeymapSeedsPostActions(t *testing.T) {
 	}
 }
 
+func TestDefaultKeymapSeedsFullscreen(t *testing.T) {
+	// 全屏是新加的窗口形态，出厂绑定得开箱即用才能被补种进用户的 keymap.json；
+	// 键位撞车由 TestDefaultKeymapHasNoDuplicateKeys 统一拦。
+	for _, b := range DefaultKeymap().Bindings {
+		if b.Command == "app.toggle-fullscreen" {
+			if b.Keys != "M-x f" {
+				t.Fatalf("全屏出厂绑定键为 %q, want %q", b.Keys, "M-x f")
+			}
+			if !b.Enabled {
+				t.Fatal("全屏出厂绑定默认是停用的")
+			}
+			return
+		}
+	}
+	t.Fatal("出厂绑定里没有 app.toggle-fullscreen")
+}
+
 func TestDefaultKeymapHasNoDuplicateKeys(t *testing.T) {
 	// 一个序列只能落到一个命令：两条出厂绑定撞键时后一条永远不会被触发，
 	// 而界面上看上去就是“那个功能的热键按了没反应”，所以在这里拦死。

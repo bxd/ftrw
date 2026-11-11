@@ -153,6 +153,14 @@ func DefaultKeymap() KeymapConfig {
 			Enabled: true,
 			Note:    "普通窗口 / quake 下拉模式互切（跨应用呼出走系统热键 Alt+`）",
 		},
+		// 全屏。键位取 f = fullscreen，还在 M-x 一族里；与 tab.close(M-x k)、
+		// 发帖一族(M-x s/r/m/l/v/i/t)、站点栏(M-x p) 都不撞（重键由 TestDefaultKeymapHasNoDuplicateKeys 扫）。
+		{
+			Keys:    "M-x f",
+			Command: "app.toggle-fullscreen",
+			Enabled: true,
+			Note:    "全屏 / 退出全屏（全屏时工具条沉到屏幕底缘，鼠标停 1 秒浮出；焦点不在终端时 ESC 也退出）",
+		},
 		// 标签循环切换。记法里尖括号是特殊键名，S- 前缀不会被字符大小写吸掉
 		// （不同于 S-a ≡ A），所以写 S-<LEFT> 就是“按住 Shift 按左方向键”。
 		// 代价：绑定生效期间终端里 shift+方向键 扩展选区会被吞掉，想两者兼得
