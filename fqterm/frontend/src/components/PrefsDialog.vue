@@ -24,6 +24,9 @@ if (p.proxyHost == null) p.proxyHost = ''
 if (p.proxyPort == null) p.proxyPort = 0
 if (p.proxyUser == null) p.proxyUser = ''
 if (p.proxyPass == null) p.proxyPass = ''
+if (p.agentApiEnabled == null) p.agentApiEnabled = false
+if (p.agentApiPort == null) p.agentApiPort = 0
+if (p.agentApiToken == null) p.agentApiToken = ''
 
 // 随系统启动不进 Preferences：它的唯一事实来源是注册表（HKCU\...\Run），
 // 在应用里存一份镜像会导致用户从「启动」里手工删掉后又被偷偷写回来。
@@ -96,6 +99,25 @@ async function doProxyTest() {
     proxyTestText.value = `测试失败：${e?.message || e}`
   } finally {
     proxyTesting.value = false
+  }
+}
+
+/* ---------------- Agent API ---------------- */
+
+const agentTokenBusy = ref(false)
+const agentTokenNote = ref('')
+
+// 重生成走后端直达（存盘 + 监听器换 token 一气完成）：旧 token 当场作废。
+async function doRegenAgentToken() {
+  agentTokenBusy.value = true
+  agentTokenNote.value = ''
+  try {
+    p.agentApiToken = await api.RegenerateAgentToken()
+    agentTokenNote.value = '新 token 已生效（旧值立刻作废），无需再点保存'
+  } catch (e: any) {
+    agentTokenNote.value = `重生成失败：${e?.message || e}`
+  } finally {
+    agentTokenBusy.value = false
   }
 }
 
@@ -189,6 +211,21 @@ function doSave() {
           <div class="hint">{{ proxyTestText || '代理同时管住终端连接（Telnet/SSH）、IP 库下载与链接预览三条出站路；端口留空按类型补默认（SOCKS 1080 / HTTP 8080）。单个站点要直连或换代理，在站点编辑里另有设置。' }}</div>
         </fieldset>
         <fieldset>
+          <legend>Agent API（给 AI agent 的本地操控入口）</legend>
+          <label class="chk"><input type="checkbox" v-model="p.agentApiEnabled" /> 启用：在本机 127.0.0.1 开一个 HTTP 接口，让 AI agent 读屏幕内容、发按键与文字、跑应用命令</label>
+          <div class="grid grid-in">
+            <label>端口</label>
+            <input type="number" v-model.number="p.agentApiPort" min="1" max="65535" placeholder="37837" :disabled="!p.agentApiEnabled" />
+            <label>Token</label>
+            <div class="row2">
+              <input v-model="p.agentApiToken" readonly spellcheck="false" placeholder="开启并保存后自动生成" />
+              <button class="mini inline" :disabled="agentTokenBusy || !p.agentApiToken" @click="doRegenAgentToken">{{ agentTokenBusy ? '生成中…' : '重生成' }}</button>
+            </div>
+          </div>
+          <div class="note" v-if="agentTokenNote">{{ agentTokenNote }}</div>
+          <div class="hint">只听回环地址，局域网里谁也连不上；但本机任意进程拿了 token 就能看你的屏（含密码回显）并替你操作 BBS —— token 当密码对待。入口：<code>GET /ftrw/status</code>（探活）、<code>GET /ftrw/sites</code>、<code>GET /ftrw/tabs</code>、<code>GET /ftrw/screen</code>、<code>POST /ftrw/send</code>、<code>POST /ftrw/wait</code>、<code>POST /ftrw/command</code>、<code>POST /ftrw/connect</code>、<code>POST /ftrw/tab/activate|close</code>，鉴权头 <code>X-FTRW-Token</code>。Shell 标签可读回滚区，BBS 标签只返回当前屏。</div>
+        </fieldset>
+        <fieldset>
           <legend>IP 归属地</legend>
           <label class="chk"><input type="checkbox" v-model="p.ipLocationEnabled" /> 鼠标悬停屏幕上的 IPv4 时显示归属地（只读本地纯真库，不把地址发给在线接口）</label>
           <div class="grid grid-in">
@@ -256,6 +293,7 @@ legend { color: #6a7180; font-size: 12px; padding: 0 6px; }
 .hint code { color: #b5bac4; background: #1b1d22; border: 1px solid #3d424b; border-radius: 3px; padding: 0 4px; }
 .row2 { display: flex; align-items: center; gap: 6px; }
 button.mini { margin-top: 10px; padding: 4px 12px; font-size: 12px; }
+button.mini.inline { margin-top: 0; flex: 0 0 auto; }
 .row2 input.port { flex: 0 0 84px; width: 84px; }
 .foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid #33373f; }
 button { background: #2f333b; color: #d5d9e0; border: 1px solid #3d424b; border-radius: 5px; padding: 6px 16px; cursor: pointer; font-size: 13px; }

@@ -12,6 +12,9 @@ type ConfigService struct {
 	// IP 库下载失败过一轮就要等一天再去碰，而用户刚刚才把代理填对——这时候不能让他
 	// 等到明天。见 main.go 里的接线。
 	onProxyChanged func()
+	// onAgentChanged 在 Agent API 的生效配置（开关/端口/token）真的变了之后叫一次：
+	// 监听器的起停必须即时跟上，不能等重启。见 main.go 里接 AgentAPI.Sync。
+	onAgentChanged func()
 }
 
 func NewConfigService(store *Store) *ConfigService {
@@ -21,6 +24,11 @@ func NewConfigService(store *Store) *ConfigService {
 // OnProxyChanged 接上「代理改了」的回调（只能构造之后设：要通知的 IPService 比 ConfigService 晚建）。
 func (cs *ConfigService) OnProxyChanged(fn func()) {
 	cs.onProxyChanged = fn
+}
+
+// OnAgentChanged 接上「Agent API 配置改了」的回调（接线时机同上：晚构造的 AgentAPI 认晚接）。
+func (cs *ConfigService) OnAgentChanged(fn func()) {
+	cs.onAgentChanged = fn
 }
 
 // --- Site manager ---
@@ -124,7 +132,21 @@ func (cs *ConfigService) SetPreferences(prefs Preferences) error {
 	if proxyFromPrefs(old) != proxyFromPrefs(prefs) && cs.onProxyChanged != nil {
 		go cs.onProxyChanged()
 	}
+	if agentConfigFromPrefs(old) != agentConfigFromPrefs(prefs) && cs.onAgentChanged != nil {
+		go cs.onAgentChanged()
+	}
 	return cs.store.SavePrefs()
+}
+
+// RegenerateAgentToken 换一个新随 token 并存盘，返回给设置页展示。旧的立刻作废：
+// 接错了机器的 agent 拿旧 token 再也进不来。
+func (cs *ConfigService) RegenerateAgentToken() (string, error) {
+	p := cs.GetPreferences()
+	p.AgentApiToken = newAgentToken()
+	if err := cs.SetPreferences(p); err != nil {
+		return "", err
+	}
+	return cs.GetPreferences().AgentApiToken, nil
 }
 
 // TestProxy 拿一份还没存盘的代理设置去试连：界面上改完就能测，不必先保存、再等下一次
@@ -144,6 +166,17 @@ func normalizePreferences(p Preferences) Preferences {
 	// 免得界面里看着是 SOCKS5、实际拨号时走了另一套解释。
 	pc := proxyFromPrefs(p).normalized()
 	p.ProxyType, p.ProxyHost, p.ProxyPort, p.ProxyUser, p.ProxyPass = pc.Type, pc.Host, pc.Port, pc.User, pc.Pass
+	// Agent API：端口 0 按出厂值，越界也回出厂（听不到比听错好）；开启但没 token 就现生一个，
+	// 设置页当场能拷 —— 逼用户自己编 token 只会得到一串 "1234"。
+	if p.AgentApiPort < 0 || p.AgentApiPort > 65535 {
+		p.AgentApiPort = def.AgentApiPort
+	}
+	if p.AgentApiPort == 0 {
+		p.AgentApiPort = def.AgentApiPort
+	}
+	if p.AgentApiEnabled && p.AgentApiToken == "" {
+		p.AgentApiToken = newAgentToken()
+	}
 	return p
 }
 

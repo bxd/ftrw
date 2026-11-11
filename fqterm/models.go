@@ -109,6 +109,13 @@ type Preferences struct {
 	QuakeHideOnBlur bool `json:"quakeHideOnBlur"` // quake 失焦自动收起
 	TrayEnabled     bool `json:"trayEnabled"`     // 显示系统托盘图标
 	CloseToTray     bool `json:"closeToTray"`     // 点 ✕ 收起而非退出
+
+	// Agent API（本地 AI agent 操控入口，见 agentapi.go）：开启后在 127.0.0.1 监听
+	// 一个只读屏/发键/跑命令的小 HTTP 服务。默认关：本机任意进程能读整屏（含密码
+	// 回显）并替你操作 BBS，这是高权限能力，必须用户显式打开且走 token 鉴权。
+	AgentApiEnabled bool   `json:"agentApiEnabled"`
+	AgentApiPort    int    `json:"agentApiPort"`  // 0 时取默认 37837（手机键盘拼 FQTERM）
+	AgentApiToken   string `json:"agentApiToken"` // 开启且为空时自动生成（见 normalizePreferences）
 }
 
 // KeyBinding maps an Emacs-style key sequence to a command id. Parsing and
@@ -361,5 +368,8 @@ func defaultPreferences() Preferences {
 		QuakeHideOnBlur:   true,
 		TrayEnabled:       true,
 		CloseToTray:       false,
+		// Agent API 出厂关：安全边界（见 Preferences 注释），要用的人在设置页打开。
+		AgentApiEnabled: false,
+		AgentApiPort:    defaultAgentApiPort,
 	}
 }

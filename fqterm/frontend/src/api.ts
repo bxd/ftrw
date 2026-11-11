@@ -90,6 +90,11 @@ export interface Preferences {
   proxyPort: number
   proxyUser: string
   proxyPass: string
+  // Agent API（给本地 AI agent 的 127.0.0.1 HTTP 操控入口，见后端 agentapi.go）：
+  // 出厂关；token 开启且为空时后端自动生成。旧 prefs 缺这三键时解码为 false/0/空，无害。
+  agentApiEnabled?: boolean
+  agentApiPort?: number
+  agentApiToken?: string
 }
 
 // 一份代理设置（与后端 ProxyConfig 同形）。测试连通时传的是界面上还没存盘的那一份。
@@ -305,6 +310,13 @@ export const Disconnect = (id: string): Promise<void> => Call.ByName(`${term}.Di
 export const SendFile = (id: string, paths: string[]): Promise<void> => Call.ByName(`${term}.SendFile`, id, paths)
 export const CancelTransfer = (id: string): Promise<void> => Call.ByName(`${term}.CancelTransfer`, id)
 export const ListSessions = (): Promise<SessionInfo[]> => Call.ByName(`${term}.ListSessions`)
+
+// ---- Agent API 往返（agentbridge.ts 用）----
+// AgentReply：渲染端做完一条 agent 命令后的收尾信号（与后端 "agent:cmd" 请求一一对应）。
+export const AgentReply = (reqId: string, payload: string, errMsg: string): Promise<void> =>
+  Call.ByName(`${term}.AgentReply`, reqId, payload, errMsg)
+// RegenerateAgentToken：换一个新随机 token 并存盘（旧立刻作废），返回新的。
+export const RegenerateAgentToken = (): Promise<string> => Call.ByName(`${cfg}.RegenerateAgentToken`)
 
 // ---- Events ----
 

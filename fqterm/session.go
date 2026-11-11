@@ -137,14 +137,20 @@ type TerminalService struct {
 	app      *application.App
 	khosts   *KnownHosts
 	dbgPath  string
+
+	// agentAPI 的应答登记处：前端完成一条 agent 命令后调 AgentReply（动态方法调用），
+	// 这里把载荷交给还挂着等的那条 HTTP 请求。见 agentapi.go。
+	agentMu   sync.Mutex
+	agentPend map[string]chan agentResp
 }
 
 func NewTerminalService(store *Store) *TerminalService {
 	return &TerminalService{
-		store:    store,
-		sessions: make(map[string]*Session),
-		khosts:   NewKnownHosts(store.Dir()),
-		dbgPath:  filepath.Join(store.Dir(), "zmodem_debug.log"),
+		store:     store,
+		sessions:  make(map[string]*Session),
+		khosts:    NewKnownHosts(store.Dir()),
+		dbgPath:   filepath.Join(store.Dir(), "zmodem_debug.log"),
+		agentPend: make(map[string]chan agentResp),
 	}
 }
 
@@ -457,6 +463,37 @@ func (ts *TerminalService) ListSessions() []SessionInfo {
 		out = append(out, SessionInfo{ID: s.ID, Name: s.Site.Name, Title: s.Title, Status: s.Status, Host: s.Site.Host})
 	}
 	return out
+}
+
+// trackAgent / untrackAgent：HTTP 请求挂起与收摊。超时后请求方自己退登记，
+// 迟到的 AgentReply 只会找不到通道，不会挂任何人。
+func (ts *TerminalService) trackAgent(reqID string) chan agentResp {
+	ch := make(chan agentResp, 1)
+	ts.agentMu.Lock()
+	ts.agentPend[reqID] = ch
+	ts.agentMu.Unlock()
+	return ch
+}
+
+func (ts *TerminalService) untrackAgent(reqID string) {
+	ts.agentMu.Lock()
+	delete(ts.agentPend, reqID)
+	ts.agentMu.Unlock()
+}
+
+// AgentReply 是渲染端对 "agent:cmd" 的收尾信号（frontend/src/agentbridge.ts 调用）。
+// payload 为结果 JSON 字符串；errMsg 非空表示渲染端把这做砸了。
+func (ts *TerminalService) AgentReply(reqID string, payload string, errMsg string) {
+	ts.agentMu.Lock()
+	ch := ts.agentPend[reqID]
+	delete(ts.agentPend, reqID)
+	ts.agentMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- agentResp{payload: payload, errMsg: errMsg}:
+		default: // 没人等了（已超时），丢弃
+		}
+	}
 }
 
 func (ts *TerminalService) get(id string) (*Session, bool) {

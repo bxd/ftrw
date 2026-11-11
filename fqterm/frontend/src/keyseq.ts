@@ -299,6 +299,17 @@ class KeySeqEngine {
     if (!this.enabled) return 'pass'
     const tok = eventToken(ev)
     if (!tok) return 'pass' // 单纯按 Ctrl/Alt/Shift 不影响序列
+    return this.feedToken(tok)
+  }
+
+  /**
+   * token 级入口：与 feed(ev) 同一条状态机，区别只是跳过“从 KeyboardEvent 导 token”这一步。
+   * Agent API 用它重放序列记法（agentbridge.ts）：agent 按 "M-x k" 这种用户键法操作，
+   * 命中绑定就执行命令，和真人按键走同一棵树、同一份 pending。
+   */
+  feedToken(tok: string): Verdict {
+    if (!this.enabled) return 'pass'
+    if (!tok) return 'pass'
 
     if (this.describeMode) {
       this.describeMode = false

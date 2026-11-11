@@ -16,6 +16,7 @@ import {
   toolbarPinned, toggleToolbarPin,
 } from './postactions'
 import { applyProbe, asKind, classifyURL, hostSpanAt, ipSpanAt, linkName, looksGenericName, mediaOnly, probeTargets, type PreviewItem } from './linkscan'
+import { configureAgentBridge } from './agentbridge'
 
 interface TabMeta { id: string; title: string; status: string }
 
@@ -367,6 +368,39 @@ configurePost({
     // 为一个字符走整圈“保存设置”的重活不值，直接整份回写（后端会自己归一代理那些字段）；
     // 写失败也只是下次记不住，不该打断这一次的插入
     api.SetPreferences(prefs.value).catch(() => { /* noop */ })
+  },
+})
+
+/* ---------------- Agent API（给本地 AI agent 的操控入口） ---------------- */
+// 命令本体住在 agentbridge.ts（读屏/发键/等屏都直接打在 xterm 真缓冲区上），
+// 这里只把标签集递过去。tab 参数省略即当前活动标签：agent 少一次往返，
+// 也让"对着我眼前这屏干活"成为默认语义。
+configureAgentBridge({
+  listTabs: () => insts.map((t, i) => ({
+    index: i, id: t.id, title: t.title, status: t.status, active: i === active.value,
+    cols: t.term.cols, rows: t.term.rows,
+    protocolType: t.site.protocolType, siteName: t.site.name,
+  })),
+  tabById: (id) => (id ? byId.get(id) ?? null : insts[active.value] ?? null),
+  activate: (id) => {
+    const t = byId.get(id)
+    if (!t) throw new Error(`找不到标签：${id}`)
+    const i = idxOf(t)
+    setActive(i)
+    return { index: i }
+  },
+  close: (id) => {
+    const t = byId.get(id)
+    if (!t) throw new Error(`找不到标签：${id}`)
+    void closeTab(idxOf(t), true)
+    return { closing: true }
+  },
+  connect: async (name) => {
+    const s = sites.value.find((x) => x.name === name)
+    if (!s) throw new Error(`站点表里没有叫“${name || '（空）'}”的存站`)
+    await newTab(s)
+    const i = insts.length - 1
+    return { index: i, id: insts[i]?.id || '' }
   },
 })
 
@@ -727,10 +761,12 @@ function cycleTab(delta: number) {
   setActive((active.value + delta + n) % n)
 }
 
-async function closeTab(i: number) {
+async function closeTab(i: number, force = false) {
   const t = insts[i]
   if (!t) return
-  if (t.status === 'connected' && prefs.value?.confirmClose) {
+  // force：跳过确认对话框 —— Agent API 的 /tab/close 走这条路（没有手去点按钮，
+  // 弹窗就等于挂死）；人按 M-x k / 点 ✕ 仍保留确认。
+  if (!force && t.status === 'connected' && prefs.value?.confirmClose) {
     const r = await withDialogGuard(() => Dialogs.Question({
       Title: 'FTRW',
       Message: `断开 “${t.title}” ？`,
@@ -974,13 +1010,13 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       <span class="brand">FTRW</span>
       <button @click="toggleSidebar" :title="sidebarShown ? '隐藏站点栏（Alt+X P）' : '显示站点栏（Alt+X P，或鼠标移到窗口左缘）'">☰ 站点</button>
       <button @click="openQuickConnect" title="新建连接">＋ 连接</button>
-      <button @click="closeTab(active)" :disabled="active < 0" title="关闭当前标签">✕ 断开</button>
+      <button @click="closeTab(active, false)" :disabled="active < 0" title="关闭当前标签">✕ 断开</button>
       <!-- 标签页跟工具栏共用一行：多一个会话就少不了一行高，窄屏下标签区自己滚动 -->
       <div class="tabs" v-if="tabs.length">
         <div v-for="(t, i) in tabs" :key="i" class="tab" :class="{ on: i === active }" @click="setActive(i)">
           <span class="tdot" :class="t.status"></span>
           <span class="ttitle" :title="t.title">{{ t.title }}</span>
-          <span class="tclose" @click.stop="closeTab(i)">✕</span>
+          <span class="tclose" @click.stop="closeTab(i, false)">✕</span>
         </div>
       </div>
       <div class="spacer" />

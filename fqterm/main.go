@@ -41,6 +41,7 @@ func init() {
 	application.RegisterEvent[*ZmodemProgress]("zmodem:progress")
 	application.RegisterEvent[*WindowModeState]("app:mode")
 	application.RegisterEvent[*PreviewRequest]("preview:load")
+	application.RegisterEvent[*AgentCmd]("agent:cmd")
 }
 
 func main() {
@@ -66,9 +67,12 @@ func main() {
 	appService := NewAppService(store)
 	previewService := NewPreviewService()
 	ipService := NewIPService(store)
+	agentAPI := NewAgentAPI(store, terminalService)
 	// 代理没配好之前 IP 库注定下不来，失败一轮就要等满一天闸门。用户刚刚把代理填对的
 	// 那一刻就是「该再试一次」的信号，不能让他等到明天。
 	configService.OnProxyChanged(func() { ipService.MaybeUpdate() })
+	// Agent API 的开关/端口/token 一改，监听器当场跟上（Sync 幂等，重复叫没成本）。
+	configService.OnAgentChanged(agentAPI.Sync)
 
 	exe, _ := os.Executable()
 	log.Printf("FTRW 启动 pid=%d exe=%s log=%s", os.Getpid(), exe, logger.Path())
@@ -123,6 +127,8 @@ func main() {
 		appService.Start()
 		// 库过期或缺过一次就后台补一轮：开在启动路径上是白等，而且失败也不该拦人。
 		go ipService.MaybeUpdate()
+		// Agent API 按偏好拉起（出厂关着，没开时 Sync 什么都不做；env 覆盖见 agentapi.go）。
+		agentAPI.Sync()
 	})
 
 	if err := app.Run(); err != nil {
