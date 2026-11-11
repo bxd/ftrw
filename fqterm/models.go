@@ -109,7 +109,17 @@ type Preferences struct {
 	QuakeHideOnBlur bool `json:"quakeHideOnBlur"` // quake 失焦自动收起
 	TrayEnabled     bool `json:"trayEnabled"`     // 显示系统托盘图标
 	CloseToTray     bool `json:"closeToTray"`     // 点 ✕ 收起而非退出
+
+	// 启动器搜索范围（launcher 分支）：开始菜单与桌面永远在搜，这里只填「额外目录」。
+	// LauncherExts 出厂 exe,lnk,bat,ps1,com，用户可增减；目录或后缀改动在偏好保存后
+	// 立即重建索引（见 main.go 的 OnPrefsChanged 接线）。
+	LauncherDirs []string `json:"launcherDirs"`
+	LauncherExts []string `json:"launcherExts"`
 }
+
+// defaultLauncherExts 是启动器文件搜索的出厂后缀。lnk 也列其中：用户把软件安装
+// 目录加进来时，那里常有现成的快捷方式，语义与开始菜单的 .lnk 完全一致。
+var defaultLauncherExts = []string{"exe", "lnk", "bat", "ps1", "com"}
 
 // KeyBinding maps an Emacs-style key sequence to a command id. Parsing and
 // matching happen entirely on the frontend (see frontend/src/keyseq.ts for the
@@ -270,30 +280,55 @@ type GlobalKeymap struct {
 	// DoubleTapMs 是双击判定窗口：全部松开后再按下同一组合键，超过这个时长就不算双击。
 	DoubleTapMs int         `json:"doubleTapMs"`
 	Bindings    []GlobalKey `json:"bindings"`
+	// Seeded 记下「已尝试过补种的出厂动作 id」，形状与 KeymapConfig.Seeded 同一套
+	// 语义：新版本新增的出厂热键只塞一次，用户删掉就不会每次启动又复活。
+	Seeded []string `json:"seeded,omitempty"`
 }
 
-// DefaultGlobalKeymap 是出厂表。这张表不做「补种」：出厂行只有两条、且带一个停用的
-// 示例，用户删掉就是删掉了，需要恢复用界面上的「恢复出厂」按钮，比 keybindings.json
-// 那套 Seeded 台账更省事，也不会出现「解绑后每次启动又复活」。
+// DefaultGlobalKeymap 是出厂表。出厂行靠 store 加载时的台账补种（见
+// seedFactoryGlobalBindings）送达已有配置的老用户：新版增了动作（launcher.toggle）
+// 时补一次，用户删过就不再强塞；手工解绑后也能用界面上的「恢复出厂」按钮复位。
 func DefaultGlobalKeymap() GlobalKeymap {
+	bindings := []GlobalKey{
+		{
+			Keys:    "M-`",
+			Action:  "quake.toggle",
+			Enabled: true,
+			Note:    "Alt+反引号；波浪号是同一个物理键，也认（绑定没要求 Shift 时多按的 Shift 不算数）",
+		},
+		{
+			Keys:    "<C-M> <C-M>",
+			Action:  "launcher.toggle",
+			Enabled: true,
+			Note:    "双击 Ctrl+Alt 呼出/收起启动器（模糊搜索开始菜单与桌面快捷方式，回车启动）",
+		},
+		{
+			Keys:    "<C-M> <C-M>",
+			Action:  "quake.toggle",
+			Enabled: false,
+			Note:    "示例：双击 Ctrl+Alt 呼出 quake，出厂默认停用（同键位已给启动器）",
+		},
+	}
 	return GlobalKeymap{
 		Enabled:     true,
 		DoubleTapMs: defaultDoubleTapMs,
-		Bindings: []GlobalKey{
-			{
-				Keys:    "M-`",
-				Action:  "quake.toggle",
-				Enabled: true,
-				Note:    "Alt+反引号；波浪号是同一个物理键，也认（绑定没要求 Shift 时多按的 Shift 不算数）",
-			},
-			{
-				Keys:    "<C-M> <C-M>",
-				Action:  "quake.toggle",
-				Enabled: false,
-				Note:    "示例：双击 Ctrl+Alt 呼出，出厂默认停用",
-			},
-		},
+		Bindings:    bindings,
+		Seeded:      seededActionIDs(bindings),
 	}
+}
+
+// seededActionIDs 把出厂行映成动作 id 名单（补种台账用，重复 id 只记一次）。
+func seededActionIDs(bindings []GlobalKey) []string {
+	out := make([]string, 0, len(bindings))
+	seen := map[string]bool{}
+	for _, b := range bindings {
+		if seen[b.Action] {
+			continue
+		}
+		seen[b.Action] = true
+		out = append(out, b.Action)
+	}
+	return out
 }
 
 // ColorScheme defines terminal palette (16 ANSI colors + defaults).
@@ -369,5 +404,6 @@ func defaultPreferences() Preferences {
 		QuakeHideOnBlur:   false,
 		TrayEnabled:       true,
 		CloseToTray:       false,
+		LauncherExts:      defaultLauncherExts,
 	}
 }

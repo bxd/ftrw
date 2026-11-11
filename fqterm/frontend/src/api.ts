@@ -90,6 +90,10 @@ export interface Preferences {
   proxyPort: number
   proxyUser: string
   proxyPass: string
+  // 启动器搜索范围：开始菜单与桌面永远在搜，launcherDirs 只填额外目录；
+  // launcherExts 出厂 exe/lnk/bat/ps1/com，整列清空后端会退回出厂值。
+  launcherDirs: string[]
+  launcherExts: string[]
 }
 
 // 一份代理设置（与后端 ProxyConfig 同形）。测试连通时传的是界面上还没存盘的那一份。
@@ -141,6 +145,7 @@ const cfg = 'main.ConfigService'
 const term = 'main.TerminalService'
 const appsvc = 'main.AppService'
 const pvsvc = 'main.PreviewService'
+const lan = 'main.LauncherService'
 const ipsvc = 'main.IPService'
 
 export const ListSites = (): Promise<Site[]> => Call.ByName(`${cfg}.ListSites`)
@@ -295,6 +300,36 @@ export const StartIPUpdate = (): Promise<number> => Call.ByName(`${ipsvc}.StartU
 export const IPStatus = (): Promise<string> => Call.ByName(`${ipsvc}.Status`)
 // 改完库路径/地址后叫一次：后端会重新找库、重新读盘。
 export const IPReload = (): Promise<void> => Call.ByName(`${ipsvc}.Reload`)
+
+// ---- 启动器（?view=launcher 隐藏常驻窗）----
+
+// 一条命中。path 是 .lnk 全路径（invoke 用它），target 是解析出的 exe 路径，
+// 可能为空（只用于展示与匹配）。
+export interface LauncherResult {
+  name: string
+  path: string
+  target: string
+  score: number
+}
+
+export interface LauncherInfo {
+  ready: boolean
+  count: number
+  indexing: boolean
+}
+
+export const LauncherSearch = (query: string): Promise<LauncherResult[]> =>
+  Call.ByName(`${lan}.LauncherSearch`, query)
+// elevate=true 走 runas 动词（Ctrl+Enter 以管理员身份启动，UAC 由系统弹）。
+export const LauncherInvoke = (path: string, elevate = false): Promise<void> => Call.ByName(`${lan}.LauncherInvoke`, path, elevate)
+export const LauncherHide = (): Promise<void> => Call.ByName(`${lan}.LauncherHide`)
+export const LauncherStatus = (): Promise<LauncherInfo> => Call.ByName(`${lan}.LauncherInfo`)
+export const LauncherRebuild = (): Promise<void> => Call.ByName(`${lan}.LauncherRebuild`)
+// 设置页「添加目录」：弹原生选目录框，取消返空串（不是错误）
+export const PickLauncherDir = (): Promise<string> => Call.ByName(`${lan}.PickLauncherDir`)
+// 窗口已被预建常驻，每次呼出后端推一条：页面拿它清空上次输入并重新聚焦。
+export const onLauncherShow = (cb: () => void) =>
+  Events.On('launcher:show', () => cb())
 
 // ---- Terminal service ----
 

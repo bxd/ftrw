@@ -10,7 +10,7 @@
   <Identity 
     Name="org.fqterm.app"
     Publisher="CN=FQTerm"
-    Version="0.4.4.0"
+    Version="0.5.1.0"
     ProcessorArchitecture="x64" />
   
   <Properties>

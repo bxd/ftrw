@@ -136,11 +136,13 @@ func (s *Store) load() error {
 	}
 	// globalkeys.json：跨应用热键表。与应用内键序表故意分开存：两张表的生效条件、
 	// 语法形状、由谁匹配都不同，混在一个文件里会让 normalizeKeymap 那种「按形状钳制」
-	// 变成两套分支。这张表不做补种，出厂值只在文件不存在时生效。
+	// 变成两套分支。出厂行里的新增动作靠 Seeded 台账补种（见 seedFactoryGlobalBindings）。
 	if b, err := os.ReadFile(s.file("globalkeys.json")); err == nil {
 		var gk GlobalKeymap
 		if json.Unmarshal(b, &gk) == nil {
-			s.GlobalKey = normalizeGlobalKeymap(gk)
+			gk = normalizeGlobalKeymap(gk)
+			seedFactoryGlobalBindings(&gk, DefaultGlobalKeymap())
+			s.GlobalKey = gk
 		}
 	}
 	s.loaded = true
@@ -169,6 +171,32 @@ func seedFactoryBindings(cur *KeymapConfig, factory KeymapConfig) {
 		seeded[b.Command] = true
 		cur.Seeded = append(cur.Seeded, b.Command)
 		if bound[b.Command] {
+			continue
+		}
+		cur.Bindings = append(cur.Bindings, b)
+	}
+}
+
+// seedFactoryGlobalBindings 把新版本新增的出厂跨应用热键补种进用户已有的表。
+// 判据与 seedFactoryBindings 完全同一套：台账记「已尝试过补种的动作 id」，
+// bound 那一跳区分「用户手工解绑」与「用户把这条改成了别的键」。
+// 与表里的台账只在内存，不单独落盘：用户下次在界面保存时自然写回。
+func seedFactoryGlobalBindings(cur *GlobalKeymap, factory GlobalKeymap) {
+	seeded := make(map[string]bool, len(cur.Seeded))
+	for _, id := range cur.Seeded {
+		seeded[id] = true
+	}
+	bound := make(map[string]bool, len(cur.Bindings))
+	for _, b := range cur.Bindings {
+		bound[b.Action] = true
+	}
+	for _, b := range factory.Bindings {
+		if seeded[b.Action] {
+			continue
+		}
+		seeded[b.Action] = true
+		cur.Seeded = append(cur.Seeded, b.Action)
+		if bound[b.Action] {
 			continue
 		}
 		cur.Bindings = append(cur.Bindings, b)

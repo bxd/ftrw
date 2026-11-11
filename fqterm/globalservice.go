@@ -211,8 +211,10 @@ func defaultGlobalActionSpecs() []GlobalAction {
 	return out
 }
 
-// globalActionTable 是动作 id → 实现的唯一事实来源，界面下拉就从这里生成。三个动作
-// 都已经在 appservice.go 里实现好了：这里只把「系统级触发」接到同一扇门上，不新增窗口逻辑。
+// globalActionTable 是动作 id → 实现的唯一事实来源，界面下拉就从这里生成。窗口
+// 一族动作都已经在 appservice.go 里实现好了：这里只把「系统级触发」接到同一扇
+// 门上，不新增窗口逻辑；launcher.toggle 是唯一的例外 —— 本体在 LauncherService，
+// 进门只借 AppService 的转发（HotkeyToggleLauncher）。
 var globalActionTable = []globalActionSpec{
 	{
 		action: GlobalAction{
@@ -237,6 +239,14 @@ var globalActionTable = []globalActionSpec{
 			Description: "等同应用内 M-x M-q，切换后窗口一定可见并聚焦",
 		},
 		run: (*AppService).ToggleWindowModeSafe,
+	},
+	{
+		action: GlobalAction{
+			ID:          "launcher.toggle",
+			Label:       "呼出 / 收起启动器（模糊搜索并启动应用）",
+			Description: "已显示则收起，否则抢回前台弹出搜索条（默认双击 Ctrl+Alt）",
+		},
+		run: (*AppService).HotkeyToggleLauncher,
 	},
 }
 

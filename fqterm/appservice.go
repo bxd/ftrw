@@ -54,6 +54,8 @@ type AppService struct {
 	gkMu     sync.Mutex
 	gkEngine *globalKeyEngine
 
+	launcher *LauncherService // 启动器服务（main.go 注入），全局热键与托盘菜单共用
+
 	quitting    atomic.Bool // 托盘「退出」置位：放行 WindowClosing 钩子
 	dialogGuard atomic.Bool // 原生对话框占用焦点期间抑制 quake 收起
 }
@@ -76,6 +78,23 @@ func (s *AppService) Bind(app *application.App, win *application.WebviewWindow) 
 func (s *AppService) SetTrayIcons(light, dark []byte) {
 	s.trayIconLight = light
 	s.trayIconDark = dark
+}
+
+// SetLauncher 注入启动器服务。动作表里 launcher.toggle 的实现要经由 AppService
+// 这一扇门走（globalActionTable 的 run 签名是 func(*AppService)），窗口本体全在
+// LauncherService 里，这里只做转发。参数类型会把 LauncherService 拖成 bindings
+// 里的 model（与服务名撞车），所以整条对生成器隐去。
+//
+//wails:ignore
+func (s *AppService) SetLauncher(l *LauncherService) { s.launcher = l }
+
+// HotkeyToggleLauncher 是全局热键/托盘菜单的呼出入口（跑在热键动作 goroutine 上）。
+func (s *AppService) HotkeyToggleLauncher() {
+	if s.launcher == nil {
+		log.Printf("启动器服务未接线，呼出被忽略")
+		return
+	}
+	s.launcher.Toggle()
 }
 
 // prefs 取当前配置快照。Store 的锁只在取快照的这几行内持有，绝不在调用原生
@@ -235,6 +254,7 @@ func (s *AppService) trayOnNow() bool {
 func (s *AppService) buildTrayMenu() *application.Menu {
 	menu := application.NewMenu()
 	menu.Add("显示 / 隐藏 FTRW").OnClick(func(*application.Context) { s.TrayClick() })
+	menu.Add("启动器").OnClick(func(*application.Context) { s.HotkeyToggleLauncher() })
 	menu.AddSeparator()
 	menu.Add("切换 Quake 下拉模式").OnClick(func(*application.Context) { s.ToggleWindowMode() })
 	menu.AddSeparator()

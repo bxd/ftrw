@@ -1,4 +1,8 @@
 <script setup lang="ts">
+// 偏好设置对话框：左侧分组导航（启动器 / 终端 / 通用），右侧显示所选组的设置。
+// 「终端」组沿用最早的整页偏好（编码/字体/行为等），「通用」收跨模块的东西
+// （代理、IP 归属地、系统集成、quake），「启动器」是 launcher 分支新加的搜索范围设置。
+// 保存仍是一次 SetPreferences 全量回写：后端归一化字段，各组改动静默互相覆盖不了。
 import { computed, reactive, ref, onMounted, onBeforeUnmount } from 'vue'
 import * as api from '../api'
 
@@ -24,6 +28,49 @@ if (p.proxyHost == null) p.proxyHost = ''
 if (p.proxyPort == null) p.proxyPort = 0
 if (p.proxyUser == null) p.proxyUser = ''
 if (p.proxyPass == null) p.proxyPass = ''
+if (!Array.isArray(p.launcherDirs)) p.launcherDirs = []
+if (!Array.isArray(p.launcherExts)) p.launcherExts = ['exe', 'lnk', 'bat', 'ps1', 'com']
+
+// 左侧导航：tab → 右侧面板。默认打开终端组（老用户点开设置 most 常改的还是终端）。
+const tabs = [
+  { id: 'launcher', label: '启动器' },
+  { id: 'terminal', label: '终端' },
+  { id: 'general', label: '通用' },
+] as const
+type TabId = (typeof tabs)[number]['id']
+const tab = ref<TabId>('terminal')
+
+/* ---------------- 启动器：搜索范围 ---------------- */
+
+// 后缀框直接编辑一个逗号/空格分隔的字符串，保存时才拆成数组：编辑中间态
+// （刚打完逗号还没打下一个）不值得为它维护逐 token 的控件。
+const extsText = ref(p.launcherExts.join(', '))
+const dirNote = ref('')
+
+function parseExts(s: string): string[] {
+  return s.toLowerCase().split(/[\s,;，；]+/).map((v) => v.replace(/^\./, '').trim()).filter(Boolean)
+}
+
+async function addDir() {
+  try {
+    const d = await api.PickLauncherDir()
+    if (!d) return // 取消：空串不是错误
+    if (p.launcherDirs.some((v) => v.toLowerCase() === d.toLowerCase())) {
+      dirNote.value = `这个目录已经在列表里：${d}`
+      return
+    }
+    p.launcherDirs.push(d)
+    dirNote.value = ''
+  } catch (e: any) {
+    dirNote.value = `打开目录选择框失败：${e?.message || e}`
+  }
+}
+
+function removeDir(i: number) {
+  p.launcherDirs.splice(i, 1)
+}
+
+/* ---------------- 随系统启动 ---------------- */
 
 // 随系统启动不进 Preferences：它的唯一事实来源是注册表（HKCU\...\Run），
 // 在应用里存一份镜像会导致用户从「启动」里手工删掉后又被偷偷写回来。
@@ -120,6 +167,8 @@ onMounted(() => {
 onBeforeUnmount(() => { offIPU?.() })
 
 function doSave() {
+  // 启动器后缀框落进对象：整列被清空时后端会补回出厂值（那不等于「不搜文件」）。
+  p.launcherExts = parseExts(extsText.value)
   if (autostart.value !== autostartInit.value) {
     api.SetAutostart(autostart.value)
       .then(() => { autostartInit.value = autostart.value; autostartNote.value = '自启动设置已写入，下次登录生效' })
@@ -133,99 +182,137 @@ function doSave() {
   <div class="mask" @click.self="emit('close')">
     <div class="dlg">
       <div class="head"><span>偏好设置</span><button class="x" @click="emit('close')">✕</button></div>
-      <div class="form">
-        <div class="grid">
-          <label>默认编码</label>
-          <select v-model.number="p.defaultEncodingID">
-            <option v-for="(e, i) in api.ENCODINGS" :key="i" :value="i">{{ e }}</option>
-          </select>
-          <label>默认终端</label>
-          <select v-model="p.defaultTermType">
-            <option v-for="t in api.TERM_TYPES" :key="t" :value="t">{{ t }}</option>
-          </select>
-          <label>默认配色</label><input v-model="p.defaultScheme" />
-          <label>字体</label>
-                    <select v-model="p.fontName">
-                      <option value="">（默认：等宽）</option>
-                      <option v-for="f in fonts" :key="f" :value="f">{{ f }}</option>
-                    </select>
-          <label>字号</label><input type="number" v-model.number="p.fontSize" min="8" max="32" />
-          <label>列×行</label>
-          <div class="row2">
-            <input type="number" v-model.number="p.defaultColumns" min="20" /> ×
-            <input type="number" v-model.number="p.defaultRows" min="6" />
-          </div>
-          <label>回滚行数</label><input type="number" v-model.number="p.scrollbackLines" min="100" />
-          <label>下载目录</label><input v-model="p.zmodemDir" placeholder="留空使用默认目录" />
+      <div class="body">
+        <nav class="side">
+          <button v-for="t in tabs" :key="t.id" class="nav" :class="{ on: tab === t.id }" @click="tab = t.id">{{ t.label }}</button>
+        </nav>
+        <div class="form">
+          <!-- ============ 启动器 ============ -->
+          <template v-if="tab === 'launcher'">
+            <fieldset>
+              <legend>额外搜索目录</legend>
+              <div class="hint top">开始菜单与桌面永远在搜索范围内，这里只加「额外目录」（比如软件安装目录），递归扫描其中的可执行文件。</div>
+              <div class="dirlist">
+                <div v-for="(d, i) in p.launcherDirs" :key="d" class="dirrow">
+                  <span class="dirpath" :title="d">{{ d }}</span>
+                  <button class="del" @click="removeDir(i)">移除</button>
+                </div>
+                <div v-if="!p.launcherDirs.length" class="hint top">还没有额外目录。</div>
+              </div>
+              <button class="mini" @click="addDir">添加目录…</button>
+              <div class="note" v-if="dirNote">{{ dirNote }}</div>
+            </fieldset>
+            <fieldset>
+              <legend>文件类型（后缀）</legend>
+              <input v-model="extsText" placeholder="exe, lnk, bat, ps1, com" />
+              <div class="hint">逗号或空格分隔，不带点；只对上面的额外目录生效（开始菜单照常只认 .lnk）。整列清空保存会恢复出厂的 exe, lnk, bat, ps1, com。</div>
+            </fieldset>
+            <fieldset>
+              <legend>呼出</legend>
+              <div class="hint top">全局热键默认 <code>双击 Ctrl+Alt</code>（间隔可在「热键」窗口的跨应用热键页调整）；搜索支持应用名、exe 名与中文名的拼音（全拼 / 首字母）。</div>
+            </fieldset>
+          </template>
+
+          <!-- ============ 终端 ============ -->
+          <template v-if="tab === 'terminal'">
+            <div class="grid">
+              <label>默认编码</label>
+              <select v-model.number="p.defaultEncodingID">
+                <option v-for="(e, i) in api.ENCODINGS" :key="i" :value="i">{{ e }}</option>
+              </select>
+              <label>默认终端</label>
+              <select v-model="p.defaultTermType">
+                <option v-for="t in api.TERM_TYPES" :key="t" :value="t">{{ t }}</option>
+              </select>
+              <label>默认配色</label><input v-model="p.defaultScheme" />
+              <label>字体</label>
+                        <select v-model="p.fontName">
+                          <option value="">（默认：等宽）</option>
+                          <option v-for="f in fonts" :key="f" :value="f">{{ f }}</option>
+                        </select>
+              <label>字号</label><input type="number" v-model.number="p.fontSize" min="8" max="32" />
+              <label>列×行</label>
+              <div class="row2">
+                <input type="number" v-model.number="p.defaultColumns" min="20" /> ×
+                <input type="number" v-model.number="p.defaultRows" min="6" />
+              </div>
+              <label>回滚行数</label><input type="number" v-model.number="p.scrollbackLines" min="100" />
+              <label>下载目录</label><input v-model="p.zmodemDir" placeholder="留空使用默认目录" />
+            </div>
+            <fieldset>
+              <legend>行为</legend>
+              <label class="chk"><input type="checkbox" v-model="p.confirmClose" /> 关闭连接时确认</label>
+              <label class="chk"><input type="checkbox" v-model="p.imageViewerEnabled" /> 点击超链接时在预览窗口中打开（关闭则交给系统浏览器）</label>
+              <label class="chk"><input type="checkbox" v-model="p.menuClickEnabled" /> 鼠标点击 BBS 菜单与文章列表（悬停出现高亮才可点）</label>
+            </fieldset>
+          </template>
+
+          <!-- ============ 通用 ============ -->
+          <template v-if="tab === 'general'">
+            <fieldset>
+              <legend>网络代理</legend>
+              <div class="grid grid-in">
+                <label>类型</label>
+                <select v-model.number="p.proxyType">
+                  <option :value="0">不用代理</option>
+                  <option :value="2">SOCKS4 / 4a</option>
+                  <option :value="3">SOCKS5</option>
+                  <option :value="4">HTTP（CONNECT）</option>
+                </select>
+                <label>地址</label>
+                <div class="row2">
+                  <input v-model="p.proxyHost" placeholder="127.0.0.1" :disabled="!proxyOn" />
+                  <input type="number" v-model.number="p.proxyPort" class="port" placeholder="端口" :disabled="!proxyOn" />
+                </div>
+                <label>认证</label>
+                <div class="row2">
+                  <input v-model="p.proxyUser" placeholder="用户名（可空）" :disabled="!proxyOn" />
+                  <input type="password" v-model="p.proxyPass" placeholder="口令（可空）" :disabled="!proxyOn" />
+                </div>
+              </div>
+              <button class="mini" :disabled="!proxyOn || proxyTesting" @click="doProxyTest">{{ proxyTesting ? '测试中…' : '测试连通' }}</button>
+              <div class="hint">{{ proxyTestText || '代理同时管住终端连接（Telnet/SSH）、IP 库下载与链接预览三条出站路；端口留空按类型补默认（SOCKS 1080 / HTTP 8080）。单个站点要直连或换代理，在站点编辑里另有设置。' }}</div>
+            </fieldset>
+            <fieldset>
+              <legend>IP 归属地</legend>
+              <label class="chk"><input type="checkbox" v-model="p.ipLocationEnabled" /> 鼠标悬停屏幕上的 IPv4 时显示归属地（只读本地纯真库，不把地址发给在线接口）</label>
+              <div class="grid grid-in">
+                <label>库文件</label>
+                <input v-model="p.ipLocationDb" placeholder="留空自动查找：程序目录 → 配置目录" />
+                <label>下载地址</label>
+                <input v-model="p.ipLocationUrl" placeholder="留空用内置镜像 metowolf/qqwry.dat" />
+              </div>
+              <button class="mini" :disabled="ipUpdating" @click="doIPUpdate">{{ ipUpdating ? '更新中…' : '立即更新' }}</button>
+              <div class="hint">{{ ipStatusText || '正在读取库状态…' }}</div>
+              <div class="hint">本地库缺失或距上次尝试超一天时，后台自动更新一轮。自动更新失败（无网、镜像不可达）可自行下载 qqwry.dat 存到上面“库文件”的路径或配置目录，保存后立即生效。</div>
+            </fieldset>
+            <fieldset>
+              <legend>系统集成</legend>
+              <label class="chk"><input type="checkbox" v-model="autostart" /> 随系统启动（登录时自动运行）</label>
+              <label class="chk"><input type="checkbox" v-model="p.trayEnabled" /> 显示系统托盘图标（左键显示/隐藏，右键菜单）</label>
+              <label class="chk"><input type="checkbox" v-model="p.closeToTray" :disabled="!p.trayEnabled" /> 点 ✕ 收起至托盘而不退出</label>
+              <div class="note" v-if="autostartNote">{{ autostartNote }}</div>
+            </fieldset>
+            <fieldset>
+              <legend>quake 下拉窗口</legend>
+              <div class="grid grid-in">
+                <label>下拉宽度</label>
+                <div class="row2">
+                  <input type="number" v-model.number="p.quakeWidthPct" min="20" max="100" step="5" />
+                  <span class="unit">% 工作区宽度</span>
+                </div>
+                <label>下拉高度</label>
+                <div class="row2">
+                  <input type="number" v-model.number="p.quakeHeightPct" min="20" max="100" step="5" />
+                  <span class="unit">% 工作区高度</span>
+                </div>
+              </div>
+              <label class="chk"><input type="checkbox" v-model="p.quakeHideOnBlur" /> 失焦自动收起</label>
+              <div class="hint">{{ quakeNote }}</div>
+              <div class="hint">切换入口：键序列 <code>M-x M-q</code>（应用内）· 全局热键 <code>Alt+`</code> / <code>Alt+~</code>（跨应用）</div>
+            </fieldset>
+          </template>
         </div>
-        <fieldset>
-          <legend>行为</legend>
-          <label class="chk"><input type="checkbox" v-model="p.confirmClose" /> 关闭连接时确认</label>
-          <label class="chk"><input type="checkbox" v-model="p.imageViewerEnabled" /> 点击超链接时在预览窗口中打开（关闭则交给系统浏览器）</label>
-          <label class="chk"><input type="checkbox" v-model="p.menuClickEnabled" /> 鼠标点击 BBS 菜单与文章列表（悬停出现高亮才可点）</label>
-        </fieldset>
-        <fieldset>
-          <legend>网络代理</legend>
-          <div class="grid grid-in">
-            <label>类型</label>
-            <select v-model.number="p.proxyType">
-              <option :value="0">不用代理</option>
-              <option :value="2">SOCKS4 / 4a</option>
-              <option :value="3">SOCKS5</option>
-              <option :value="4">HTTP（CONNECT）</option>
-            </select>
-            <label>地址</label>
-            <div class="row2">
-              <input v-model="p.proxyHost" placeholder="127.0.0.1" :disabled="!proxyOn" />
-              <input type="number" v-model.number="p.proxyPort" class="port" placeholder="端口" :disabled="!proxyOn" />
-            </div>
-            <label>认证</label>
-            <div class="row2">
-              <input v-model="p.proxyUser" placeholder="用户名（可空）" :disabled="!proxyOn" />
-              <input type="password" v-model="p.proxyPass" placeholder="口令（可空）" :disabled="!proxyOn" />
-            </div>
-          </div>
-          <button class="mini" :disabled="!proxyOn || proxyTesting" @click="doProxyTest">{{ proxyTesting ? '测试中…' : '测试连通' }}</button>
-          <div class="hint">{{ proxyTestText || '代理同时管住终端连接（Telnet/SSH）、IP 库下载与链接预览三条出站路；端口留空按类型补默认（SOCKS 1080 / HTTP 8080）。单个站点要直连或换代理，在站点编辑里另有设置。' }}</div>
-        </fieldset>
-        <fieldset>
-          <legend>IP 归属地</legend>
-          <label class="chk"><input type="checkbox" v-model="p.ipLocationEnabled" /> 鼠标悬停屏幕上的 IPv4 时显示归属地（只读本地纯真库，不把地址发给在线接口）</label>
-          <div class="grid grid-in">
-            <label>库文件</label>
-            <input v-model="p.ipLocationDb" placeholder="留空自动查找：程序目录 → 配置目录" />
-            <label>下载地址</label>
-            <input v-model="p.ipLocationUrl" placeholder="留空用内置镜像 metowolf/qqwry.dat" />
-          </div>
-          <button class="mini" :disabled="ipUpdating" @click="doIPUpdate">{{ ipUpdating ? '更新中…' : '立即更新' }}</button>
-          <div class="hint">{{ ipStatusText || '正在读取库状态…' }}</div>
-          <div class="hint">本地库缺失或距上次尝试超一天时，后台自动更新一轮。自动更新失败（无网、镜像不可达）可自行下载 qqwry.dat 存到上面“库文件”的路径或配置目录，保存后立即生效。</div>
-        </fieldset>
-        <fieldset>
-          <legend>系统集成</legend>
-          <label class="chk"><input type="checkbox" v-model="autostart" /> 随系统启动（登录时自动运行）</label>
-          <label class="chk"><input type="checkbox" v-model="p.trayEnabled" /> 显示系统托盘图标（左键显示/隐藏，右键菜单）</label>
-          <label class="chk"><input type="checkbox" v-model="p.closeToTray" :disabled="!p.trayEnabled" /> 点 ✕ 收起至托盘而不退出</label>
-          <div class="note" v-if="autostartNote">{{ autostartNote }}</div>
-        </fieldset>
-        <fieldset>
-          <legend>quake 下拉窗口</legend>
-          <div class="grid grid-in">
-            <label>下拉宽度</label>
-            <div class="row2">
-              <input type="number" v-model.number="p.quakeWidthPct" min="20" max="100" step="5" />
-              <span class="unit">% 工作区宽度</span>
-            </div>
-            <label>下拉高度</label>
-            <div class="row2">
-              <input type="number" v-model.number="p.quakeHeightPct" min="20" max="100" step="5" />
-              <span class="unit">% 工作区高度</span>
-            </div>
-          </div>
-          <label class="chk"><input type="checkbox" v-model="p.quakeHideOnBlur" /> 失焦自动收起</label>
-          <div class="hint">{{ quakeNote }}</div>
-          <div class="hint">切换入口：键序列 <code>M-x M-q</code>（应用内）· 全局热键 <code>Alt+`</code> / <code>Alt+~</code>（跨应用）</div>
-        </fieldset>
       </div>
       <div class="foot">
         <button class="primary" @click="doSave">保存</button>
@@ -237,14 +324,20 @@ function doSave() {
 
 <style scoped>
 .mask { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); display: flex; align-items: center; justify-content: center; z-index: 50; }
-.dlg { width: 480px; max-height: 88vh; overflow-y: auto; background: #24272e; border: 1px solid #3d424b; border-radius: 10px; }
-.head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; font-weight: 600; border-bottom: 1px solid #33373f; }
+.dlg { width: 720px; max-height: 88vh; display: flex; flex-direction: column; background: #24272e; border: 1px solid #3d424b; border-radius: 10px; }
+.head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; font-weight: 600; border-bottom: 1px solid #33373f; flex: none; }
 .x { background: none; border: none; color: #8a919e; cursor: pointer; font-size: 16px; }
-.form { padding: 14px 16px; }
+.body { display: flex; min-height: 0; flex: 1; }
+.side { display: flex; flex-direction: column; gap: 4px; padding: 12px 8px; border-right: 1px solid #33373f; flex: 0 0 96px; }
+.nav { text-align: left; background: none; border: none; border-radius: 6px; padding: 8px 12px; font-size: 14px; color: #8a919e; }
+.nav:hover { background: #2b2f37; color: #d5d9e0; }
+.nav.on { background: #2c313a; color: #e6e9ef; font-weight: 600; }
+.form { padding: 14px 16px; overflow-y: auto; flex: 1; min-width: 0; }
 .grid { display: grid; grid-template-columns: 96px 1fr; gap: 8px 10px; align-items: center; }
 .grid label { color: #8a919e; font-size: 13px; text-align: right; }
 input, select { background: #1b1d22; color: #d5d9e0; border: 1px solid #3d424b; border-radius: 5px; padding: 5px 8px; font-size: 13px; width: 100%; box-sizing: border-box; }
 fieldset { border: 1px solid #33373f; border-radius: 6px; margin-top: 12px; padding: 10px 12px; }
+fieldset:first-child { margin-top: 0; }
 legend { color: #6a7180; font-size: 12px; padding: 0 6px; }
 .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #b5bac4; margin: 6px 0; }
 .chk input { width: auto; }
@@ -253,11 +346,16 @@ legend { color: #6a7180; font-size: 12px; padding: 0 6px; }
 .unit { color: #6a7180; font-size: 12px; white-space: nowrap; }
 .note { color: #6ab0f3; font-size: 12px; margin: 6px 0 0; }
 .hint { color: #6a7180; font-size: 12px; margin-top: 6px; }
+.hint.top { margin-top: 0; margin-bottom: 8px; }
 .hint code { color: #b5bac4; background: #1b1d22; border: 1px solid #3d424b; border-radius: 3px; padding: 0 4px; }
 .row2 { display: flex; align-items: center; gap: 6px; }
 button.mini { margin-top: 10px; padding: 4px 12px; font-size: 12px; }
 .row2 input.port { flex: 0 0 84px; width: 84px; }
-.foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid #33373f; }
+.dirlist { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
+.dirrow { display: flex; align-items: center; gap: 8px; background: #1b1d22; border: 1px solid #3d424b; border-radius: 5px; padding: 5px 8px; }
+.dirpath { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d5d9e0; font-size: 13px; }
+button.del { flex: none; padding: 2px 10px; font-size: 12px; color: #e07171; }
+.foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid #33373f; flex: none; }
 button { background: #2f333b; color: #d5d9e0; border: 1px solid #3d424b; border-radius: 5px; padding: 6px 16px; cursor: pointer; font-size: 13px; }
 button.primary { background: #2f74c0; border-color: #2f74c0; color: #fff; }
 </style>

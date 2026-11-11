@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 )
 
 // ConfigService is the Wails-bound service exposing site manager, preferences
@@ -12,6 +13,10 @@ type ConfigService struct {
 	// IP 库下载失败过一轮就要等一天再去碰，而用户刚刚才把代理填对——这时候不能让他
 	// 等到明天。见 main.go 里的接线。
 	onProxyChanged func()
+	// onPrefsChanged 在每次偏好保存后都会被叫一次（异步）：启动器拿它感知
+	// 搜索目录/后缀的改动并立即重建索引。与 onProxyChanged 不同，这里不比旧值，
+	// 叫一声没有副作用。见 main.go 里的接线。
+	onPrefsChanged func(prefs Preferences)
 }
 
 func NewConfigService(store *Store) *ConfigService {
@@ -21,6 +26,11 @@ func NewConfigService(store *Store) *ConfigService {
 // OnProxyChanged 接上「代理改了」的回调（只能构造之后设：要通知的 IPService 比 ConfigService 晚建）。
 func (cs *ConfigService) OnProxyChanged(fn func()) {
 	cs.onProxyChanged = fn
+}
+
+// OnPrefsChanged 接上「偏好保存了」的回调，回调拿到的是归一化之后的那一份。
+func (cs *ConfigService) OnPrefsChanged(fn func(prefs Preferences)) {
+	cs.onPrefsChanged = fn
 }
 
 // --- Site manager ---
@@ -124,6 +134,9 @@ func (cs *ConfigService) SetPreferences(prefs Preferences) error {
 	if proxyFromPrefs(old) != proxyFromPrefs(prefs) && cs.onProxyChanged != nil {
 		go cs.onProxyChanged()
 	}
+	if cs.onPrefsChanged != nil {
+		go cs.onPrefsChanged(prefs)
+	}
 	return cs.store.SavePrefs()
 }
 
@@ -144,7 +157,40 @@ func normalizePreferences(p Preferences) Preferences {
 	// 免得界面里看着是 SOCKS5、实际拨号时走了另一套解释。
 	pc := proxyFromPrefs(p).normalized()
 	p.ProxyType, p.ProxyHost, p.ProxyPort, p.ProxyUser, p.ProxyPass = pc.Type, pc.Host, pc.Port, pc.User, pc.Pass
+	// 启动器搜索范围：剪空白、去重；后缀列表整列被剪空时退回出厂值。
+	// 「一个后缀都不搜」不是能成立的状态（那等于把功能弄坏了），想只搜开始菜单
+	// 把目录清空就行；旧 prefs.json 没这个键（解码后 nil）也从这里拿到出厂后缀。
+	p.LauncherDirs = normalizeLauncherList(p.LauncherDirs, false)
+	if ex := normalizeLauncherList(p.LauncherExts, true); len(ex) > 0 {
+		p.LauncherExts = ex
+	} else {
+		p.LauncherExts = defaultLauncherExts
+	}
 	return p
+}
+
+// normalizeLauncherList 逐项剪空白、小写（withLower 时）、丢弃空项并按小写去重。
+// 剪完只剩标点的项（纯逗号、纯点）也丢：后缀框里多打的逗号会被前端拆成这种碎片，
+// 留着它们就会顶掉「整列已空 → 回出厂值」的判断。
+func normalizeLauncherList(items []string, withLower bool) []string {
+	out := make([]string, 0, len(items))
+	seen := make(map[string]bool, len(items))
+	for _, it := range items {
+		v := strings.TrimSpace(it)
+		if strings.Trim(v, ".,;、；， ") == "" {
+			continue
+		}
+		key := strings.ToLower(v)
+		if withLower {
+			v = key
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 // --- Color schemes ---

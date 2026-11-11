@@ -65,10 +65,18 @@ func main() {
 	terminalService := NewTerminalService(store)
 	appService := NewAppService(store)
 	previewService := NewPreviewService()
+	launcherService := NewLauncherService()
 	ipService := NewIPService(store)
 	// 代理没配好之前 IP 库注定下不来，失败一轮就要等满一天闸门。用户刚刚把代理填对的
 	// 那一刻就是「该再试一次」的信号，不能让他等到明天。
 	configService.OnProxyChanged(func() { ipService.MaybeUpdate() })
+	// 偏好保存后把搜索范围那份交给启动器并重建索引：用户改完目录/后缀点保存，
+	// 下次呼出就该看到新东西，不该还要重启。启动路径上不重建：Init 紧跟着就建。
+	launcherService.ApplyPrefs(store.Prefs)
+	configService.OnPrefsChanged(func(p Preferences) {
+		launcherService.ApplyPrefs(p)
+		go launcherService.LauncherRebuild()
+	})
 
 	exe, _ := os.Executable()
 	log.Printf("FTRW 启动 pid=%d exe=%s log=%s", os.Getpid(), exe, logger.Path())
@@ -89,6 +97,7 @@ func main() {
 			application.NewService(terminalService),
 			application.NewService(appService),
 			application.NewService(previewService),
+			application.NewService(launcherService),
 			application.NewService(ipService),
 		},
 		Assets: application.AssetOptions{
@@ -111,7 +120,9 @@ func main() {
 
 	appService.Bind(app, win)
 	appService.SetTrayIcons(trayIconLight, trayIconDark)
+	appService.SetLauncher(launcherService)
 	previewService.Bind(app, win, appService)
+	launcherService.Bind(app, win, appService)
 	ipService.Bind(win)
 
 	// 跨应用热键不在这里注册：低级键盘钩子要等应用跑起来之后才能安全地往主线程投递动作，
@@ -121,6 +132,9 @@ func main() {
 	appService.SetupTray()
 	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		appService.Start()
+		// 启动器预建隐藏窗 + 后台建索引：热键呼出时只剩 Show 与抢前台，不为 webview
+		// 冷启动买单。
+		launcherService.Init()
 		// 库过期或缺过一次就后台补一轮：开在启动路径上是白等，而且失败也不该拦人。
 		go ipService.MaybeUpdate()
 	})
