@@ -154,3 +154,64 @@ func TestMergeSeededKeepsLedgerAcrossSave(t *testing.T) {
 		t.Fatalf("并集未去重/未忽略空串: %v", dup)
 	}
 }
+
+func TestDefaultKeymapSeedsFileManager(t *testing.T) {
+	// 文件管理器是新加的标签形态，出厂绑定要开箱即用才能被补种进用户的 keybindings.json。
+	// 键位撞车由 TestDefaultKeymapHasNoDuplicateKeys 统一拦。
+	km := DefaultKeymap()
+	var hit *KeyBinding
+	for i := range km.Bindings {
+		if km.Bindings[i].Command == "files.open-manager" {
+			hit = &km.Bindings[i]
+		}
+	}
+	if hit == nil {
+		t.Fatal("出厂绑定里没有 files.open-manager")
+	}
+	if hit.Keys != "M-x e" {
+		t.Fatalf("文件管理器出厂键为 %q, want %q", hit.Keys, "M-x e")
+	}
+	if !hit.Enabled {
+		t.Fatal("文件管理器出厂绑定默认是停用的")
+	}
+	// 补种台账必须记上这个 id，否则用户手工解绑后每次启动又会被塞回来。
+	found := false
+	for _, id := range km.Seeded {
+		if id == "files.open-manager" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Seeded 台账缺 files.open-manager：%v", km.Seeded)
+	}
+}
+
+func TestDefaultKeymapSeedsEditPath(t *testing.T) {
+	// 文件管理器“编辑路径”出厂绑定 M-x d，同样要开箱即用且进补种台账。
+	// 键位撞车由 TestDefaultKeymapHasNoDuplicateKeys 统一拦。
+	km := DefaultKeymap()
+	var hit *KeyBinding
+	for i := range km.Bindings {
+		if km.Bindings[i].Command == "files.edit-path" {
+			hit = &km.Bindings[i]
+		}
+	}
+	if hit == nil {
+		t.Fatal("出厂绑定里没有 files.edit-path")
+	}
+	if hit.Keys != "M-x d" {
+		t.Fatalf("编辑路径出厂键为 %q, want %q", hit.Keys, "M-x d")
+	}
+	if !hit.Enabled {
+		t.Fatal("编辑路径出厂绑定默认是停用的")
+	}
+	found := false
+	for _, id := range km.Seeded {
+		if id == "files.edit-path" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Seeded 台账缺 files.edit-path：%v", km.Seeded)
+	}
+}

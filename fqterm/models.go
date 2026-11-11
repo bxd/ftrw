@@ -121,6 +121,27 @@ type Preferences struct {
 // 目录加进来时，那里常有现成的快捷方式，语义与开始菜单的 .lnk 完全一致。
 var defaultLauncherExts = []string{"exe", "lnk", "bat", "ps1", "com"}
 
+// FileEntry 是文件管理器（launcher 分支）的一条目录项：后端 ListDir 逐条直出，
+// 排序与呈现都交给前端。Path 是全路径（一切后续操作的唯一句柄），ModTime 用
+// UnixNano（按日期列排序时避免同目录里秒级精度打平）。
+type FileEntry struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"mtime"` // UnixNano
+	IsDir   bool   `json:"isDir"`
+	Hidden  bool   `json:"hidden"`
+}
+
+// DriveInfo 是文件管理器驱动器栏的一项。Root 是形如 "C:\" 的路径，Type 沿用
+// Windows GetDriveType 的返回值（0 未知 / 2 可移动 / 3 本地 / 4 网络 / 5 光驱）。
+type DriveInfo struct {
+	Root  string `json:"root"`
+	Label string `json:"label"`
+	Type  int    `json:"type"`
+	Ready bool   `json:"ready"`
+}
+
 // KeyBinding maps an Emacs-style key sequence to a command id. Parsing and
 // matching happen entirely on the frontend (see frontend/src/keyseq.ts for the
 // notation grammar); the backend only persists the table.
@@ -239,6 +260,22 @@ func DefaultKeymap() KeymapConfig {
 			Command: "post.toolbar-toggle",
 			Enabled: true,
 			Note:    "钉住 / 收起终端顶部的编辑工具栏（平时把鼠标移到顶缘唤出）",
+		},
+		// 文件管理器（launcher 分支）：键位取 e = explorer，还在 M-x 一族里；
+		// 与已占用的 p/f/k/s/r/m/l/v/i/t 都不撞（重键由 TestDefaultKeymapHasNoDuplicateKeys 扫）。
+		{
+			Keys:    "M-x e",
+			Command: "files.open-manager",
+			Enabled: true,
+			Note:    "新建一个 Total Commander 式双栏文件管理器标签",
+		},
+		// 编辑文件管理器活动栏的路径（d = directory）。只在有可见文件管理器标签时生效，
+		// 落在终端标签上时命令自己回一句提示。键位与已占用的 p/f/k/s/r/m/l/v/i/t/e 都不撞。
+		{
+			Keys:    "M-x d",
+			Command: "files.edit-path",
+			Enabled: true,
+			Note:    "编辑文件管理器当前栏的路径（回车跳转 · Esc 取消）",
 		},
 	}
 	return KeymapConfig{

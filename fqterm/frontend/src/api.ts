@@ -147,6 +147,7 @@ const appsvc = 'main.AppService'
 const pvsvc = 'main.PreviewService'
 const lan = 'main.LauncherService'
 const ipsvc = 'main.IPService'
+const fil = 'main.FileService'
 
 export const ListSites = (): Promise<Site[]> => Call.ByName(`${cfg}.ListSites`)
 export const SaveSite = (index: number, site: Site): Promise<void> => Call.ByName(`${cfg}.SaveSite`, index, site)
@@ -330,6 +331,65 @@ export const PickLauncherDir = (): Promise<string> => Call.ByName(`${lan}.PickLa
 // 窗口已被预建常驻，每次呼出后端推一条：页面拿它清空上次输入并重新聚焦。
 export const onLauncherShow = (cb: () => void) =>
   Events.On('launcher:show', () => cb())
+
+// ---- 文件管理器（launcher 分支：主窗口 M-x e 开的 Total Commander 式标签）----
+
+// 一条目录项。后端 ListDir 逐条直出，不排序、不跳过隐藏（hidden 供前端过滤）。
+// path 是全路径，一切后续操作的唯一句柄；mtime 是 UnixNano。
+export interface FileEntry {
+  name: string
+  path: string
+  size: number
+  mtime: number
+  isDir: boolean
+  hidden: boolean
+}
+
+export interface DriveInfo {
+  root: string
+  label: string
+  type: number // 0 未知 / 2 可移动 / 3 本地 / 4 网络 / 5 光驱
+  ready: boolean
+}
+
+export interface PluginTool {
+  id: string
+  title: string
+  kind: string
+  needsSelection: boolean
+}
+
+export interface PluginContext {
+  activeDir: string
+  selected: string[]
+  targetDir: string
+}
+
+export interface PluginResult {
+  message: string
+}
+
+// path 传空串后端会回主目录（ListDir/FileHome 都兜底）。
+export const FileHome = (): Promise<string> => Call.ByName(`${fil}.HomeDir`)
+export const FileDrives = (): Promise<DriveInfo[]> => Call.ByName(`${fil}.ListDrives`)
+export const FileListDir = (path: string): Promise<FileEntry[]> => Call.ByName(`${fil}.ListDir`, path)
+export const FileStat = (path: string): Promise<FileEntry> => Call.ByName(`${fil}.FileStat`, path)
+export const FileMkdir = (path: string): Promise<void> => Call.ByName(`${fil}.MakeDir`, path)
+export const FileRename = (oldPath: string, newPath: string): Promise<void> =>
+  Call.ByName(`${fil}.Rename`, oldPath, newPath)
+export const FileCopy = (src: string[], dstDir: string): Promise<void> => Call.ByName(`${fil}.Copy`, src, dstDir)
+export const FileMove = (src: string[], dstDir: string): Promise<void> => Call.ByName(`${fil}.Move`, src, dstDir)
+export const FileDelete = (paths: string[]): Promise<void> => Call.ByName(`${fil}.Delete`, paths)
+// 删除到回收站（Del）；Shift+Del / F8 走上面的 FileDelete 永久删除。
+export const FileRecycle = (paths: string[]): Promise<void> => Call.ByName(`${fil}.Recycle`, paths)
+// 用系统默认方式打开一条路径（Enter）。
+export const FileOpenPath = (path: string): Promise<void> => Call.ByName(`${fil}.OpenPath`, path)
+// 读文件开头一段做文本预览（F3），默认 64KB。
+export const FilePeek = (path: string, maxBytes = 65536): Promise<string> => Call.ByName(`${fil}.PeekFile`, path, maxBytes)
+// Python 扩展：本轮只有接口，Plugins 恒空、RunPlugin 恒报错。
+export const FilePlugins = (): Promise<PluginTool[]> => Call.ByName(`${fil}.Plugins`)
+export const FileRunPlugin = (toolID: string, ctx: PluginContext): Promise<PluginResult> =>
+  Call.ByName(`${fil}.RunPlugin`, toolID, ctx)
 
 // ---- Terminal service ----
 

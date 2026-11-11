@@ -2,6 +2,7 @@
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as api from './api'
 import { TermTab } from './terminal'
+import { FmTab } from './fmtab'
 import { Dialogs, Window } from '@wailsio/runtime'
 import SiteDialog from './components/SiteDialog.vue'
 import PrefsDialog from './components/PrefsDialog.vue'
@@ -17,7 +18,7 @@ import {
 } from './postactions'
 import { applyProbe, asKind, classifyURL, hostSpanAt, ipSpanAt, linkName, looksGenericName, mediaOnly, probeTargets, type PreviewItem } from './linkscan'
 
-interface TabMeta { id: string; title: string; status: string }
+interface TabMeta { id: string; title: string; status: string; kind?: 'term' | 'files' }
 
 const viewport = ref<HTMLDivElement | null>(null)
 const tabs = ref<TabMeta[]>([])        // reactive UI metadata only
@@ -352,7 +353,11 @@ function applyKeymap(c: api.KeymapConfig) {
  */
 function onGlobalKey(ev: KeyboardEvent) {
   const el = document.activeElement
-  if (el && viewport.value && viewport.value.contains(el)) return // 焦点在终端，交给 xterm 的回调，不查两遍
+  // 焦点在终端里 → 交给 xterm 回调，不查两遍。但活动标签若是文件管理器（也挂在
+  // viewport 里、没有 xterm）就不能早退：得让 M-x / S-<方向> 这些出厂序列在这也能用
+  // （否则关了个终端就再也 M-x k 不掉文件标签）。普通方向键/Enter/Fn 不在出厂序列里，
+  // keyseq 判 pass 放行，仍会落到 FileManagerView 自己的 @keydown。
+  if (el && viewport.value && viewport.value.contains(el) && tabs.value[active.value]?.kind !== 'files') return
   if (isTextEditing(el)) return // 正在往输入框打字，按键一律属于输入内容
   // 全屏下的退出出口：只认「焦点不在终端」这条路径。终端里 ESC 是 vim/BBS 的命根子，
   // 在 xterm 那一路抢走会把输终端打残，所以故意不做「按 ESC 处处退出」。
@@ -391,7 +396,7 @@ registerBuiltinCommands({
   echo: (m, k) => showEcho(m, k || 'info'),
   activeSessionId: () => insts[active.value]?.id || '',
   // 手查与悬停查共用一套：同一个缓存、同一个提示位置（没会话时只进底部状态区）
-  ipLookup: (addr) => void onIPHover(insts[active.value] ?? null, addr),
+  ipLookup: (addr) => void onIPHover(activeTerm(), addr),
   ipUpdate: () => void api.StartIPUpdate()
     .then(() => showEcho('正在更新 IP 库…', 'pending'))
     .catch((e: any) => showEcho(`IP 库更新启不起来：${e?.message || e}`, 'error')),
@@ -440,6 +445,25 @@ registerCommand({
   title: '标签：关闭当前标签',
   description: '默认 M-x k；连着线时按偏好可能弹确认，断开态直接关',
   handler: () => { if (active.value >= 0) void closeTab(active.value) },
+})
+
+registerCommand({
+  id: 'files.open-manager',
+  title: '文件管理器：新建一个双栏文件管理器标签（Total Commander 式）',
+  description: '默认序列 M-x e；Tab 切栏，F5/F6 复制移动、F7/F8/F2 建目录/删除/重命名，Enter 打开、F3/Space 预览',
+  handler: () => { void newFileManagerTab() },
+})
+
+// 编辑路径：命令住在 App 侧，但路径栏状态住在独立的 FileManagerView 里，
+// 故用 CustomEvent 广播；组件自己判“可不见”（只活动标签响应）。活动标签不是文件管理器时回一句提示。
+registerCommand({
+  id: 'files.edit-path',
+  title: '文件管理器：编辑当前栏的路径（地址栏）',
+  description: '默认序列 M-x d；仅当活动标签是文件管理器时生效，回车跳转、Esc 取消',
+  handler: () => {
+    if (tabs.value[active.value]?.kind !== 'files') { showEcho('当前标签不是文件管理器（先 M-x e 开一个）', 'info'); return }
+    window.dispatchEvent(new CustomEvent('ftrw:fm-edit-path'))
+  },
 })
 
 /* ---------------- 发帖动作（编辑工具栏背后那套） ---------------- */
@@ -743,6 +767,34 @@ async function newTab(site: api.Site) {
   // 必须移除，否则会与后端重复注入一次输入。
 }
 
+// activeTerm：活动标签不一定是终端（文件管理器标签混在 insts 里）。凡是要摸
+// 终端专属成员（site / term / IP 缓存 / 配色）的地方都先过这道闸，FmTab 没有
+// site，返回 null，让那些逻辑对文件标签自然空转，而不是拿到一个假 TermTab 崩属性。
+function activeTerm(): TermTab | null {
+  const t = active.value >= 0 ? insts[active.value] : null
+  return t && t.site ? t : null
+}
+
+// newFileManagerTab：命令 / 工具栏入口。开一个 FmTab（独立 Vue 根挂在 viewport 里），
+// 复用 newTab 那套铺满容器 + setActive 显隐/聚焦；FmTab 鸭子类型对齐通用标签逻辑，
+// 故 cast 进 insts（见 fmtab.ts 注释）。
+async function newFileManagerTab() {
+  if (!viewport.value) await nextTick()
+  const container = document.createElement('div')
+  container.className = 'fm-container'
+  container.style.position = 'absolute'
+  container.style.top = '0'
+  container.style.left = '0'
+  container.style.right = '0'
+  container.style.bottom = '0'
+  container.style.display = 'none'
+  viewport.value!.appendChild(container)
+  const fm = new FmTab(container)
+  insts.push(fm as unknown as TermTab)
+  tabs.value.push({ id: '', title: '文件管理器', status: 'ready', kind: 'files' })
+  setActive(insts.length - 1)
+}
+
 /**
  * 点到超链接：交给预览窗口。
  *
@@ -1027,17 +1079,20 @@ function onWinResize() {
 }
 
 function applySchemeToActive() {
-  const t = insts[active.value]
+  const t = activeTerm()
   if (!t) return
   const sc = schemes.value.find((s) => s.name === t.site.colorScheme) || schemes.value[0]
   t.applyScheme(sc || null)
 }
 
 const activeScheme = computed({
-  get: () => (active.value >= 0 ? insts[active.value].site.colorScheme : ''),
+  // 活动标签可能是文件管理器（FmTab 没有 site），统一经 activeTerm() 闸，
+  // 非终端时读空串 / 写不生效，避免渲染期访问 undefined.site 抛错。
+  get: () => activeTerm()?.site.colorScheme || '',
   set: (v: string) => {
-    if (active.value < 0) return
-    insts[active.value].site.colorScheme = v
+    const t = activeTerm()
+    if (!t) return
+    t.site.colorScheme = v
     applySchemeToActive()
   },
 })
@@ -1151,7 +1206,7 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
     </div>
 
     <div class="statusbar">
-      <span v-if="cur">
+      <span v-if="cur && cur.inst.site">
         {{ statusText(cur.meta.status) }}
         · {{ cur.inst.site.host || '本地' }}
         · {{ api.ENCODINGS[cur.inst.encoderID] }}
