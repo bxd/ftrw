@@ -1,0 +1,7 @@
+{
+  "id": "docx-preview",
+  "title": "Word 文档（docx 文本提取）",
+  "extensions": [".docx"],
+  "entry": "main.py",
+  "func": "preview"
+}

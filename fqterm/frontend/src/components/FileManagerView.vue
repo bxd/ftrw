@@ -9,7 +9,7 @@
 // 与 App.vue 的 M-x 键序列框架共存：裸方向键/Tab/Enter/Fn/Insert/Backspace 都不在
 // 出厂序列里（那些要 M-x 前缀或 Shift+方向），keyseq 判 pass 放行到这里；输入浮层聚焦
 // 时 isTextEditing 为真、这里也让路，所以两条路不打架。
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import * as api from '../api'
 import { initials, nameMatches } from '../pinyin'
 
@@ -53,10 +53,15 @@ let acCache: { name: string; isDir: boolean }[] = []
 const drives = ref<api.DriveInfo[]>([])
 const status = ref('')
 const plugins = ref<api.PluginTool[]>([])
+const pluginsDir = ref('')
 const menuOpen = ref(false)
 const input = reactive({ show: false, title: '', value: '', kind: '' as '' | 'mkdir' | 'rename', target: '' })
 const confirmDel = reactive({ show: false, paths: [] as string[], label: '', permanent: false })
 const viewer = reactive({ show: false, title: '', text: '', path: '' })
+// Ctrl+Q 就地预览：在“另一栏”盖一层渲染区，渲染当前光标项。
+const previewOn = ref(false)
+const preview = reactive({ kind: '', url: '', text: '', html: '', title: '', busy: false, err: '' })
+let previewSeq = 0 // 快速切项时丢弃旧请求，避免旧响应盖新项
 
 function mkPane(path: string): Pane {
   return { path, rows: [], allRows: [], filter: '', editingPath: false, cursor: 0, anchor: 0, sel: new Set(), sortKey: 'name', sortAsc: true, showHidden: false, loading: false, error: '' }
@@ -399,10 +404,18 @@ function startPathEdit(idx: number) {
   })
 }
 
+// 用户在地址栏敲的裸盘符（"F:"）在 Windows 上指的是「该盘上次记住的当前目录」而非盘根，
+// 换盘符时会被解析到意料之外的目录、地址栏显示也与真实内容对不上（甚至报错使路径停在旧盘）。
+// 提交前统一补成 "F:\\"，落到真正的盘根。（只处理纯盘符；带路径的 "F:\\x" 不动。）
+function normalizeTypedPath(p: string): string {
+  const q = p.trim()
+  return /^[A-Za-z]:$/.test(q) ? q + '\\' : q
+}
+
 function commitPathEdit(idx: number) {
   const pane = panes[idx]
   if (!pane.editingPath) return // Enter 后紧接的 blur 不重复提交
-  const val = pathDraft.value.trim()
+  const val = normalizeTypedPath(pathDraft.value)
   pane.editingPath = false
   acOpen.value = false
   if (val && val !== pane.path) void loadPane(idx, val, '')
@@ -559,16 +572,61 @@ async function view(quick = false) {
 
 async function loadPlugins() {
   try { plugins.value = await api.FilePlugins() } catch { plugins.value = [] }
+  if (!pluginsDir.value) { try { pluginsDir.value = await api.FilePluginsDir() } catch { /* 保留空 */ } }
 }
 
-async function runPlugin(tool: api.PluginTool) {
+async function runAction(tool: api.PluginTool, act: api.PluginAction) {
   const pane = panes[active.value]
+  const cur = curRow(pane)
+  // 解压面向当前光标项（归档文件）；压缩面向 ctx.selected。目录/特殊项不传 path。
+  const path = cur && !cur.special && !cur.isDir ? cur.path : ''
   const ctx: api.PluginContext = { activeDir: pane.path, selected: selectedPaths(pane), targetDir: panes[other.value].path }
   menuOpen.value = false
+  status.value = `${act.title} 进行中…`
   try {
-    const r = await api.FileRunPlugin(tool.id, ctx)
-    status.value = r.message || `${tool.title} 完成`
+    const r = await api.FileRunPluginAction(tool.id, act.id, path, ctx)
+    status.value = r.message || `${act.title} 完成`
+    // 解压/压缩会改目录内容：重载活动栏，让新文件立刻出现（光标尽量停在原项）。
+    await loadPane(active.value, pane.path, cur?.name || '')
   } catch (e: any) { status.value = String(e?.message || e) }
+}
+
+// 右键文件行：弹系统 Explorer 原生菜单（后端在顶部拼了 FTRW 插件动作）。
+// 坐标不传，后端在菜单线程 GetCursorPos；这里只按 Explorer 语义先调整选区/光标。
+async function onRowContext(idx: number, ri: number, e: MouseEvent) {
+  const pane = panes[idx]
+  const row = pane.rows[ri]
+  if (!row) return
+  if (row.special && row.name === '..') {
+    pane.cursor = ri
+  } else if (idx === active.value && !row.special && pane.sel.has(row.path)) {
+    // 右键已在多选内的项：保持选区，仅把光标落到该行。
+    pane.cursor = ri
+  } else {
+    // 否则清选区，光标/锚点落到该行（Ctrl/⌘ 右键切换该项选区）。
+    if ((e.ctrlKey || e.metaKey) && !row.special) {
+      if (pane.sel.has(row.path)) pane.sel.delete(row.path); else pane.sel.add(row.path)
+    } else {
+      pane.sel.clear()
+    }
+    pane.cursor = ri
+    pane.anchor = ri
+  }
+  if (idx !== active.value) switchPaneTo(idx)
+
+  // 目标路径：导航/特殊项用当前目录本身；否则用选区（空则回落到右键行）。
+  const sel = selectedPaths(pane)
+  const paths = row.special ? [pane.path] : (sel.length ? sel : [row.path])
+  const ctx: api.PluginContext = { activeDir: pane.path, selected: sel, targetDir: panes[other.value].path }
+  try {
+    const r = await api.FileShellContextMenu({ paths, ctx })
+    if (r.isPlugin) {
+      const tool = plugins.value.find((t) => t.id === r.pluginId)
+      const act = tool?.actions?.find((a) => a.id === r.actionId)
+      if (tool && act) { await runAction(tool, act); return }
+    }
+    if (r.error) status.value = r.error
+  } catch (e2: any) { status.value = String(e2?.message || e2) }
 }
 
 /* ---------- 键盘分发 ---------- */
@@ -585,11 +643,14 @@ function onKeydown(e: KeyboardEvent) {
     if (viewer.show) { e.preventDefault(); viewer.show = false; root.value?.focus(); return }
     if (confirmDel.show) { e.preventDefault(); confirmDel.show = false; root.value?.focus(); return }
     if (menuOpen.value) { menuOpen.value = false; return }
+    if (previewOn.value) { e.preventDefault(); closePreview(); return }
     if (panes[active.value].filter) { e.preventDefault(); setFilter(panes[active.value], ''); return }
   }
   // 其余浮层 / 菜单在场时整体让路。
   if (input.show || confirmDel.show || viewer.show || menuOpen.value) return
   const pane = panes[active.value]
+  // Ctrl/⌘+Q：就地预览开关（出厂键表未绑、也非 WebView2 保留键，能落到这里）。
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'q' || e.key === 'Q')) { e.preventDefault(); togglePreview(); return }
   switch (e.key) {
     case 'ArrowDown': e.preventDefault(); if (e.shiftKey) moveCursorExt(1); else moveCursor(1); break
     case 'ArrowUp': e.preventDefault(); if (e.shiftKey) moveCursorExt(-1); else moveCursor(-1); break
@@ -658,6 +719,99 @@ function rowType(r: Row): string {
   return e ? e.toUpperCase() : 'FILE'
 }
 
+/* ---------- Ctrl+Q 预览 ---------- */
+
+// 插件认领表：后端已给每个插件带 extensions（小写含点）；同一扩展名取第一个。
+function pluginForExt(extNoDot: string): api.PluginTool | null {
+  if (!extNoDot) return null
+  const e = '.' + extNoDot.toLowerCase()
+  return plugins.value.find((t) => (t.extensions || []).includes(e)) || null
+}
+
+function togglePreview() {
+  if (previewOn.value) { closePreview(); return }
+  previewOn.value = true
+  void resolvePreview(curRow(panes[active.value]))
+}
+
+function closePreview() {
+  previewOn.value = false
+  previewSeq++
+  preview.kind = ''; preview.url = ''; preview.text = ''; preview.html = ''
+  preview.title = ''; preview.busy = false; preview.err = ''
+}
+
+// 解析当前光标项：先问后端分类，kind=other 再交给认领该扩展名的插件转产物。
+async function resolvePreview(row: Row | null) {
+  if (!row || row.special) return
+  if (row.isDir) {
+    previewSeq++
+    preview.kind = ''; preview.url = ''; preview.text = ''; preview.html = ''
+    preview.title = row.name; preview.busy = false; preview.err = '（目录不可预览）'
+    return
+  }
+  const seq = ++previewSeq
+  preview.busy = true
+  preview.err = ''
+  preview.title = row.name
+  try {
+    const ref = await api.FilePreview(row.path)
+    if (seq !== previewSeq) return
+    if (ref.kind === 'other' && ref.needPlugin) {
+      const tool = pluginForExt(extOf(row.name))
+      if (!tool) { preview.busy = false; preview.kind = ''; preview.err = '无可用预览（未装 Python 或无插件认领）'; return }
+      const pane = panes[active.value]
+      const ctx: api.PluginContext = { activeDir: pane.path, selected: selectedPaths(pane), targetDir: panes[other.value].path }
+      const art = await api.FilePluginPreview(tool.id, row.path, ctx)
+      if (seq !== previewSeq) return
+      applyArtifact(art)
+    } else {
+      applyRef(ref)
+    }
+  } catch (e: any) {
+    if (seq !== previewSeq) return
+    preview.busy = false
+    preview.err = String(e?.message || e)
+  }
+}
+
+function applyRef(ref: api.PreviewRef) {
+  preview.kind = ref.kind
+  preview.url = ref.url
+  preview.text = ''
+  preview.html = ''
+  preview.busy = false
+  if (ref.kind === 'text') void loadText(ref.url)
+}
+
+function applyArtifact(art: api.PluginArtifact) {
+  preview.kind = art.kind || 'text'
+  preview.url = art.url || ''
+  preview.text = art.text || ''
+  preview.html = art.html || ''
+  if (art.title) preview.title = art.title
+  preview.busy = false
+}
+
+// 文本：先按 UTF-8 严格解，失败退回 GBK（中文 Windows 常见），与终端那侧的编码习惯对齐。
+async function loadText(url: string) {
+  try {
+    const resp = await fetch(url)
+    const buf = await resp.arrayBuffer()
+    let s: string
+    try { s = new TextDecoder('utf-8', { fatal: true }).decode(buf) }
+    catch { s = new TextDecoder('gbk').decode(buf) }
+    preview.text = s
+  } catch (e: any) {
+    preview.err = String(e?.message || e)
+  }
+}
+
+// 预览开着时光标移动就跟着切项（复用 resolvePreview 的 seq 防抖）。
+watch([() => active.value, () => panes[active.value].cursor], () => {
+  if (previewOn.value) void resolvePreview(curRow(panes[active.value]))
+})
+
 /* ---------- 生命周期 ---------- */
 
 // M-x d 从 App.vue 以 CustomEvent 广播过来：只有当前可见（活动）的文件管理器
@@ -706,8 +860,17 @@ onBeforeUnmount(() => {
       <div class="menu-wrap">
         <button class="dbtn" :class="{ on: menuOpen }" @click="menuOpen = !menuOpen; menuOpen && loadPlugins()">扩展 ▾</button>
         <div v-if="menuOpen" class="menu">
-          <div v-if="!plugins.length" class="menu-empty">（尚未接入 Python 扩展）</div>
-          <button v-for="t in plugins" :key="t.id" class="menu-item" @click="runPlugin(t)">{{ t.title }}</button>
+          <div v-if="!plugins.length" class="menu-empty">（未装 Python 或未放插件；插件目录 {{ pluginsDir || '程序目录\\plugins' }}）</div>
+          <template v-for="t in plugins" :key="t.id">
+            <div class="menu-group">{{ t.title }}</div>
+            <button
+              v-for="a in (t.actions || [])"
+              :key="t.id + ':' + a.id"
+              class="menu-item"
+              @click="runAction(t, a)"
+            >{{ a.title }}</button>
+            <div v-if="!(t.actions && t.actions.length)" class="menu-hint">（Ctrl+Q 预览其认领的格式）</div>
+          </template>
         </div>
       </div>
     </div>
@@ -765,6 +928,7 @@ onBeforeUnmount(() => {
             :class="{ cur: ri === pane.cursor && idx === active, mark: !row.special && pane.sel.has(row.path), dir: row.isDir, special: row.special }"
             @click="rowClick(idx, ri, $event)"
             @dblclick="activate(row)"
+            @contextmenu.prevent="onRowContext(idx, ri, $event)"
           >
             <span class="c-name">{{ row.name }}</span>
             <span class="c-type">{{ rowType(row) }}</span>
@@ -774,11 +938,31 @@ onBeforeUnmount(() => {
           <div v-if="!pane.loading && pane.filter && !pane.rows.length" class="row-empty">（无匹配项）</div>
           <div v-else-if="!pane.loading && !pane.filter && pane.rows.length <= 2" class="row-empty">（空目录）</div>
         </div>
+        <!-- Ctrl+Q 预览层：只盖在非活动栏（另一侧） -->
+        <div v-if="previewOn && idx === other" class="preview-layer" @click="root?.focus()">
+          <div class="pv-head">
+            <span class="pv-title" :title="preview.title">{{ preview.title }}</span>
+            <span class="pv-hint">再按 Ctrl+Q / Esc 关闭</span>
+          </div>
+          <div class="pv-body">
+            <div v-if="preview.busy" class="pv-info">载入中…</div>
+            <div v-else-if="preview.err" class="pv-info err">{{ preview.err }}</div>
+            <img v-else-if="preview.kind === 'image'" :src="preview.url" class="pv-img" alt="" />
+            <audio v-else-if="preview.kind === 'audio'" :src="preview.url" controls class="pv-audio"></audio>
+            <video v-else-if="preview.kind === 'video'" :src="preview.url" controls class="pv-video"></video>
+            <iframe v-else-if="preview.kind === 'pdf'" :src="preview.url" class="pv-frame"></iframe>
+            <iframe v-else-if="preview.kind === 'html' && preview.html" :srcdoc="preview.html" sandbox="" class="pv-frame"></iframe>
+            <iframe v-else-if="preview.kind === 'html' && preview.url" :src="preview.url" sandbox="" class="pv-frame"></iframe>
+            <div v-else-if="preview.kind === 'html'" class="pv-info">（插件未回内容）</div>
+            <pre v-else-if="preview.kind === 'text'" class="pv-text">{{ preview.text }}</pre>
+            <div v-else class="pv-info">（无可预览内容）</div>
+          </div>
+        </div>
       </div>
     </div>
 
     <div class="foot">
-      <span class="hint">Tab 切栏 · Enter 打开 · F5 复制 / F6 移动 / F7 目录 · Del 回收站 / Shift+Del 永删 · F2 重命名 · F3 预览 · Insert 多选 · Shift+↑↓ / Shift+点击 连续多选 · Ctrl+点击 跳选 · 敲字母过滤（支持拼音）· 双击地址栏 / Alt+X d 改路径</span>
+      <span class="hint">Tab 切栏 · Enter 打开 · F5 复制 / F6 移动 / F7 目录 · Del 回收站 / Shift+Del 永删 · F2 重命名 · F3 预览 · Insert 多选 · Shift+↑↓ / Shift+点击 连续多选 · Ctrl+点击 跳选 · Ctrl+Q 预览/退出 · 敲字母过滤（支持拼音）· 双击地址栏 / Alt+X d 改路径</span>
       <span v-if="status" class="status">{{ status }}</span>
     </div>
 
@@ -839,6 +1023,8 @@ onBeforeUnmount(() => {
 .menu-empty { color: #6b7280; font-size: 12px; padding: 4px 6px; }
 .menu-item { display: block; width: 100%; text-align: left; background: none; border: none; color: #c6ccd6; padding: 5px 6px; cursor: pointer; border-radius: 4px; }
 .menu-item:hover { background: #343943; }
+.menu-group { color: #8b93a1; font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 6px 6px 2px; text-transform: uppercase; }
+.menu-hint { color: #6b7280; font-size: 11px; padding: 2px 6px 4px; }
 .panes { flex: 1; display: flex; min-height: 0; }
 .pane { flex: 1; display: flex; flex-direction: column; min-width: 0; border: 2px solid transparent; position: relative; }
 .pane.on { border-color: #2f5aa0; }
@@ -885,4 +1071,16 @@ onBeforeUnmount(() => {
 .dlg-btns button { background: #2b2f37; color: #c6ccd6; border: 1px solid #3d424b; border-radius: 6px; padding: 5px 14px; cursor: pointer; }
 .dlg-btns button:hover { background: #3a3f49; }
 .dlg-btns button.danger { background: #5a2b2b; border-color: #7a3a3a; color: #f0d0d0; }
+.preview-layer { position: absolute; inset: 0; z-index: 25; display: flex; flex-direction: column; background: #12161f; }
+.pv-head { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; background: #1b2130; border-bottom: 1px solid #2c3038; font-size: 12px; }
+.pv-title { color: #d5d9e0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-hint { color: #6b7280; flex: none; margin-left: 8px; }
+.pv-body { flex: 1; overflow: auto; display: flex; align-items: center; justify-content: center; background: #12161f; }
+.pv-img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.pv-video { max-width: 100%; max-height: 100%; }
+.pv-audio { width: 90%; }
+.pv-frame { width: 100%; height: 100%; border: 0; background: #fff; }
+.pv-text { box-sizing: border-box; width: 100%; height: 100%; margin: 0; padding: 10px 12px; overflow: auto; color: #cfd4dd; background: #12161f; white-space: pre-wrap; word-break: break-all; font-family: Consolas, "Courier New", monospace; font-size: 12px; text-align: left; align-self: stretch; }
+.pv-info { color: #8a919e; padding: 12px; }
+.pv-info.err { color: #e0a0a0; }
 </style>

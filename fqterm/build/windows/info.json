@@ -1,12 +1,12 @@
 {
 	"fixed": {
-		"file_version": "0.5.2",
-		"product_version": "0.5.2"
+		"file_version": "0.5.3",
+		"product_version": "0.5.3"
 	},
 	"info": {
 		"0409": {
-			"FileVersion": "0.5.2",
-			"ProductVersion": "0.5.2",
+			"FileVersion": "0.5.3",
+			"ProductVersion": "0.5.3",
 			"CompanyName": "FTRW",
 			"FileDescription": "Telnet/SSH BBS Terminal",
 			"LegalCopyright": "© 2026, FTRW",

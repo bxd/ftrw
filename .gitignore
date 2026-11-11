@@ -6,6 +6,8 @@
 fqterm/bin/
 fqterm/.task/
 fqterm/.wails/
+# go build 直接构建（约定禁止）漏在源码目录的同名裸产物
+fqterm/fqterm
 
 # 前端依赖与产物（npm install / vite build 可再生）
 fqterm/frontend/node_modules/

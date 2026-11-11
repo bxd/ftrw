@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -169,5 +170,76 @@ func TestFilePeekTrimsTail(t *testing.T) {
 	full, _ := (&FileService{}).PeekFile(p, 0)
 	if full != "中文abc" {
 		t.Errorf("完整读不符：%q", full)
+	}
+}
+
+func TestPreviewKindByExt(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "x.png")
+	writeFile(t, f, "bin")
+	svc := NewFileService()
+	ref, err := svc.Preview(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Kind != "image" || ref.NeedPlugin {
+		t.Errorf("png 应为 image 且不交插件，得 kind=%q need=%v", ref.Kind, ref.NeedPlugin)
+	}
+	for ext, want := range map[string]string{".mp4": "video", ".mp3": "audio", ".txt": "text", ".html": "html", ".pdf": "pdf", ".docx": "other"} {
+		p := filepath.Join(dir, "f"+ext)
+		writeFile(t, p, "x")
+		r, err := svc.Preview(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Kind != want {
+			t.Errorf("%s 应为 %s，得 %s", ext, want, r.Kind)
+		}
+		if want == "other" && !r.NeedPlugin {
+			t.Errorf("%s 应置 NeedPlugin", ext)
+		}
+	}
+	// 目录不可预览。
+	if _, err := svc.Preview(dir); err == nil {
+		t.Errorf("目录应报错")
+	}
+	// 不存在的路径应报错。
+	if _, err := svc.Preview(filepath.Join(dir, "nope.png")); err == nil {
+		t.Errorf("不存在应报错")
+	}
+}
+
+func TestPreviewSignsOnlyExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "note.txt")
+	writeFile(t, f, "hi")
+	svc := NewFileService()
+	ref, err := svc.Preview(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.URL == "" {
+		t.Fatal("URL 为空")
+	}
+	u, err := url.Parse(ref.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok := u.Query().Get("k")
+	if tok == "" {
+		t.Fatal("URL 无 token")
+	}
+	if !svc.VerifyToken(f, tok) {
+		t.Errorf("合法 token 应通过")
+	}
+	if svc.VerifyToken(f, tok+"x") {
+		t.Errorf("篡改 token 应拒绝")
+	}
+	if svc.VerifyToken(f, "") {
+		t.Errorf("空 token 应拒绝")
+	}
+	// 另一条路径用同一 token 应失败（token 绑定路径）。
+	if svc.VerifyToken(filepath.Join(dir, "other.txt"), tok) {
+		t.Errorf("token 不应对其它路径有效")
 	}
 }

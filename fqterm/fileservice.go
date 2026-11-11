@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +16,24 @@ import (
 // 不引用其它服务的类型（否则绑定生成器会拖出 model 重名，见 launcher 的同款约定）。
 // 平台专属那部分（驱动器枚举、隐藏属性判定）拆到 fileservice_windows.go /
 // fileservice_other.go，这里只留跨平台骨架。
-type FileService struct{}
+type FileService struct {
+	// sessionSecret 是本进程随机生成的 HMAC 密钥（仅内存），用于给本机文件 URL 签名。
+	sessionSecret []byte
+	// py 是 Python 插件运行时；无 Python 时 Available=false，插件档自动禁用。
+	py *pyRuntime
+	// hwndProvider 由 main 在建好主窗后注入（见 shellmenu.go 的 Bind），供原生右键菜单
+	// 取主窗 HWND 作为 InvokeCommand 的父窗；非 Windows 或注入前为 nil。
+	hwndProvider func() uintptr
+}
 
-func NewFileService() *FileService { return &FileService{} }
+func NewFileService() *FileService {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		// crypto/rand 正常不会失败；真失败了给个定长兜底，签名照样自洽（只是弱）。
+		copy(secret, []byte("ftrw-fallback-session-secret-please"))
+	}
+	return &FileService{sessionSecret: secret, py: newPyRuntime()}
+}
 
 // ListDrives 给驱动器栏。平台实现在 fileservice_*_.go。
 func (s *FileService) ListDrives() []DriveInfo { return listDrives() }
@@ -219,6 +236,78 @@ func copyFile(from, to string, fi os.FileInfo) error {
 	}
 	_ = os.Chtimes(to, fi.ModTime(), fi.ModTime())
 	return nil
+}
+
+/* ---------- 预览（Ctrl+Q）：分类 + 签名 URL ---------- */
+
+// PreviewRef 是前端渲染一条本地文件所需的元信息。
+type PreviewRef struct {
+	URL        string `json:"url"`        // 已签名的 /__ftrwfile 地址（媒体/img/iframe 直接用）
+	Kind       string `json:"kind"`       // image / text / html / audio / video / pdf / other
+	MimeType   string `json:"mimeType"`   // 供前端参考（可空）
+	NeedPlugin bool   `json:"needPlugin"` // kind=other 时置真：交给 Python 插件认领转换
+	Size       int64  `json:"size"`
+}
+
+// previewKindByExt：扩展名（小写、含点）→ 预览种类。不在表内的落 other，交给插件档。
+var previewKindByExt = map[string]string{
+	".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image", ".webp": "image",
+	".bmp": "image", ".dib": "image", ".ico": "image", ".avif": "image", ".svg": "image", ".tif": "image", ".tiff": "image", ".jfif": "image",
+	".mp3": "audio", ".wav": "audio", ".ogg": "audio", ".oga": "audio", ".m4a": "audio", ".aac": "audio", ".flac": "audio", ".opus": "audio", ".wma": "audio",
+	".mp4": "video", ".webm": "video", ".mov": "video", ".m4v": "video", ".mkv": "video", ".avi": "video", ".wmv": "video", ".mpg": "video", ".mpeg": "video",
+	".html": "html", ".htm": "html", ".xhtml": "html", ".mhtml": "html",
+	".pdf": "pdf",
+	".txt": "text", ".md": "text", ".markdown": "text", ".log": "text", ".json": "text", ".csv": "text", ".tsv": "text",
+	".ini": "text", ".conf": "text", ".cfg": "text", ".yaml": "text", ".yml": "text", ".xml": "text", ".toml": "text",
+	".go": "text", ".py": "text", ".js": "text", ".ts": "text", ".jsx": "text", ".tsx": "text", ".vue": "text", ".c": "text", ".h": "text",
+	".cpp": "text", ".hpp": "text", ".rs": "text", ".java": "text", ".rb": "text", ".php": "text", ".sh": "text", ".bat": "text", ".ps1": "text",
+	".css": "text", ".sql": "text", ".lua": "text", ".r": "text", ".swift": "text", ".kt": "text", ".gradle": "text",
+}
+
+func previewKindFor(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if k, ok := previewKindByExt[ext]; ok {
+		return k
+	}
+	// 点开头且无扩展（如 Makefile）当作文本兜底，其余交插件。
+	if ext == "" {
+		return "text"
+	}
+	return "other"
+}
+
+// Preview 校验文件存在并给出渲染元信息 + 签名 URL。未知扩展名不报错，只置 NeedPlugin。
+func (s *FileService) Preview(path string) (PreviewRef, error) {
+	abs := canonicalPath(path)
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return PreviewRef{}, fmt.Errorf("无法预览（%s）：%v", path, err)
+	}
+	if fi.IsDir() {
+		return PreviewRef{}, fmt.Errorf("目录不可预览：%s", path)
+	}
+	kind := previewKindFor(abs)
+	ref := PreviewRef{
+		URL:        s.buildFileURL(abs),
+		Kind:       kind,
+		MimeType:   mime.TypeByExtension(strings.ToLower(filepath.Ext(abs))),
+		NeedPlugin: kind == "other",
+		Size:       fi.Size(),
+	}
+	return ref, nil
+}
+
+// SignPath 给一条本机路径签发可渲染 URL（插件转换产物用）；校验存在且为普通文件。
+func (s *FileService) SignPath(path string) (string, error) {
+	abs := canonicalPath(path)
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("签名失败（%s）：%v", path, err)
+	}
+	if fi.IsDir() {
+		return "", fmt.Errorf("不能签目录：%s", path)
+	}
+	return s.buildFileURL(abs), nil
 }
 
 // samePath 判两条路径是否指向同一处：取绝对路径后 EqualFold（NTFS 不区分大小写；

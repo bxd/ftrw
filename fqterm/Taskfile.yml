@@ -23,6 +23,7 @@ tasks:
     summary: Builds the application
     cmds:
       - task: "{{.GOOS}}:build"
+      - task: sync:plugins
 
   package:
     summary: Packages a production build of the application
@@ -32,7 +33,17 @@ tasks:
   run:
     summary: Runs the application
     cmds:
+      - task: sync:plugins
       - task: "{{.GOOS}}:run"
+
+  sync:plugins:
+    summary: 同步 pluginexamples 到 bin/plugins（运行时加载处；只覆文件、保留已生成的 .venv/__pycache__）
+    cmds:
+      - cmd: |-
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path '{{.BIN_DIR}}\plugins'; Copy-Item -Path 'pluginexamples\*' -Destination '{{.BIN_DIR}}\plugins' -Recurse -Force"
+        platforms: [windows]
+      - cmd: mkdir -p {{.BIN_DIR}}/plugins && cp -R pluginexamples/. {{.BIN_DIR}}/plugins/
+        platforms: [linux, darwin]
 
   dev:
     summary: Runs the application in development mode

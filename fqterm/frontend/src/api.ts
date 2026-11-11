@@ -357,6 +357,33 @@ export interface PluginTool {
   title: string
   kind: string
   needsSelection: boolean
+  extensions?: string[]
+  actions?: PluginAction[]
+}
+
+// PluginAction：插件声明的一条有副作用动作（解压/压缩等），在「扩展」菜单里点。
+export interface PluginAction {
+  id: string
+  title: string
+}
+
+// PreviewRef：后端 FileService.Preview 回传——已签名的可渲染 URL + 种类。
+export interface PreviewRef {
+  url: string
+  kind: string // image / text / html / audio / video / pdf / other
+  mimeType: string
+  needPlugin: boolean
+  size: number
+}
+
+// PluginArtifact：插件把任意文件转成的产物（path 经 Go 签成 url）。
+export interface PluginArtifact {
+  kind: string
+  path: string
+  url: string
+  html: string
+  text: string
+  title: string
 }
 
 export interface PluginContext {
@@ -367,6 +394,21 @@ export interface PluginContext {
 
 export interface PluginResult {
   message: string
+}
+
+// ShellMenuRequest：原生右键菜单一次弹出的入参（目标路径集 + 随行 ctx）。
+export interface ShellMenuRequest {
+  paths: string[]
+  ctx: PluginContext
+}
+
+// ShellMenuResult：右键菜单一次选择的结果。isPlugin 时前端据 pluginId/actionId 复用 runAction。
+export interface ShellMenuResult {
+  handled: boolean
+  pluginId: string
+  actionId: string
+  isPlugin: boolean
+  error: string
 }
 
 // path 传空串后端会回主目录（ListDir/FileHome 都兜底）。
@@ -386,10 +428,23 @@ export const FileRecycle = (paths: string[]): Promise<void> => Call.ByName(`${fi
 export const FileOpenPath = (path: string): Promise<void> => Call.ByName(`${fil}.OpenPath`, path)
 // 读文件开头一段做文本预览（F3），默认 64KB。
 export const FilePeek = (path: string, maxBytes = 65536): Promise<string> => Call.ByName(`${fil}.PeekFile`, path, maxBytes)
-// Python 扩展：本轮只有接口，Plugins 恒空、RunPlugin 恒报错。
+// Python 扩展预览：无 Python 时 Plugins 为空、PythonAvailable 为假；Ctrl+Q 走 FilePreview，
+// kind=other 再交 FilePluginPreview。
 export const FilePlugins = (): Promise<PluginTool[]> => Call.ByName(`${fil}.Plugins`)
-export const FileRunPlugin = (toolID: string, ctx: PluginContext): Promise<PluginResult> =>
-  Call.ByName(`${fil}.RunPlugin`, toolID, ctx)
+export const FilePythonAvailable = (): Promise<boolean> => Call.ByName(`${fil}.PythonAvailable`)
+// 插件目录绝对路径（程序目录\plugins）。
+export const FilePluginsDir = (): Promise<string> => Call.ByName(`${fil}.PluginsDir`)
+// 触发插件的一条动作（解压/压缩）。path 为当前光标项（可空），ctx 携选中集与对侧目录。
+export const FileRunPluginAction = (pluginID: string, action: string, path: string, ctx: PluginContext): Promise<PluginResult> =>
+  Call.ByName(`${fil}.RunPluginAction`, pluginID, action, path, ctx)
+// 在文件行上弹系统 Explorer 原生右键菜单（顶部拼 FTRW 插件动作）。菜单坐标后端自取鼠标位置。
+export const FileShellContextMenu = (req: ShellMenuRequest): Promise<ShellMenuResult> =>
+  Call.ByName(`${fil}.ShellContextMenu`, req)
+// 拿一条本地文件的渲染元信息（签名 URL + 种类）。Ctrl+Q 预览第一步。
+export const FilePreview = (path: string): Promise<PreviewRef> => Call.ByName(`${fil}.Preview`, path)
+// 未知类型交给认领该扩展名的插件转产物。
+export const FilePluginPreview = (pluginID: string, path: string, ctx: PluginContext): Promise<PluginArtifact> =>
+  Call.ByName(`${fil}.PluginPreview`, pluginID, path, ctx)
 
 // ---- Terminal service ----
 

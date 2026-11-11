@@ -1,0 +1,13 @@
+{
+  "id": "archive",
+  "title": "压缩包",
+  "extensions": [".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".tar.gz", ".tar.bz2", ".tar.xz", ".rar", ".7z"],
+  "entry": "main.py",
+  "func": "preview",
+  "actionFunc": "action",
+  "actions": [
+    { "id": "extract", "title": "解压到当前目录" },
+    { "id": "extract_to_other", "title": "解压到对侧目录" },
+    { "id": "compress", "title": "压缩选中项为 zip" }
+  ]
+}

@@ -103,7 +103,7 @@ func main() {
 			application.NewService(fileService),
 		},
 		Assets: application.AssetOptions{
-			Handler: application.AssetFileServerFS(assets),
+			Handler: newFMAssetHandler(assets, fileService),
 		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
@@ -111,13 +111,15 @@ func main() {
 	})
 
 	win := app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "FTRW - BBS 终端",
-		Width:            1120,
-		Height:           720,
-		Frameless:        true,
-		BackgroundColour: application.NewRGB(24, 26, 30),
-		URL:              "/",
-		StartState:       application.WindowStateNormal,
+		Title:     "FTRW - BBS 终端",
+		Width:     1120,
+		Height:    720,
+		Frameless: true,
+		// 文件管理器行自己接管右键弹原生 Shell 菜单，关掉 WebView2 默认菜单（重新加载/检查）以免抢先弹出。
+		DefaultContextMenuDisabled: true,
+		BackgroundColour:           application.NewRGB(24, 26, 30),
+		URL:                        "/",
+		StartState:                 application.WindowStateNormal,
 	})
 
 	appService.Bind(app, win)
@@ -126,6 +128,7 @@ func main() {
 	previewService.Bind(app, win, appService)
 	launcherService.Bind(app, win, appService)
 	ipService.Bind(win)
+	fileService.Bind(win)
 
 	// 跨应用热键不在这里注册：低级键盘钩子要等应用跑起来之后才能安全地往主线程投递动作，
 	// 见 AppService.Start 里的 startGlobalKeys。
