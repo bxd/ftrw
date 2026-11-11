@@ -326,11 +326,24 @@ export const LauncherInvoke = (path: string, elevate = false): Promise<void> => 
 export const LauncherHide = (): Promise<void> => Call.ByName(`${lan}.LauncherHide`)
 export const LauncherStatus = (): Promise<LauncherInfo> => Call.ByName(`${lan}.LauncherInfo`)
 export const LauncherRebuild = (): Promise<void> => Call.ByName(`${lan}.LauncherRebuild`)
+// LauncherReveal：把当前命中的路径交给主窗口的文件管理器标签（Shift+Enter 定位、
+// Alt+Enter 额外预览）。path 必须是索引项里的（后端白名单校验）。preview=true 走右栏预览。
+export const LauncherReveal = (path: string, preview: boolean): Promise<void> =>
+  Call.ByName(`${lan}.LauncherReveal`, path, preview)
 // 设置页「添加目录」：弹原生选目录框，取消返空串（不是错误）
 export const PickLauncherDir = (): Promise<string> => Call.ByName(`${lan}.PickLauncherDir`)
 // 窗口已被预建常驻，每次呼出后端推一条：页面拿它清空上次输入并重新聚焦。
 export const onLauncherShow = (cb: () => void) =>
   Events.On('launcher:show', () => cb())
+
+// LauncherReveal 后端把主窗提到前台后推给主窗口的定位事件。事件走全局总线（每个
+// 窗口都会收到），但只有主窗口注册了监听者（App.vue），启动器窗没人听这一条。
+export interface FileManagerReveal {
+  path: string
+  preview: boolean
+}
+export const onFileManagerReveal = (cb: (d: FileManagerReveal) => void) =>
+  Events.On('fm:reveal', (e: any) => cb(e.data))
 
 // ---- 文件管理器（launcher 分支：主窗口 M-x e 开的 Total Commander 式标签）----
 

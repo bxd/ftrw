@@ -796,6 +796,28 @@ async function newFileManagerTab() {
 }
 
 /**
+ * revealInFileManager：启动器 Shift+Enter / Alt+Enter 的后端事件落点（后端已把主窗
+ * 提到前台，这里只负责前端）。“已有文件管理器标签就复用（多个取最后一个）、没有
+ * 就新建”，两种情况都先把它激活到前台，再以 CustomEvent 广播给 FileManagerView 定位。
+ * 广播走 nextTick：新建标签时组件 onMounted 刚挂好监听、initial load 也已排入，下一个
+ * 滴答再发才能既命中监听者、又不与首屏加载抢游标。可见性判定交给接收方（offsetParent）。
+ */
+function revealInFileManager(path: string, preview: boolean) {
+  const dispatch = () => window.dispatchEvent(new CustomEvent('ftrw:fm-reveal', { detail: { path, preview } }))
+  let idx = -1
+  for (let i = tabs.value.length - 1; i >= 0; i--) {
+    if (tabs.value[i].kind === 'files') { idx = i; break }
+  }
+  if (idx < 0) {
+    // 没有文件管理器标签：新建（newFileManagerTab 内部会 setActive 到最后一个）再广播。
+    void newFileManagerTab().then(() => nextTick(dispatch))
+    return
+  }
+  setActive(idx)
+  nextTick(dispatch)
+}
+
+/**
  * 点到超链接：交给预览窗口。
  *
  * 清单取自当前屏幕（tab.collectLinks()），所以点开一张图之后还能在这一帖的图里
@@ -1000,6 +1022,7 @@ function grouped(): { name: string; items: { site: api.Site; index: number }[] }
 
 let offData: () => void, offStatus: () => void, offZ: () => void, offMode: (() => void) | undefined
 let offIP: (() => void) | undefined
+let offReveal: (() => void) | undefined
 
 onMounted(async () => {
   prefs.value = await api.GetPreferences()
@@ -1049,6 +1072,8 @@ onMounted(async () => {
     }
   })
   offIP = api.onIPUpdate(onIPProgress)
+  // 启动器发来的“在文件管理器里显示这条路径”（Shift+Enter 定位、Alt+Enter 额外预览）。
+  offReveal = api.onFileManagerReveal((d) => { if (d && d.path) revealInFileManager(d.path, !!d.preview) })
   window.addEventListener('resize', onWinResize)
   window.addEventListener('blur', onWindowBlur)
   try { applyKeymap(await api.GetKeymap()) } catch { /* 读不到就用出厂默认表 */ }
@@ -1070,7 +1095,7 @@ onMounted(async () => {
   })
 })
 
-onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
+onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP?.(); offReveal?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
 
 function onWinResize() {
   insts[active.value]?.fitNow()

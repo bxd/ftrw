@@ -41,6 +41,7 @@ func init() {
 	application.RegisterEvent[*ZmodemProgress]("zmodem:progress")
 	application.RegisterEvent[*WindowModeState]("app:mode")
 	application.RegisterEvent[*PreviewRequest]("preview:load")
+	application.RegisterEvent[*LauncherRevealPayload]("fm:reveal")
 }
 
 func main() {

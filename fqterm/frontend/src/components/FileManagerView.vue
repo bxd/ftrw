@@ -68,6 +68,12 @@ function mkPane(path: string): Pane {
 }
 const panes = reactive<Pane[]>([mkPane(''), mkPane('')])
 const other = computed(() => (active.value === 0 ? 1 : 0))
+// 每栏「最后一次请求」代次：同一栏上两个 loadPane 并发时（外部 reveal 抢占挂载初始
+// 加载、连发两次定位），只采纳最后发出的那份结果，旧响应回来就丢弃。
+const loadGen = [0, 0]
+// 外部 reveal 请求（启动器 Shift/Alt+Enter）进过本栏即置位：onMounted 的默认加载必须
+// 让位——FileHome+ListDir 比 reveal 的加载多半晚一跳落地，单靠代次会被它「迟到但赢」。
+let revealTaken = false
 
 /* ---------- 路径工具 ---------- */
 
@@ -124,10 +130,12 @@ function sortRows(list: Row[], pane: Pane): Row[] {
 
 async function loadPane(idx: number, path: string, keepName = '') {
   const pane = panes[idx]
+  const gen = ++loadGen[idx] // 本次是该栏最新一轮；在途期间别人再发，旧结果回来不落地
   pane.loading = true
   pane.error = ''
   try {
     const entries = await api.FileListDir(path)
+    if (gen !== loadGen[idx]) return // 在途期间该栏已有更新的加载，旧目录不许盖回
     const real: Row[] = entries
       .filter((e) => pane.showHidden || !e.hidden)
       .map((e) => ({ name: e.name, path: e.path, size: e.size, mtime: e.mtime, isDir: e.isDir, hidden: e.hidden }))
@@ -145,11 +153,14 @@ async function loadPane(idx: number, path: string, keepName = '') {
     pane.cursor = ci
     pane.anchor = ci
   } catch (e: any) {
+    if (gen !== loadGen[idx]) return // 过期请求的失败也不写错误/状态
     pane.error = String(e?.message || e)
     status.value = pane.error
   } finally {
-    pane.loading = false
-    if (idx === active.value) scrollCursor()
+    if (gen === loadGen[idx]) {
+      pane.loading = false
+      if (idx === active.value) scrollCursor()
+    }
   }
 }
 
@@ -821,18 +832,57 @@ function onEditPathEvent() {
   startPathEdit(active.value)
 }
 
+// 启动器 Shift+Enter / Alt+Enter 经后端事件→App.vue 广播过来：把 fullPath 定位到左栏
+// （固定 index 0）并选中；preview 为真时额外在右栏（活动栏对侧，active=0 时 other=1）就地
+// 预览。与 onEditPathEvent 同一套可见性闸：只有当前显示出来的那个文件管理器标签响应。
+async function revealPath(fullPath: string, preview: boolean) {
+  revealTaken = true // 进门先挂号：onMounted 那份默认初始加载要为此让位
+  const q = fullPath.replace(/[\\/]+$/, '')
+  const i = Math.max(q.lastIndexOf('\\'), q.lastIndexOf('/'))
+  const name = i >= 0 ? q.slice(i + 1) : q
+  const dir = parentOf(q)
+  active.value = 0
+  await loadPane(0, dir, name)
+  const pane = panes[0]
+  const ri = pane.rows.findIndex((r) => !r.special && r.name === name)
+  if (ri >= 0) {
+    pane.cursor = ri
+    pane.anchor = ri
+    pane.sel = new Set([pane.rows[ri].path])
+    scrollCursor()
+  }
+  if (preview) {
+    previewOn.value = true
+    void resolvePreview(curRow(pane))
+  }
+  root.value?.focus()
+}
+
+function onRevealEvent(ev: Event) {
+  if (!root.value || root.value.offsetParent === null) return
+  const d = (ev as CustomEvent).detail
+  if (!d || !d.path) return
+  void revealPath(String(d.path), !!d.preview)
+}
+
 onMounted(async () => {
   window.addEventListener('ftrw:fm-edit-path', onEditPathEvent)
+  window.addEventListener('ftrw:fm-reveal', onRevealEvent)
   refreshDrives()
   void loadPlugins()
   let start = props.initialPath || ''
   if (!start) start = await api.FileHome().catch(() => '')
+  // 取盘期间外部 reveal 已接管本栏：左栏由 reveal 打开目标目录，默认加载不能再拿主目录
+  // 盖回去（它落地更晚，单靠 loadGen 代次会被它「迟到但赢」）；右栏补一份主目录，
+  // 保持双栏默认观感，与 reveal 不同栏、不冲突。
+  if (revealTaken) { void loadPane(1, start, ''); root.value?.focus(); return }
   await Promise.all([loadPane(0, start, ''), loadPane(1, start, '')])
   root.value?.focus()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('ftrw:fm-edit-path', onEditPathEvent)
+  window.removeEventListener('ftrw:fm-reveal', onRevealEvent)
 })
 </script>
 

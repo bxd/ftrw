@@ -37,6 +37,11 @@ const (
 	// launcherEventShow 通知页面「又被呼出了」：清空上次的输入并重新聚焦。
 	launcherEventShow = "launcher:show"
 
+	// launcherEventReveal 通知主窗口「把这条路径在文件管理器里显示出来」：
+	// Shift+Enter 只在左栏定位选中，Alt+Enter 额外在右栏预览。接收方见
+	// App.vue（复用/新建文件管理器标签）与 FileManagerView.vue（实际定位）。
+	launcherEventReveal = "fm:reveal"
+
 	// launcherMaxResults 一屏给键盘够选的宽度，再多也没人滚。
 	launcherMaxResults = 20
 
@@ -72,6 +77,13 @@ type LauncherInfo struct {
 	Ready    bool `json:"ready"`
 	Count    int  `json:"count"`
 	Indexing bool `json:"indexing"`
+}
+
+// LauncherRevealPayload 是 fm:reveal 事件的载荷。Path 是要在文件管理器里定位的
+// 文件全路径（一定来自索引项）；Preview 为真时额外在右栏就地预览。
+type LauncherRevealPayload struct {
+	Path    string `json:"path"`
+	Preview bool   `json:"preview"`
 }
 
 // LauncherService 管启动器窗口与索引。零值不可用，须经 NewLauncherService + Bind。
@@ -407,6 +419,57 @@ func verbNote(elevate bool) string {
 		return "（管理员）"
 	}
 	return ""
+}
+
+/* --------------------------------------------------------------------------- */
+/* 在文件管理器中显示                                                           */
+/* --------------------------------------------------------------------------- */
+
+// LauncherReveal 把一条索引项的路径送进主窗口的文件管理器标签：
+// preview=false（Shift+Enter）只在左栏定位并选中该文件；preview=true（Alt+Enter）
+// 额外在右栏就地预览。主窗口里已有文件管理器标签则复用（App.vue 取最后一个），
+// 没有则新建；两种情况都要先收起启动器、把主窗口提到前台。
+//
+// path 必须来自索引 —— 与 LauncherInvoke 同一道闸：这是能从全局热键触达的窗口，
+// 不接受前端随手递来的任意路径。
+func (s *LauncherService) LauncherReveal(path string, preview bool) error {
+	s.mu.Lock()
+	ok := false
+	for _, e := range s.entries {
+		if strings.EqualFold(e.Path, path) {
+			ok = true
+			break
+		}
+	}
+	main := s.main
+	s.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("启动器不认识这条路径：%s", path)
+	}
+	if main == nil {
+		return errors.New("主窗口不可用，无法显示文件路径")
+	}
+	// 先收启动器（顺带撤掉它压着的 quake 护栏），再把主窗提到前台并投递定位事件。
+	s.hide()
+	s.revealToFront(main, path, preview)
+	return nil
+}
+
+// revealToFront 把主窗口 Show + 抢前台 + 聚焦，然后通知前端去定位。提窗动作与
+// AppService.forceShowFront 同源：先取原生 hwnd，Show 后用 forceForeground 绕开
+// 前台锁，裸 Focus() 才能真正把键盘焦点送进 webview。事件必须在窗口可见之后再发，
+// 因为 FileManagerView 靠 offsetParent 判定「自己是可见的活动栏」才响应。
+func (s *LauncherService) revealToFront(main *application.WebviewWindow, path string, preview bool) {
+	var hwnd uintptr
+	application.InvokeSync(func() {
+		if p := main.NativeWindow(); p != nil {
+			hwnd = uintptr(p)
+		}
+	})
+	main.Show()
+	forceForeground(hwnd)
+	main.Focus()
+	main.EmitEvent(launcherEventReveal, &LauncherRevealPayload{Path: path, Preview: preview})
 }
 
 /* --------------------------------------------------------------------------- */

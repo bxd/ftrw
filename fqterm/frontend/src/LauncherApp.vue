@@ -51,9 +51,14 @@ function onKeydown(e: KeyboardEvent) {
     case 'ArrowDown': e.preventDefault(); move(1); break
     case 'ArrowUp': e.preventDefault(); move(-1); break
     case 'Enter':
-      // Ctrl+Enter = 以管理员身份启动（UAC 由系统弹）；IME 拦在上头，
+      // Ctrl+Enter = 以管理员身份启动（UAC 由系统弹）；Shift+Enter = 把这条路径发到
+      // 文件管理器左栏定位选中；Alt+Enter = 同上并在右栏预览。IME 拦在上头，
       // 合成期间不会走到这里。
-      e.preventDefault(); void launch(e.ctrlKey); break
+      e.preventDefault()
+      if (e.shiftKey) void reveal(false)
+      else if (e.altKey) void reveal(true)
+      else void launch(e.ctrlKey)
+      break
     case 'Escape':
       // 后端窗口级绑定与失焦钩子也会收，这里自己再走一遍直连路径，不赌命中。
       e.preventDefault()
@@ -76,6 +81,18 @@ async function launch(elevate = false) {
   if (!it) return
   try {
     await api.LauncherInvoke(it.path, elevate)
+  } catch (e) {
+    err.value = String(e)
+  }
+}
+
+// reveal：不启动应用，而是把当前命中项的路径交给主窗口的文件管理器标签。后端会
+// 收起启动器、把主窗提到前台，再广播定位事件（Shift+Enter 只选中、Alt+Enter 额外预览）。
+async function reveal(preview = false) {
+  const it = items.value[sel.value]
+  if (!it) return
+  try {
+    await api.LauncherReveal(it.path, preview)
   } catch (e) {
     err.value = String(e)
   }
@@ -143,7 +160,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <div class="foot">
-      <span class="hint">↑↓ 选择 · Enter 启动 · Ctrl+Enter 管理员 · Esc 收起</span>
+      <span class="hint">↑↓ 选择 · Enter 启动 · Ctrl+Enter 管理员 · Shift+Enter 定位 · Alt+Enter 预览 · Esc 收起</span>
       <span v-if="err" class="fail">{{ err }}</span>
       <span v-else class="count">{{ info.count }} 个应用</span>
     </div>
