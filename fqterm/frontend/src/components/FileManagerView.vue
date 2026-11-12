@@ -58,6 +58,8 @@ const pluginsDir = ref('')
 const menuOpen = ref(false)
 const input = reactive({ show: false, title: '', value: '', kind: '' as '' | 'mkdir' | 'rename', target: '' })
 const confirmDel = reactive({ show: false, paths: [] as string[], label: '', permanent: false })
+// 复制/移动操作确认：发起前先问一遍；目标已有同名项时列出冲突，确认键升级为「覆盖」。
+const confirmOp = reactive({ show: false, kind: '' as '' | 'copy' | 'move', src: [] as string[], dst: '', conflicts: [] as string[] })
 const viewer = reactive({ show: false, title: '', text: '', path: '' })
 // Ctrl+Q 就地预览：在“另一栏”盖一层渲染区，渲染当前光标项。
 const previewOn = ref(false)
@@ -465,25 +467,147 @@ function switchPane() {
 /* ---------- 文件操作 ---------- */
 
 async function doCopy() {
-  const src = selectedPaths(panes[active.value])
-  const dst = panes[other.value].path
-  if (!src.length) return
-  try {
-    await api.FileCopy(src, dst)
-    status.value = `已复制 ${src.length} 项 → ${dst}`
-    await Promise.all([reloadPaneKeep(active.value), reloadPaneKeep(other.value)])
-  } catch (e: any) { status.value = String(e?.message || e) }
+  await askOp('copy')
 }
 
 async function doMove() {
+  await askOp('move')
+}
+
+// 操作确认：先预检目标同名冲突（后端 Conflicts），再弹确认框；
+// 有冲突时列出名单、确认键变「覆盖并复制/移动」，无冲突才是普通确认。
+async function askOp(kind: 'copy' | 'move') {
   const src = selectedPaths(panes[active.value])
   const dst = panes[other.value].path
   if (!src.length) return
+  let conflicts: string[] = []
+  try { conflicts = (await api.FileConflicts(src, dst)) || [] } catch { /* 预检失败不拦操作，StartTask 还会再校验 */ }
+  confirmOp.kind = kind
+  confirmOp.src = src
+  confirmOp.dst = dst
+  confirmOp.conflicts = conflicts
+  confirmOp.show = true
+}
+
+async function commitOp() {
+  const { kind, src, dst } = confirmOp
+  closeOp()
+  if (kind) await startFileTask(kind, src, dst)
+}
+
+function closeOp() {
+  confirmOp.show = false
+  confirmOp.kind = ''
+  confirmOp.src = []
+  confirmOp.dst = ''
+  confirmOp.conflicts = []
+  root.value?.focus()
+}
+
+/* ---------- 异步文件任务：模态进度对话框 / 栏内浮动进度条 ---------- */
+// 发起即弹模态对话框独占主窗口；点「后台运行」（或 Esc）最小化成发起栏
+// 左下角的浮动条，主窗口照常操作。多个后台任务自底向上堆叠，完成显示
+// 成功 2 秒后自动消失，上方条下移补位（bottom 定位 + CSS 过渡）。
+interface TaskView extends api.FileTask { paneIdx: number }
+const tasks = reactive<TaskView[]>([])
+const modalTaskId = ref('')
+const modalTask = computed(() => tasks.find((t) => t.id === modalTaskId.value) || null)
+let offTask: (() => void) | null = null
+const taskTimers = new Map<string, number>()
+
+const TASK_KIND_LABEL: Record<string, string> = { copy: '复制', move: '移动', delete: '永久删除', recycle: '删除' }
+
+function taskLabel(t: TaskView): string {
+  const k = TASK_KIND_LABEL[t.kind] || t.kind
+  return t.dst ? `${k} ${t.items} 项 → ${t.dst}` : `${k} ${t.items} 项`
+}
+
+function taskPct(t: TaskView): number {
+  if (t.totalBytes > 0) return Math.min(100, (t.doneBytes / t.totalBytes) * 100)
+  return t.state === 'running' ? 0 : 100
+}
+
+function taskStateText(t: TaskView): string {
+  if (t.state === 'done') return '已完成'
+  if (t.state === 'cancelled') return '已取消'
+  if (t.state === 'error') return '失败'
+  return t.curName || '准备中…'
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} K`
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} M`
+  return `${(n / 1073741824).toFixed(2)} G`
+}
+
+// 某栏的后台浮动条（模态中的那条不重复显示）；数组序即发起序，底条在前。
+function bgTasksFor(idx: number): TaskView[] {
+  return tasks.filter((t) => t.paneIdx === idx && t.id !== modalTaskId.value)
+}
+
+async function startFileTask(kind: string, src: string[], dst: string) {
   try {
-    await api.FileMove(src, dst)
-    status.value = `已移动 ${src.length} 项 → ${dst}`
-    await Promise.all([reloadPaneKeep(active.value), reloadPaneKeep(other.value)])
+    const id = await api.FileStartTask(kind, src, dst)
+    tasks.push({ id, kind, state: 'running', items: src.length, dst, totalBytes: 0, doneBytes: 0, curName: '', error: '', paneIdx: active.value })
+    modalTaskId.value = id
   } catch (e: any) { status.value = String(e?.message || e) }
+}
+
+function removeTask(id: string) {
+  const timer = taskTimers.get(id)
+  if (timer) { clearTimeout(timer); taskTimers.delete(id) }
+  const i = tasks.findIndex((t) => t.id === id)
+  if (i >= 0) tasks.splice(i, 1)
+}
+
+// 终态后的延时消失：浮动条显示成功 2 秒再收；期间被点开成模态则不收了。
+function scheduleTaskFade(id: string) {
+  if (taskTimers.has(id)) return
+  taskTimers.set(id, window.setTimeout(() => {
+    taskTimers.delete(id)
+    if (modalTaskId.value !== id) removeTask(id)
+  }, 2000))
+}
+
+function onTaskEvent(d: api.FileTask) {
+  const t = tasks.find((x) => x.id === d.id)
+  if (!t) return // 别的文件管理器标签发起的任务，不关本实例的事
+  Object.assign(t, d)
+  if (d.state === 'running') return
+  // 终态：两栏都刷（拷贝/移动改两边，删除也可能两栏同目录）。
+  void Promise.all([reloadPaneKeep(0), reloadPaneKeep(1)])
+  status.value = `${taskLabel(t)}：${taskStateText(t)}`
+  if (d.state === 'error') return // 错误留在条/模态里，点开看详情，不自动收
+  if (modalTaskId.value === d.id) {
+    // 模态中的成功/取消：同样显示 2 秒后自动关。
+    const timer = window.setTimeout(() => {
+      taskTimers.delete(d.id)
+      if (modalTaskId.value === d.id) { modalTaskId.value = ''; removeTask(d.id); root.value?.focus() }
+    }, 2000)
+    taskTimers.set(d.id, timer)
+  } else {
+    scheduleTaskFade(d.id)
+  }
+}
+
+// 模态「后台运行」/ Esc：不碰任务本身，只是把显示换成浮动条。
+function minimizeModalTask() {
+  modalTaskId.value = ''
+  root.value?.focus()
+}
+
+// 模态「关闭」（终态才出现）：运行中的任务只能取消或转后台，不能一关了之。
+function closeModalTask() {
+  const id = modalTaskId.value
+  modalTaskId.value = ''
+  const t = tasks.find((x) => x.id === id)
+  if (t && t.state !== 'running') removeTask(id)
+  root.value?.focus()
+}
+
+function cancelModalTask() {
+  if (modalTask.value) void api.FileCancelTask(modalTask.value.id).catch(() => {})
 }
 
 async function reloadPaneKeep(idx: number) {
@@ -666,16 +790,11 @@ function askDelete(permanent = false) {
 async function commitDelete() {
   const paths = confirmDel.paths
   const permanent = confirmDel.permanent
-  try {
-    // Del → 回收站（FileRecycle）；Shift+Del / F8 → 永久删除（FileDelete）。
-    if (permanent) await api.FileDelete(paths)
-    else await api.FileRecycle(paths)
-    status.value = `${permanent ? '已永久删除' : '已移入回收站'} ${paths.length} 项`
-    await Promise.all([reloadPaneKeep(active.value), loadPane(other.value, panes[other.value].path, '')])
-  } catch (e: any) { status.value = String(e?.message || e) }
   confirmDel.show = false
   confirmDel.paths = []
   root.value?.focus()
+  // Del → 回收站（recycle）；Shift+Del / F8 → 永久删除（delete），都走带进度的异步任务。
+  await startFileTask(permanent ? 'delete' : 'recycle', paths, '')
 }
 
 const IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'ico', 'tif', 'tiff'])
@@ -766,17 +885,27 @@ function onKeydown(e: KeyboardEvent) {
   // 不能落到下面的过滤/导航分发（否则编路径时敲字母会被当成过滤串）。
   const tag = (e.target as HTMLElement | null)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  // 模态进度对话框在场：主窗口独占，除 Esc（运行中=转后台，终态=关闭）外全部吞掉。
+  if (modalTask.value) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      if (modalTask.value.state === 'running') minimizeModalTask()
+      else closeModalTask()
+    }
+    return
+  }
   // Esc 逐级关浮层/菜单（输入框自己聚焦时已先一步消费，这里兜到 root 兼顾未聚焦的角落）。
   if (e.key === 'Escape') {
     if (input.show) { e.preventDefault(); closeInput(); return }
     if (viewer.show) { e.preventDefault(); viewer.show = false; root.value?.focus(); return }
+    if (confirmOp.show) { e.preventDefault(); closeOp(); return }
     if (confirmDel.show) { e.preventDefault(); confirmDel.show = false; root.value?.focus(); return }
     if (menuOpen.value) { menuOpen.value = false; return }
     if (previewOn.value) { e.preventDefault(); closePreview(); return }
     if (panes[active.value].filter) { e.preventDefault(); setFilter(panes[active.value], ''); return }
   }
   // 其余浮层 / 菜单在场时整体让路。
-  if (input.show || confirmDel.show || viewer.show || menuOpen.value) return
+  if (input.show || confirmDel.show || confirmOp.show || viewer.show || menuOpen.value) return
   const pane = panes[active.value]
   // Ctrl/⌘+Q：就地预览开关（出厂键表未绑、也非 WebView2 保留键，能落到这里）。
   if ((e.ctrlKey || e.metaKey) && (e.key === 'q' || e.key === 'Q')) { e.preventDefault(); togglePreview(); return }
@@ -987,6 +1116,7 @@ onMounted(async () => {
   window.addEventListener('ftrw:fm-edit-path', onEditPathEvent)
   window.addEventListener('ftrw:fm-reveal', onRevealEvent)
   offDirChanged = api.onFileManagerDirChanged(onDirChanged)
+  offTask = api.onFileTask(onTaskEvent)
   window.addEventListener('mousemove', onWinMouseMove)
   window.addEventListener('mouseup', onWinMouseUp)
   refreshDrives()
@@ -1019,6 +1149,9 @@ onBeforeUnmount(() => {
   window.removeEventListener('ftrw:fm-edit-path', onEditPathEvent)
   window.removeEventListener('ftrw:fm-reveal', onRevealEvent)
   offDirChanged?.()
+  offTask?.()
+  for (const timer of taskTimers.values()) clearTimeout(timer)
+  taskTimers.clear()
   for (const w of watched) if (w) void api.FileUnwatchDir(w)
   window.removeEventListener('mousemove', onWinMouseMove)
   window.removeEventListener('mouseup', onWinMouseUp)
@@ -1148,6 +1281,20 @@ onBeforeUnmount(() => {
             <div v-else class="pv-info">（无可预览内容）</div>
           </div>
         </div>
+        <!-- 后台任务浮动条：发起栏左下角，自底向上堆叠；填充从左走到右正好 100%。
+             点条重新弹模态看详情；完成显示成功 2 秒后自动收，上方条下移补位。 -->
+        <div
+          v-for="(t, ti) in bgTasksFor(idx)"
+          :key="t.id"
+          class="taskbar"
+          :class="{ done: t.state === 'done', err: t.state === 'error', cancel: t.state === 'cancelled' }"
+          :style="{ bottom: ti * 30 + 4 + 'px' }"
+          :title="taskLabel(t) + (t.error ? '：' + t.error : '')"
+          @click="modalTaskId = t.id"
+        >
+          <div class="taskfill" :style="{ width: taskPct(t) + '%' }"></div>
+          <span class="tasktext">{{ taskLabel(t) }} · {{ t.state === 'running' ? Math.floor(taskPct(t)) + '%' : taskStateText(t) }}</span>
+        </div>
       </div>
     </div>
 
@@ -1183,6 +1330,42 @@ onBeforeUnmount(() => {
         <div class="dlg-btns">
           <button class="danger" @click="commitDelete()">{{ confirmDel.permanent ? '永久删除' : '删除' }}</button>
           <button @click="confirmDel.show = false; root?.focus()">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 复制/移动操作确认；目标已有同名项时升级为覆盖确认 -->
+    <div v-if="confirmOp.show" class="mask" @click.self="closeOp()">
+      <div class="dlg">
+        <div class="dlg-head">{{ confirmOp.kind === 'copy' ? '确认复制' : '确认移动' }}</div>
+        <div class="dlg-msg">{{ confirmOp.src.length }} 项 → {{ confirmOp.dst }}</div>
+        <template v-if="confirmOp.conflicts.length">
+          <div class="dlg-note warn">目标已存在以下 {{ confirmOp.conflicts.length }} 项，继续将覆盖同名文件（目录则逐文件覆盖合并）：</div>
+          <div class="conflict-list">
+            <div v-for="name in confirmOp.conflicts" :key="name" class="conflict-item">{{ name }}</div>
+          </div>
+        </template>
+        <div class="dlg-btns">
+          <button :class="{ danger: confirmOp.conflicts.length > 0 }" @click="commitOp()">{{ confirmOp.conflicts.length ? (confirmOp.kind === 'copy' ? '覆盖并复制' : '覆盖并移动') : (confirmOp.kind === 'copy' ? '复制' : '移动') }}</button>
+          <button @click="closeOp()">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 异步文件任务模态进度对话框：独占主窗口，可转后台（浮动条）或取消 -->
+    <div v-if="modalTask" class="mask" @click.self="modalTask.state !== 'running' && closeModalTask()">
+      <div class="dlg task-dlg">
+        <div class="dlg-head">{{ taskLabel(modalTask) }}</div>
+        <div class="task-cur" :title="modalTask.curName">{{ taskStateText(modalTask) }}</div>
+        <div class="task-track"><div class="task-track-fill" :class="{ done: modalTask.state === 'done', err: modalTask.state === 'error', cancel: modalTask.state === 'cancelled' }" :style="{ width: taskPct(modalTask) + '%' }"></div></div>
+        <div class="task-meta">{{ fmtBytes(modalTask.doneBytes) }} / {{ fmtBytes(modalTask.totalBytes) }} · {{ Math.floor(taskPct(modalTask)) }}%</div>
+        <div v-if="modalTask.error" class="dlg-note err">{{ modalTask.error }}</div>
+        <div class="dlg-btns">
+          <template v-if="modalTask.state === 'running'">
+            <button @click="minimizeModalTask()">后台运行 (Esc)</button>
+            <button class="danger" @click="cancelModalTask()">取消</button>
+          </template>
+          <button v-else @click="closeModalTask()">关闭</button>
         </div>
       </div>
     </div>
@@ -1255,6 +1438,9 @@ onBeforeUnmount(() => {
 .view-body { flex: 1; overflow: auto; background: #16181c; color: #cfd4dd; border: 1px solid #2c3038; border-radius: 6px; padding: 10px; margin: 0; white-space: pre-wrap; word-break: break-all; font-family: Consolas, "Courier New", monospace; font-size: 12px; }
 .dlg-msg { color: #d5d9e0; padding: 4px 0; word-break: break-all; }
 .dlg-note { color: #8a919e; font-size: 12px; margin: 6px 0; }
+.dlg-note.warn { color: #e0c080; }
+.conflict-list { max-height: 160px; overflow-y: auto; background: #16181c; border: 1px solid #2c3038; border-radius: 6px; padding: 4px 0; margin: 6px 0; }
+.conflict-item { padding: 2px 10px; font-size: 12px; color: #d5d9e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dlg-input { width: 100%; box-sizing: border-box; background: #1b1d22; color: #e6e9ef; border: 1px solid #3d424b; border-radius: 6px; padding: 7px 10px; font-size: 14px; outline: none; }
 .dlg-input:focus { border-color: #6ea8fe; }
 .dlg-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
@@ -1273,4 +1459,21 @@ onBeforeUnmount(() => {
 .pv-text { box-sizing: border-box; width: 100%; height: 100%; margin: 0; padding: 10px 12px; overflow: auto; color: #cfd4dd; background: #12161f; white-space: pre-wrap; word-break: break-all; font-family: Consolas, "Courier New", monospace; font-size: 12px; text-align: left; align-self: stretch; }
 .pv-info { color: #8a919e; padding: 12px; }
 .pv-info.err { color: #e0a0a0; }
+/* 后台任务浮动条：横跨整栏，填充宽度即进度；bottom 定位 + 过渡，收条时上方条平滑下移补位。 */
+.taskbar { position: absolute; left: 2px; right: 2px; height: 24px; z-index: 26; background: #10141c; border: 1px solid #3d424b; border-radius: 4px; overflow: hidden; cursor: pointer; transition: bottom .25s ease; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+.taskfill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; background: #2f5aa0; transition: width .15s linear; }
+.taskbar.done .taskfill { background: #2e7d4f; }
+.taskbar.err .taskfill { background: #7a3a3a; }
+.taskbar.cancel .taskfill { background: #5d6470; }
+.tasktext { position: relative; z-index: 1; display: block; padding: 3px 8px; font-size: 12px; color: #e6e9ef; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 模态进度对话框 */
+.task-dlg { min-width: 480px; }
+.task-cur { color: #9aa1ad; font-size: 12px; margin-bottom: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-track { height: 14px; background: #16181c; border: 1px solid #2c3038; border-radius: 7px; overflow: hidden; }
+.task-track-fill { height: 100%; background: #2f5aa0; transition: width .15s linear; }
+.task-track-fill.done { background: #2e7d4f; }
+.task-track-fill.err { background: #7a3a3a; }
+.task-track-fill.cancel { background: #5d6470; }
+.task-meta { color: #8a919e; font-size: 12px; margin-top: 6px; }
+.dlg-note.err { color: #e0a0a0; word-break: break-all; }
 </style>

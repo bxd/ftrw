@@ -42,6 +42,7 @@ func init() {
 	application.RegisterEvent[*WindowModeState]("app:mode")
 	application.RegisterEvent[*PreviewRequest]("preview:load")
 	application.RegisterEvent[*LauncherRevealPayload]("fm:reveal")
+	application.RegisterEvent[*FileTask]("fm:task")
 }
 
 func main() {

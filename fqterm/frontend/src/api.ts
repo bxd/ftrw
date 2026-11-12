@@ -445,6 +445,21 @@ export const FileRename = (oldPath: string, newPath: string): Promise<void> =>
   Call.ByName(`${fil}.Rename`, oldPath, newPath)
 export const FileCopy = (src: string[], dstDir: string): Promise<void> => Call.ByName(`${fil}.Copy`, src, dstDir)
 export const FileMove = (src: string[], dstDir: string): Promise<void> => Call.ByName(`${fil}.Move`, src, dstDir)
+
+// 异步文件任务（复制/移动/删除带进度）：StartTask 立刻回任务号，进度经 fm:task 事件推。
+// kind：copy / move / delete（永久）/ recycle（回收站）；删除类 dst 传空串。
+export interface FileTask {
+  id: string; kind: string; state: string; items: number; dst: string
+  totalBytes: number; doneBytes: number; curName: string; error: string
+}
+export const FileStartTask = (kind: string, src: string[], dst: string): Promise<string> =>
+  Call.ByName(`${fil}.StartTask`, kind, src, dst)
+export const FileCancelTask = (id: string): Promise<void> => Call.ByName(`${fil}.CancelTask`, id)
+// 复制/移动前预检目标已存在的同名条目（覆盖确认用）。
+export const FileConflicts = (src: string[], dstDir: string): Promise<string[]> =>
+  Call.ByName(`${fil}.Conflicts`, src, dstDir)
+export const onFileTask = (cb: (t: FileTask) => void) =>
+  Events.On('fm:task', (e: any) => cb(e.data))
 export const FileDragPaths = (paths: string[]): Promise<void> => Call.ByName(`${fil}.DragPaths`, paths)
 export const FileDelete = (paths: string[]): Promise<void> => Call.ByName(`${fil}.Delete`, paths)
 // 删除到回收站（Del）；Shift+Del / F8 走上面的 FileDelete 永久删除。

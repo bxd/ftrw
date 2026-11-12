@@ -120,6 +120,7 @@ func cleanShellPaths(raw []string) []string {
 //wails:ignore
 func (s *FileService) Bind(win *application.WebviewWindow) {
 	s.bindWatch(win)
+	s.taskEmit = func(t *FileTask) { win.EmitEvent(fileTaskEvent, t) }
 	s.hwndProvider = func() uintptr {
 		var h uintptr
 		// NativeWindow 必须在主线程上取；服务方法跑在独立 goroutine，主循环空闲，InvokeSync 安全。

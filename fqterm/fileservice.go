@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -26,6 +27,10 @@ type FileService struct {
 	hwndProvider func() uintptr
 	// dw 监听两栏当前目录的外部改动（filewatch.go）；Bind 时创建，失败为 nil 降级。
 	dw *dirWatcher
+	// 异步文件任务（filetask.go）：复制/移动/删除的进度引擎，Bind 时挂事件出口。
+	taskMu   sync.Mutex
+	tasks    map[string]*fmTask
+	taskEmit func(*FileTask)
 }
 
 func NewFileService() *FileService {
@@ -36,7 +41,7 @@ func NewFileService() *FileService {
 	}
 	// 上一轮解出预览/打开的临时文件顺手清掉，不让 ftrw-arc-* 在系统 TEMP 里越积越多。
 	cleanArcTemp()
-	return &FileService{sessionSecret: secret, py: newPyRuntime()}
+	return &FileService{sessionSecret: secret, py: newPyRuntime(), tasks: make(map[string]*fmTask)}
 }
 
 // ListDrives 给驱动器栏。平台实现在 fileservice_*_.go。
