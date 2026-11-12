@@ -60,6 +60,9 @@ const input = reactive({ show: false, title: '', value: '', kind: '' as '' | 'mk
 const confirmDel = reactive({ show: false, paths: [] as string[], label: '', permanent: false })
 // 复制/移动操作确认：发起前先问一遍；目标已有同名项时列出冲突，确认键升级为「覆盖」。
 const confirmOp = reactive({ show: false, kind: '' as '' | 'copy' | 'move', src: [] as string[], dst: '', conflicts: [] as string[] })
+// 确认框两按钮的焦点穿梭：默认停取消（防误回车覆盖），Tab/方向键可移到确认。
+const opOkBtn = ref<HTMLButtonElement | null>(null)
+const opCancelBtn = ref<HTMLButtonElement | null>(null)
 const viewer = reactive({ show: false, title: '', text: '', path: '' })
 // Ctrl+Q 就地预览：在“另一栏”盖一层渲染区，渲染当前光标项。
 const previewOn = ref(false)
@@ -487,6 +490,7 @@ async function askOp(kind: 'copy' | 'move') {
   confirmOp.dst = dst
   confirmOp.conflicts = conflicts
   confirmOp.show = true
+  nextTick(() => opCancelBtn.value?.focus())
 }
 
 async function commitOp() {
@@ -904,8 +908,26 @@ function onKeydown(e: KeyboardEvent) {
     if (previewOn.value) { e.preventDefault(); closePreview(); return }
     if (panes[active.value].filter) { e.preventDefault(); setFilter(panes[active.value], ''); return }
   }
+  // 操作确认框在场：焦点只在两按钮间穿梭（Tab 循环不出框，方向键左=确认/右=取消），
+  // Enter/Space 不拦，留给聚焦按钮的原生 click。
+  if (confirmOp.show) {
+    const btns = [opOkBtn.value, opCancelBtn.value].filter(Boolean) as HTMLButtonElement[]
+    if (e.key === 'Tab') {
+      e.preventDefault()
+      const i = btns.indexOf(document.activeElement as HTMLButtonElement)
+      const n = i < 0 ? 1 : (i + (e.shiftKey ? btns.length - 1 : 1)) % btns.length
+      btns[n]?.focus()
+      return
+    }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault()
+      btns[e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? 0 : 1]?.focus()
+      return
+    }
+    return
+  }
   // 其余浮层 / 菜单在场时整体让路。
-  if (input.show || confirmDel.show || confirmOp.show || viewer.show || menuOpen.value) return
+  if (input.show || confirmDel.show || viewer.show || menuOpen.value) return
   const pane = panes[active.value]
   // Ctrl/⌘+Q：就地预览开关（出厂键表未绑、也非 WebView2 保留键，能落到这里）。
   if ((e.ctrlKey || e.metaKey) && (e.key === 'q' || e.key === 'Q')) { e.preventDefault(); togglePreview(); return }
@@ -1166,41 +1188,10 @@ onBeforeUnmount(() => {
     @keydown="onKeydown"
     @click="root?.focus()"
   >
-    <div class="drives">
-      <button class="dbtn home" @click="goHome()">🏠 主目录</button>
-      <button
-        v-for="d in drives"
-        :key="d.root"
-        class="dbtn"
-        :class="{ off: !d.ready }"
-        :title="`${d.root}${d.label ? ' (' + d.label + ')' : ''}`"
-        @click="onDrive(d)"
-      >{{ driveLetter(d) }}<span v-if="d.label" class="dlabel"> {{ d.label }}</span></button>
-      <span class="spacer"></span>
-      <button class="dbtn" @click="refreshDrives()">⟳ 盘符</button>
-      <button class="dbtn" :class="{ on: panes[active].showHidden }" @click="toggleHidden()">隐藏档</button>
-      <div class="menu-wrap">
-        <button class="dbtn" :class="{ on: menuOpen }" @click="menuOpen = !menuOpen; menuOpen && loadPlugins()">扩展 ▾</button>
-        <div v-if="menuOpen" class="menu">
-          <div v-if="!plugins.length" class="menu-empty">（未装 Python 或未放插件；插件目录 {{ pluginsDir || '程序目录\\plugins' }}）</div>
-          <template v-for="t in plugins" :key="t.id">
-            <div class="menu-group">{{ t.title }}</div>
-            <button
-              v-for="a in (t.actions || [])"
-              :key="t.id + ':' + a.id"
-              class="menu-item"
-              @click="runAction(t, a)"
-            >{{ a.title }}</button>
-            <div v-if="!(t.actions && t.actions.length)" class="menu-hint">（Ctrl+Q 预览其认领的格式）</div>
-          </template>
-        </div>
-      </div>
-    </div>
-
     <div class="panes">
+      <!-- 两栏内容用同一模板片段渲染两次，中间夹竖排按钮列（原顶部驱动器条） -->
+      <template v-for="(pane, idx) in panes" :key="idx">
       <div
-        v-for="(pane, idx) in panes"
-        :key="idx"
         class="pane"
         :class="{ on: idx === active }"
         @click="paneClick(idx)"
@@ -1296,6 +1287,39 @@ onBeforeUnmount(() => {
           <span class="tasktext">{{ taskLabel(t) }} · {{ t.state === 'running' ? Math.floor(taskPct(t)) + '%' : taskStateText(t) }}</span>
         </div>
       </div>
+      <!-- 竖排按钮列（原顶部驱动器条）：只插在两栏之间；盘符卷标收进 tooltip，
+           上半截是主目录/盘符，下半截是刷新/隐藏档/扩展，扩展菜单向左侧弹出。 -->
+      <div v-if="idx === 0" class="midbar">
+        <button class="dbtn home" title="主目录" @click="goHome()">🏠 主目录</button>
+        <button
+          v-for="d in drives"
+          :key="d.root"
+          class="dbtn"
+          :class="{ off: !d.ready }"
+          :title="`${d.root}${d.label ? ' (' + d.label + ')' : ''}`"
+          @click="onDrive(d)"
+        >{{ driveLetter(d) }}<span v-if="d.label" class="dlabel"> {{ d.label }}</span></button>
+        <span class="spacer"></span>
+        <button class="dbtn" title="刷新盘符" @click="refreshDrives()">⟳ 盘符</button>
+        <button class="dbtn" :class="{ on: panes[active].showHidden }" title="显示/隐藏隐藏文件" @click="toggleHidden()">隐藏档</button>
+        <div class="menu-wrap">
+          <button class="dbtn" :class="{ on: menuOpen }" @click="menuOpen = !menuOpen; menuOpen && loadPlugins()">扩展 ▾</button>
+          <div v-if="menuOpen" class="menu">
+            <div v-if="!plugins.length" class="menu-empty">（未装 Python 或未放插件；插件目录 {{ pluginsDir || '程序目录\\plugins' }}）</div>
+            <template v-for="t in plugins" :key="t.id">
+              <div class="menu-group">{{ t.title }}</div>
+              <button
+                v-for="a in (t.actions || [])"
+                :key="t.id + ':' + a.id"
+                class="menu-item"
+                @click="runAction(t, a)"
+              >{{ a.title }}</button>
+              <div v-if="!(t.actions && t.actions.length)" class="menu-hint">（Ctrl+Q 预览其认领的格式）</div>
+            </template>
+          </div>
+        </div>
+      </div>
+      </template>
     </div>
 
     <div class="foot">
@@ -1346,8 +1370,8 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <div class="dlg-btns">
-          <button :class="{ danger: confirmOp.conflicts.length > 0 }" @click="commitOp()">{{ confirmOp.conflicts.length ? (confirmOp.kind === 'copy' ? '覆盖并复制' : '覆盖并移动') : (confirmOp.kind === 'copy' ? '复制' : '移动') }}</button>
-          <button @click="closeOp()">取消</button>
+          <button ref="opOkBtn" :class="{ danger: confirmOp.conflicts.length > 0 }" @click="commitOp()">{{ confirmOp.conflicts.length ? (confirmOp.kind === 'copy' ? '覆盖并复制' : '覆盖并移动') : (confirmOp.kind === 'copy' ? '复制' : '移动') }}</button>
+          <button ref="opCancelBtn" @click="closeOp()">取消</button>
         </div>
       </div>
     </div>
@@ -1383,7 +1407,11 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .fm { display: flex; flex-direction: column; height: 100%; color: #d5d9e0; font: 13px/1.4 "Segoe UI", "Microsoft YaHei", monospace; outline: none; background: #181a1e; }
-.drives { display: flex; align-items: center; gap: 4px; padding: 6px 8px; background: #202329; border-bottom: 1px solid #2c3038; flex-wrap: wrap; }
+/* 中缝竖排按钮列（原顶部驱动器条）：上段主目录/盘符， spacer 把工具钮推到底部 */
+.midbar { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch; gap: 4px; width: 58px; padding: 2px 0; }
+.midbar .dbtn { padding: 4px 2px; font-size: 11px; text-align: center; white-space: nowrap; overflow: hidden; }
+.midbar .dlabel { display: none; } /* 卷标太长，收进 title tooltip */
+.midbar .menu { right: calc(100% + 6px); left: auto; top: auto; bottom: 0; } /* 向左侧栏上方弹出，不越窗底 */
 .dbtn { background: #2b2f37; color: #c6ccd6; border: 1px solid #3d424b; border-radius: 4px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
 .dbtn:hover { background: #3a3f49; }
 .dbtn.on { border-color: #6ea8fe; color: #fff; }
@@ -1398,10 +1426,11 @@ onBeforeUnmount(() => {
 .menu-item:hover { background: #343943; }
 .menu-group { color: #8b93a1; font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 6px 6px 2px; text-transform: uppercase; }
 .menu-hint { color: #6b7280; font-size: 11px; padding: 2px 6px 4px; }
-.panes { flex: 1; display: flex; min-height: 0; }
-.pane { flex: 1; display: flex; flex-direction: column; min-width: 0; border: 2px solid transparent; position: relative; }
-.pane.on { border-color: #2f5aa0; }
-.pane:not(.on) { border-color: #7a4a1e; }
+.panes { flex: 1; display: flex; min-height: 0; gap: 6px; padding: 6px; }
+/* 圆角卡片：两栏各带淡底 + 6px 圆角，活动栏顶部 1px 细指示线 + 底色略亮一档；
+   透明顶边占位保证两栏内容垂直对齐不跳；overflow 裁掉子层直角。 */
+.pane { flex: 1; display: flex; flex-direction: column; min-width: 0; border-top: 1px solid transparent; border-radius: 6px; overflow: hidden; background: #1b1e23; position: relative; }
+.pane.on { border-top-color: #6ea8fe; background: #1e2228; }
 .pathbar { padding: 3px 8px; background: #1b1d22; color: #9aa1ad; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-bottom: 1px solid #2c3038; }
 .path-edit { width: 100%; box-sizing: border-box; color: #e6e9ef; background: #10233b; border-bottom: 1px solid #6ea8fe; outline: none; font: 12px/1.4 "Segoe UI", "Microsoft YaHei", monospace; cursor: text; }
 .path-edit::placeholder { color: #5f6b80; }
@@ -1446,6 +1475,7 @@ onBeforeUnmount(() => {
 .dlg-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .dlg-btns button { background: #2b2f37; color: #c6ccd6; border: 1px solid #3d424b; border-radius: 6px; padding: 5px 14px; cursor: pointer; }
 .dlg-btns button:hover { background: #3a3f49; }
+.dlg-btns button:focus-visible { outline: none; border-color: #6ea8fe; box-shadow: 0 0 0 1px #6ea8fe; }
 .dlg-btns button.danger { background: #5a2b2b; border-color: #7a3a3a; color: #f0d0d0; }
 .preview-layer { position: absolute; inset: 0; z-index: 25; display: flex; flex-direction: column; background: #12161f; }
 .pv-head { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; background: #1b2130; border-bottom: 1px solid #2c3038; font-size: 12px; }

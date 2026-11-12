@@ -529,6 +529,15 @@ func (s *AppService) SetDialogGuard(on bool) {
 	s.dialogGuard.Store(on)
 }
 
+// Version 供设置「关于」页显示：读 exe 自己的版本资源（info.json 经 syso 编入），
+// 不另存常量，避免与构建版本串漂移；裸 go build 没有资源时回落开发版标识。
+func (s *AppService) Version() string {
+	if v, err := exeFileVersion(); err == nil && v != "" {
+		return v
+	}
+	return "dev"
+}
+
 // PickKeyFile 弹原生选文件框挑 SSH 私钥，起始目录给 ~/.ssh（多数人的钥匙都在那儿）。
 // 取消返空串而不是错误；guard 在后端自己兜住，免得前端前后各调一次还忘了后一半。
 func (s *AppService) PickKeyFile() (string, error) {

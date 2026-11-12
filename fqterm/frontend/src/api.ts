@@ -197,6 +197,8 @@ export const ToggleWindowMode = (): Promise<WindowModeState> => Call.ByName(`${a
 export const SetWindowMode = (mode: string): Promise<void> => Call.ByName(`${appsvc}.SetMode`, mode)
 export const GetAutostart = (): Promise<boolean> => Call.ByName(`${appsvc}.GetAutostart`)
 export const SetAutostart = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetAutostart`, on)
+// 应用版本号：后端读 exe 版本资源（与构建版本串同源），裸 go build 回落 "dev"
+export const AppVersion = (): Promise<string> => Call.ByName(`${appsvc}.Version`)
 
 // ---- 跨应用热键（系统级） ----
 

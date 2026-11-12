@@ -36,6 +36,7 @@ const tabs = [
   { id: 'launcher', label: '启动器' },
   { id: 'terminal', label: '终端' },
   { id: 'general', label: '通用' },
+  { id: 'about', label: '关于' },
 ] as const
 type TabId = (typeof tabs)[number]['id']
 const tab = ref<TabId>('terminal')
@@ -80,6 +81,9 @@ const autostartNote = ref('')
 
 // 系统可用字体列表
 const fonts = ref<string[]>([])
+
+// 关于页版本号：后端读 exe 版本资源，与构建版本串同源；读不到先占位。
+const appVersion = ref('…')
 
 // 更新进度事件：这个窗口与主窗口都听 ip:update，互不干扰
 let offIPU: (() => void) | undefined
@@ -150,6 +154,7 @@ onMounted(() => {
   avail.value = { w: window.screen.availWidth, h: window.screen.availHeight }
   api.ListSystemFonts().then((f) => { fonts.value = f || [] }).catch(() => { fonts.value = [] })
   api.GetAutostart().then((v) => { autostart.value = !!v; autostartInit.value = !!v }).catch(() => {})
+  api.AppVersion().then((v) => { appVersion.value = v || 'dev' }).catch(() => { appVersion.value = 'dev' })
   refreshIPStatus()
   offIPU = api.onIPUpdate((d) => {
     if (d.state === 'downloading') {
@@ -312,6 +317,15 @@ function doSave() {
               <div class="hint">切换入口：键序列 <code>M-x M-q</code>（应用内）· 全局热键 <code>Alt+`</code> / <code>Alt+~</code>（跨应用）</div>
             </fieldset>
           </template>
+
+          <!-- ============ 关于 ============ -->
+          <template v-if="tab === 'about'">
+            <div class="about">
+              <div class="about-name">FTRW</div>
+              <div class="about-ver">版本 {{ appVersion }}</div>
+              <div class="hint top">FQTerm 的 Wails 3 重写：Telnet/SSH BBS 终端，带启动器、双栏文件管理器与 ZMODEM 传输。</div>
+            </div>
+          </template>
         </div>
       </div>
       <div class="foot">
@@ -348,6 +362,9 @@ legend { color: #6a7180; font-size: 12px; padding: 0 6px; }
 .hint { color: #6a7180; font-size: 12px; margin-top: 6px; }
 .hint.top { margin-top: 0; margin-bottom: 8px; }
 .hint code { color: #b5bac4; background: #1b1d22; border: 1px solid #3d424b; border-radius: 3px; padding: 0 4px; }
+.about { padding: 8px 4px; }
+.about-name { font-size: 22px; font-weight: 600; color: #e6e9ef; }
+.about-ver { color: #6ab0f3; font-size: 14px; margin: 6px 0 14px; }
 .row2 { display: flex; align-items: center; gap: 6px; }
 button.mini { margin-top: 10px; padding: 4px 12px; font-size: 12px; }
 .row2 input.port { flex: 0 0 84px; width: 84px; }
