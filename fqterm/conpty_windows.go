@@ -160,7 +160,7 @@ func createPseudoConsoleOnThread(inputRead, outputWrite windows.Handle, cols, ro
 
 // newConptyShell 按站点配置起一个本地 shell 并接到伪终端上。
 func newConptyShell(site Site) (protoConn, error) {
-	argv := shellArgv(site)
+	argv := injectShellBuiltins(site, shellArgv(site))
 	cols, rows := initialShellSize(site)
 
 	pk, err := openConpty(cols, rows)

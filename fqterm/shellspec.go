@@ -184,16 +184,22 @@ func joinShellArgs(args []string) string {
 	return strings.Join(args, " ")
 }
 
-// envWithTerm 在继承本进程环境的基础上补 TERM。ConPTY 起的子进程不会自己设，
-// 而 bash/vim/less 都靠它判断能力集。
+// envWithTerm 在继承本进程环境的基础上补 TERM，并把内置命令 shim 目录前置到
+// PATH（ac/am 的兜底通道：注入不进去的 shell 靠它命中 shim）。ConPTY 起的
+// 子进程不会自己设 TERM，而 bash/vim/less 都靠它判断能力集。
 func envWithTerm() []string {
 	env := os.Environ()
+	hasTerm := false
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "TERM=") {
-			return env
+			hasTerm = true
+			break
 		}
 	}
-	return append(append([]string(nil), env...), "TERM=xterm-256color")
+	if !hasTerm {
+		env = append(append([]string(nil), env...), "TERM=xterm-256color")
+	}
+	return prependShimPath(env, builtinShimDir())
 }
 
 // distroName 清理 `wsl -l -q` 输出里的一行：去掉 BOM、空引号、尾随空白。

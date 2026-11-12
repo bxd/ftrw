@@ -32,7 +32,7 @@ func newLocalShell(site Site) (protoConn, error) {
 
 // newPipeShell 按站点配置起 shell，两边接管道。
 func newPipeShell(site Site) (protoConn, error) {
-	argv := shellArgv(site)
+	argv := injectShellBuiltins(site, shellArgv(site))
 	// 老配置里没有 shellArgs，而 POSIX 的 bash/zsh 不带 -i 会把_pipe_ 当脚本读到 EOF 就退，
 	// 给它们补上交互开关。
 	if len(argv) == 1 {

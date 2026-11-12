@@ -45,6 +45,10 @@ func init() {
 }
 
 func main() {
+	// 内置 ac/am 早分流：作为 shell 子进程跑完即退，绝不初始化 GUI/托盘/配置 store。
+	if len(os.Args) > 1 && (os.Args[1] == "ac" || os.Args[1] == "am") {
+		os.Exit(runAdvancedCopyCLI(os.Args[1], os.Args[2:]))
+	}
 	// 日志要在第一个 log 调用之前接好，否则 NewStore 失败那条就直接丢了。
 	logger, logErr := SetupRunLog()
 	defer logger.Close()
@@ -82,6 +86,10 @@ func main() {
 
 	exe, _ := os.Executable()
 	log.Printf("FTRW 启动 pid=%d exe=%s log=%s", os.Getpid(), exe, logger.Path())
+	// 内置 ac/am 的 shim/启动脚本预生成：PATH 兜底不依赖第一个 shell 何时起。
+	if err := writeBuiltinShims(builtinShimDir(), exe); err != nil {
+		log.Printf("内置命令 shim 生成失败（ac/am 兜底失效）: %v", err)
+	}
 
 	app := application.New(application.Options{
 		Name:        "FTRW",
