@@ -18,7 +18,21 @@ type Store struct {
 	Schemes   []ColorScheme `json:"schemes"`
 	Keymap    KeymapConfig  `json:"keymap"`
 	GlobalKey GlobalKeymap  `json:"globalKey"`
+	FMState   FMState       `json:"fmState"`
 	loaded    bool
+}
+
+// FMTabState 一个文件管理器标签的会话快照：两栏路径 + 活动栏。
+type FMTabState struct {
+	Panes  []string `json:"panes"`
+	Active int      `json:"active"`
+}
+
+// FMState 文件管理器会话：开了几个标签、每标签每栏路径。Active 是活动标签在
+// 文件标签里的序号（-1 = 当时活动的不是文件标签），启动只还原文件标签，序号直接可用。
+type FMState struct {
+	Tabs   []FMTabState `json:"tabs"`
+	Active int          `json:"active"`
 }
 
 func NewStore() (*Store, error) {
@@ -145,6 +159,13 @@ func (s *Store) load() error {
 			s.GlobalKey = gk
 		}
 	}
+	// fmstate.json：文件管理器标签会话（标签数/每栏路径/活动栏），前端防抖落盘。
+	if b, err := os.ReadFile(s.file("fmstate.json")); err == nil {
+		var fm FMState
+		if json.Unmarshal(b, &fm) == nil {
+			s.FMState = fm
+		}
+	}
 	s.loaded = true
 	return nil
 }
@@ -240,6 +261,13 @@ func (s *Store) SaveGlobalKey() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.saveJSON("globalkeys.json", s.GlobalKey)
+}
+
+// SaveFMState 落盘文件管理器会话（fmstate.json）。
+func (s *Store) SaveFMState() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveJSON("fmstate.json", s.FMState)
 }
 
 // Dir returns the config directory (used for default zmodem download path).

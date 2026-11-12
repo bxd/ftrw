@@ -479,6 +479,13 @@ func TestProxySocks5AgainstNonSocksServer(t *testing.T) {
 	target := startTarget(t, "X")
 	proxy := startProxy(t, func(c net.Conn) {
 		defer c.Close()
+		// 先读丢客户端握手再回 HTTP 响应：带着未读数据 close 在 Windows 上
+		// 发 RST，客户端读不到 'H' 字节，断言会 flaky。
+		var head [2]byte
+		if _, err := io.ReadFull(c, head[:]); err != nil {
+			return
+		}
+		io.CopyN(io.Discard, c, int64(head[1]))
 		c.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 	})
 	expectFail(t, at(t, ProxySocks5, proxy, "", ""), target, "不是 SOCKS5")

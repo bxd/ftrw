@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as api from './api'
 import { TermTab } from './terminal'
-import { FmTab } from './fmtab'
+import { FmTab, type FmSnapshot } from './fmtab'
 import { Dialogs, Window } from '@wailsio/runtime'
 import SiteDialog from './components/SiteDialog.vue'
 import PrefsDialog from './components/PrefsDialog.vue'
@@ -787,7 +787,7 @@ function activeTerm(): TermTab | null {
 // newFileManagerTab：命令 / 工具栏入口。开一个 FmTab（独立 Vue 根挂在 viewport 里），
 // 复用 newTab 那套铺满容器 + setActive 显隐/聚焦；FmTab 鸭子类型对齐通用标签逻辑，
 // 故 cast 进 insts（见 fmtab.ts 注释）。
-async function newFileManagerTab() {
+async function newFileManagerTab(state?: FmSnapshot) {
   if (!viewport.value) await nextTick()
   const container = document.createElement('div')
   container.className = 'fm-container'
@@ -798,10 +798,38 @@ async function newFileManagerTab() {
   container.style.bottom = '0'
   container.style.display = 'none'
   viewport.value!.appendChild(container)
-  const fm = new FmTab(container)
+  const fm = new FmTab(container, { state, onState: () => scheduleFmSave() })
   insts.push(fm as unknown as TermTab)
   tabs.value.push({ id: '', title: '文件管理器', status: 'ready', kind: 'files' })
   setActive(insts.length - 1)
+  scheduleFmSave()
+}
+
+// collectFmState 按标签顺序收文件标签会话：每栏路径+活动栏，外加活动标签在
+// 文件标签里的序号（-1 = 活动的不是文件标签）。启动只还原文件标签，序号直接可用。
+function collectFmState(): api.FMState {
+  const out: api.FMTabState[] = []
+  let activeFile = -1
+  for (let i = 0; i < insts.length; i++) {
+    if (tabs.value[i]?.kind !== 'files') continue
+    if (i === active.value) activeFile = out.length
+    const snap = (insts[i] as unknown as FmTab).snapshot
+    out.push(snap ? { panes: [...snap.panes], active: snap.active } : { panes: ['', ''], active: 0 })
+  }
+  return { tabs: out, active: activeFile }
+}
+
+// 导航/切栏/开关/重排标签后防抖落盘；beforeunload 再补一刀兜底。
+let fmSaveTimer: number | undefined
+function scheduleFmSave() {
+  if (fmSaveTimer) clearTimeout(fmSaveTimer)
+  fmSaveTimer = window.setTimeout(() => {
+    fmSaveTimer = undefined
+    void api.SetFMState(collectFmState()).catch(() => {})
+  }, 500)
+}
+function onSaveFmBeforeUnload() {
+  void api.SetFMState(collectFmState()).catch(() => {})
 }
 
 /**
@@ -966,6 +994,7 @@ function moveTab(from: number, to: number) {
   else if (from < a) active.value = to < a ? a : a - 1
   else if (from > a) active.value = to <= a ? a + 1 : a
   setActive(active.value)
+  scheduleFmSave()
 }
 
 async function closeTab(i: number) {
@@ -986,6 +1015,7 @@ async function closeTab(i: number) {
   tabs.value.splice(i, 1)
   if (active.value >= insts.length) active.value = insts.length - 1
   if (insts.length) setActive(active.value)
+  scheduleFmSave()
 }
 
 /**
@@ -1211,9 +1241,22 @@ onMounted(async () => {
       nextTick(() => { const t = insts[active.value]; if (t) { t.fitNow(); t.focus() } })
     }
   })
+
+  // 还原文件管理器会话：上次开了几个标签、每标签每栏路径、活动标签。
+  // 终端会话不持久化，启动时只有文件标签，保存的「文件标签里序号」即整体索引。
+  try {
+    const fm = await api.GetFMState()
+    for (const t of (fm?.tabs || []).slice(0, 16)) {
+      const panes = [t?.panes?.[0] || '', t?.panes?.[1] || '']
+      if (!panes[0] && !panes[1]) continue
+      await newFileManagerTab({ panes, active: t.active === 1 ? 1 : 0 })
+    }
+    if (fm && fm.active >= 0 && fm.active < insts.length && tabs.value[fm.active]?.kind === 'files') setActive(fm.active)
+  } catch { /* 会话读不到不影响启动 */ }
+  window.addEventListener('beforeunload', onSaveFmBeforeUnload)
 })
 
-onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP?.(); offReveal?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true) })
+onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP?.(); offReveal?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); if (fmSaveTimer) clearTimeout(fmSaveTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true); window.removeEventListener('beforeunload', onSaveFmBeforeUnload) })
 
 function onWinResize() {
   insts[active.value]?.fitNow()

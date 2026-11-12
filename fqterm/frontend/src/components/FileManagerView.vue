@@ -13,7 +13,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import * as api from '../api'
 import { initials, nameMatches } from '../pinyin'
 
-const props = defineProps<{ initialPath?: string }>()
+const props = defineProps<{ initialPath?: string; initialPanes?: string[]; initialActive?: number }>()
+const emit = defineEmits<{ (e: 'state', s: { panes: string[]; active: number }): void }>()
 
 interface Row {
   name: string
@@ -71,9 +72,19 @@ const other = computed(() => (active.value === 0 ? 1 : 0))
 // 每栏「最后一次请求」代次：同一栏上两个 loadPane 并发时（外部 reveal 抢占挂载初始
 // 加载、连发两次定位），只采纳最后发出的那份结果，旧响应回来就丢弃。
 const loadGen = [0, 0]
+// 每栏当前监听的目录（后端引用计数）；加载成功后随导航换旧挂新。
+const watched = ['', '']
+// 加载在途时收到外部改动事件先挂票，落地后补发——不抢在途代次（避免盖掉 reveal）。
+const pendingRefresh = [false, false]
 // 外部 reveal 请求（启动器 Shift/Alt+Enter）进过本栏即置位：onMounted 的默认加载必须
 // 让位——FileHome+ListDir 比 reveal 的加载多半晚一跳落地，单靠代次会被它「迟到但赢」。
 let revealTaken = false
+
+// 会话快照上报：两栏路径都加载成功后才报（pane.path 只在成功时赋值），
+// App.vue 收后防抖落盘 fmstate.json，下次启动还原标签/双栏。
+watch([() => panes[0].path, () => panes[1].path, active], () => {
+  if (panes[0].path && panes[1].path) emit('state', { panes: [panes[0].path, panes[1].path], active: active.value })
+})
 
 /* ---------- 路径工具 ---------- */
 
@@ -84,6 +95,15 @@ function atRoot(p: string): boolean {
 }
 
 function parentOf(p: string): string {
+  // 虚拟路径（压缩包内）：包根退回压缩包所在的真实目录，包内砍末段、砍空回包根。
+  const vi = p.indexOf('::')
+  if (vi >= 0) {
+    const arc = p.slice(0, vi)
+    const inner = p.slice(vi + 2).replace(/[\\/]+$/, '')
+    if (!inner) return parentOf(arc)
+    const j = Math.max(inner.lastIndexOf('\\'), inner.lastIndexOf('/'))
+    return arc + '::' + (j >= 0 ? inner.slice(0, j) : '')
+  }
   if (atRoot(p)) return p
   const q = p.replace(/[\\/]+$/, '')
   const i = Math.max(q.lastIndexOf('\\'), q.lastIndexOf('/'))
@@ -140,6 +160,7 @@ async function loadPane(idx: number, path: string, keepName = '') {
       .filter((e) => pane.showHidden || !e.hidden)
       .map((e) => ({ name: e.name, path: e.path, size: e.size, mtime: e.mtime, isDir: e.isDir, hidden: e.hidden }))
     pane.path = path
+    syncWatch(idx, path)
     pane.allRows = sortRows(real, pane)
     pane.filter = ''
     applyFilter(pane)
@@ -160,6 +181,10 @@ async function loadPane(idx: number, path: string, keepName = '') {
     if (gen === loadGen[idx]) {
       pane.loading = false
       if (idx === active.value) scrollCursor()
+      if (pendingRefresh[idx]) {
+        pendingRefresh[idx] = false
+        void autoRefresh(idx)
+      }
     }
   }
 }
@@ -189,6 +214,34 @@ function reloadActive() {
   const p = panes[active.value]
   return loadPane(active.value, p.path, p.rows[p.cursor]?.name || '')
 }
+
+// 目录监听：加载成功后登记新目录兴趣、退掉旧目录（后端引用计数，
+// 同目录两栏只监听一份）；虚拟路径（压缩包内）不监听。
+function syncWatch(idx: number, path: string) {
+  const old = watched[idx]
+  if (old === path) return
+  if (old) void api.FileUnwatchDir(old)
+  watched[idx] = path.includes('::') ? '' : path
+  if (watched[idx]) void api.FileWatchDir(watched[idx])
+}
+
+// 外部改动自动刷新：等价 F5，但保留选区（loadPane 本身会清 sel）。
+async function autoRefresh(idx: number) {
+  const pane = panes[idx]
+  const keep = pane.rows[pane.cursor]?.name || ''
+  const oldSel = new Set(pane.sel)
+  await loadPane(idx, pane.path, keep)
+  if (oldSel.size) pane.sel = new Set(pane.rows.filter((r) => !r.special && oldSel.has(r.path)).map((r) => r.path))
+}
+
+function onDirChanged(path: string) {
+  for (let i = 0; i < 2; i++) {
+    if (panes[i].path !== path) continue
+    if (panes[i].loading) pendingRefresh[i] = true
+    else void autoRefresh(i)
+  }
+}
+let offDirChanged: (() => void) | null = null
 
 function resort(pane: Pane) {
   const keep = pane.rows[pane.cursor]?.name || ''
@@ -222,6 +275,10 @@ function paneClick(idx: number) {
 }
 
 function rowClick(idx: number, ri: number, e?: MouseEvent) {
+  if (swallowClick) {
+    swallowClick = false
+    return // 拖拽收尾的 click 不扰选区
+  }
   const pane = panes[idx]
   if (e?.ctrlKey || e?.metaKey) {
     // Ctrl/⌘ + 左键：不连续多选，把这一项加入/移出选区，不影响其它已选项。
@@ -243,6 +300,58 @@ function rowClick(idx: number, ri: number, e?: MouseEvent) {
     pane.anchor = ri
   }
   if (idx !== active.value) switchPaneTo(idx)
+}
+
+/* ---------- 出站拖拽（行拖给 Explorer 等外部应用） ---------- */
+// 左键按住行 + 移动超阈 → 交后端 OLE DoDragDrop（CF_HDROP）。
+// 拖拽期间 OLE 接管鼠标；结束后吞一次 click，避免扰选区。
+let dragCand: { idx: number; ri: number; x: number; y: number } | null = null
+let dragBusy = false
+let swallowClick = false
+
+function rowMouseDown(idx: number, ri: number, e: MouseEvent) {
+  if (e.button !== 0 || e.ctrlKey || e.shiftKey || e.metaKey) return
+  const r = panes[idx].rows[ri]
+  if (!r || r.special) return
+  dragCand = { idx, ri, x: e.clientX, y: e.clientY }
+}
+
+function onWinMouseMove(e: MouseEvent) {
+  if (!dragCand || dragBusy) return
+  if (Math.abs(e.clientX - dragCand.x) < 6 && Math.abs(e.clientY - dragCand.y) < 6) return
+  const { idx, ri } = dragCand
+  dragCand = null
+  const pane = panes[idx]
+  const r = pane.rows[ri]
+  if (!r || r.special) return
+  let paths: string[]
+  if (pane.sel.has(r.path) && pane.sel.size > 0) {
+    // 拖已选中的行 → 拖整个选区；否则只拖这行并选中它。
+    paths = pane.rows.filter((x) => !x.special && pane.sel.has(x.path)).map((x) => x.path)
+  } else {
+    paths = [r.path]
+    pane.sel = new Set([r.path])
+    pane.cursor = ri
+    pane.anchor = ri
+  }
+  if (idx !== active.value) switchPaneTo(idx)
+  dragBusy = true
+  swallowClick = true
+  void api
+    .FileDragPaths(paths)
+    .catch((err) => {
+      status.value = String(err?.message || err)
+    })
+    .finally(() => {
+      dragBusy = false
+      setTimeout(() => {
+        swallowClick = false
+      }, 0)
+    })
+}
+
+function onWinMouseUp() {
+  dragCand = null
 }
 
 // 隐藏档切换：连带动作放进脚本，模板里只留一个调用。
@@ -328,6 +437,11 @@ function activate(row: Row | null) {
   if (row.special === 'up') { void loadPane(active.value, row.path, ''); return }
   if (row.special === 'dot') { void reloadActive(); return }
   if (row.isDir) { void loadPane(active.value, row.path, ''); return }
+  // 压缩包：Enter 不交系统打开，而是进包根（虚拟路径，后端 ListDir 认 "::"）。
+  if (/\.(zip|7z|rar|tar|tgz|tbz2|tar\.gz|tar\.bz2)$/i.test(row.name)) {
+    void loadPane(active.value, row.path + '::', '')
+    return
+  }
   void api.FileOpenPath(row.path).catch((e) => { status.value = String(e?.message || e) })
 }
 
@@ -449,6 +563,10 @@ function splitBase(draft: string): { base: string; frag: string; sep: string } {
     const c = draft[i]
     if (c === '\\' || c === '/') { idx = i; break }
   }
+  // 虚拟路径："::" 后还没有分隔符时，base 收到 "::" 为止（含），
+  // 不跨界落进压缩包所在的真实目录。
+  const vi = draft.indexOf('::')
+  if (vi >= 0 && idx < vi + 2) idx = vi + 1
   const sep = idx >= 0 && draft[idx] === '/' ? '/' : '\\'
   const base = idx >= 0 ? draft.slice(0, idx + 1) : ''
   const frag = idx >= 0 ? draft.slice(idx + 1) : draft
@@ -868,21 +986,42 @@ function onRevealEvent(ev: Event) {
 onMounted(async () => {
   window.addEventListener('ftrw:fm-edit-path', onEditPathEvent)
   window.addEventListener('ftrw:fm-reveal', onRevealEvent)
+  offDirChanged = api.onFileManagerDirChanged(onDirChanged)
+  window.addEventListener('mousemove', onWinMouseMove)
+  window.addEventListener('mouseup', onWinMouseUp)
   refreshDrives()
   void loadPlugins()
   let start = props.initialPath || ''
-  if (!start) start = await api.FileHome().catch(() => '')
+  // 会话还原：initialPanes 带上次两栏路径；缺哪栏用主目录补。
+  const rp = props.initialPanes || []
+  const restored = !!(rp[0] || rp[1])
+  let start1 = ''
+  if (restored) {
+    if (props.initialActive === 1) active.value = 1
+    start = rp[0] || ''
+    start1 = rp[1] || ''
+  }
+  if (!start || (restored && !start1)) {
+    const home = await api.FileHome().catch(() => '')
+    if (!start) start = home
+    if (restored && !start1) start1 = home
+  }
+  if (!restored) start1 = start
   // 取盘期间外部 reveal 已接管本栏：左栏由 reveal 打开目标目录，默认加载不能再拿主目录
   // 盖回去（它落地更晚，单靠 loadGen 代次会被它「迟到但赢」）；右栏补一份主目录，
   // 保持双栏默认观感，与 reveal 不同栏、不冲突。
-  if (revealTaken) { void loadPane(1, start, ''); root.value?.focus(); return }
-  await Promise.all([loadPane(0, start, ''), loadPane(1, start, '')])
+  if (revealTaken) { void loadPane(1, start1, ''); root.value?.focus(); return }
+  await Promise.all([loadPane(0, start, ''), loadPane(1, start1, '')])
   root.value?.focus()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('ftrw:fm-edit-path', onEditPathEvent)
   window.removeEventListener('ftrw:fm-reveal', onRevealEvent)
+  offDirChanged?.()
+  for (const w of watched) if (w) void api.FileUnwatchDir(w)
+  window.removeEventListener('mousemove', onWinMouseMove)
+  window.removeEventListener('mouseup', onWinMouseUp)
 })
 </script>
 
@@ -976,6 +1115,7 @@ onBeforeUnmount(() => {
             :key="row.path + ri"
             class="row"
             :class="{ cur: ri === pane.cursor && idx === active, mark: !row.special && pane.sel.has(row.path), dir: row.isDir, special: row.special }"
+            @mousedown="rowMouseDown(idx, ri, $event)"
             @click="rowClick(idx, ri, $event)"
             @dblclick="activate(row)"
             @contextmenu.prevent="onRowContext(idx, ri, $event)"
@@ -1012,7 +1152,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="foot">
-      <span class="hint">Tab 切栏 · Enter 打开 · F5 复制 / F6 移动 / F7 目录 · Del 回收站 / Shift+Del 永删 · F2 重命名 · F3 预览 · Insert 多选 · Shift+↑↓ / Shift+点击 连续多选 · Ctrl+点击 跳选 · Ctrl+Q 预览/退出 · 敲字母过滤（支持拼音）· 双击地址栏 / Alt+X d 改路径</span>
+      <span class="hint">Tab 切栏 · Enter 打开 · F5 复制 / F6 移动 / F7 目录 · Del 回收站 / Shift+Del 永删 · F2 重命名 · F3 预览 · Insert 多选 · Shift+↑↓ / Shift+点击 连续多选 · Ctrl+点击 跳选 · Ctrl+Q 预览/退出 · 敲字母过滤（支持拼音）· 双击地址栏 / Alt+X d 改路径 · 行拖拽到外部应用</span>
       <span v-if="status" class="status">{{ status }}</span>
     </div>
 
@@ -1095,7 +1235,7 @@ onBeforeUnmount(() => {
 .thead span { padding: 3px 6px; cursor: pointer; }
 .thead span.sorted { color: #6ea8fe; }
 .rows { flex: 1; overflow-y: auto; }
-.row { display: flex; padding: 1px 0; cursor: default; white-space: nowrap; }
+.row { display: flex; padding: 1px 0; cursor: default; white-space: nowrap; user-select: none; }
 .row .c-name, .thead .c-name { flex: 1 1 45%; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 1px 6px; }
 .row .c-type, .thead .c-type { flex: 0 0 12%; padding: 1px 6px; color: #8a919e; }
 .row .c-size, .thead .c-size { flex: 0 0 16%; text-align: right; padding: 1px 6px; color: #b5bac4; }

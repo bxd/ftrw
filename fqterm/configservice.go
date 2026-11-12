@@ -146,6 +146,24 @@ func (cs *ConfigService) TestProxy(pc ProxyConfig) (string, error) {
 	return proxyTest(pc)
 }
 
+// GetFMState 回文件管理器会话快照（标签数/每栏路径/活动栏），启动还原用。
+func (cs *ConfigService) GetFMState() FMState {
+	cs.store.mu.RLock()
+	defer cs.store.mu.RUnlock()
+	return cs.store.FMState
+}
+
+// SetFMState 落盘文件管理器会话。前端在导航/切栏/开关标签后防抖调用。
+func (cs *ConfigService) SetFMState(st FMState) error {
+	if st.Active < -1 {
+		st.Active = -1
+	}
+	cs.store.mu.Lock()
+	cs.store.FMState = st
+	cs.store.mu.Unlock()
+	return cs.store.SaveFMState()
+}
+
 // normalizePreferences 守住 quake 宽/高的合法区间：前端传回的是整个 Preferences 对象，
 // 旧版本页面或缺失字段（上一轮还没有 quakeWidthPct）会把它们带成 0，直接生效会把
 // 窗口压成看不见的 0 尺寸条。

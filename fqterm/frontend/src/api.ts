@@ -155,6 +155,11 @@ export const DeleteSite = (index: number): Promise<void> => Call.ByName(`${cfg}.
 export const DefaultSite = (): Promise<Site> => Call.ByName(`${cfg}.DefaultSite`)
 export const GetPreferences = (): Promise<Preferences> => Call.ByName(`${cfg}.GetPreferences`)
 export const SetPreferences = (p: Preferences): Promise<void> => Call.ByName(`${cfg}.SetPreferences`, p)
+// 文件管理器会话（fmstate.json）：标签数/每栏路径/活动栏，启动还原。
+export interface FMTabState { panes: string[]; active: number }
+export interface FMState { tabs: FMTabState[]; active: number }
+export const GetFMState = (): Promise<FMState> => Call.ByName(`${cfg}.GetFMState`)
+export const SetFMState = (st: FMState): Promise<void> => Call.ByName(`${cfg}.SetFMState`, st)
 // TestProxy 经该代理建一条到 GitHub API 的隧道（只握手不下载），返一句成功文案，
 // 失败时 reject 的原因里写清了卡在代理本身还是卡在建隧。
 export const TestProxy = (c: ProxyConfig): Promise<string> => Call.ByName(`${cfg}.TestProxy`, c)
@@ -345,6 +350,10 @@ export interface FileManagerReveal {
 export const onFileManagerReveal = (cb: (d: FileManagerReveal) => void) =>
   Events.On('fm:reveal', (e: any) => cb(e.data))
 
+// 目录外部改动（explorer 复制/删除等）后端 watch防抖后推；文件管理器据此自动刷新对应栏。
+export const onFileManagerDirChanged = (cb: (path: string) => void) =>
+  Events.On('fm:dir-changed', (e: any) => cb(String(e.data)))
+
 // ---- 文件管理器（launcher 分支：主窗口 M-x e 开的 Total Commander 式标签）----
 
 // 一条目录项。后端 ListDir 逐条直出，不排序、不跳过隐藏（hidden 供前端过滤）。
@@ -428,12 +437,15 @@ export interface ShellMenuResult {
 export const FileHome = (): Promise<string> => Call.ByName(`${fil}.HomeDir`)
 export const FileDrives = (): Promise<DriveInfo[]> => Call.ByName(`${fil}.ListDrives`)
 export const FileListDir = (path: string): Promise<FileEntry[]> => Call.ByName(`${fil}.ListDir`, path)
+export const FileWatchDir = (path: string): Promise<void> => Call.ByName(`${fil}.WatchDir`, path)
+export const FileUnwatchDir = (path: string): Promise<void> => Call.ByName(`${fil}.UnwatchDir`, path)
 export const FileStat = (path: string): Promise<FileEntry> => Call.ByName(`${fil}.FileStat`, path)
 export const FileMkdir = (path: string): Promise<void> => Call.ByName(`${fil}.MakeDir`, path)
 export const FileRename = (oldPath: string, newPath: string): Promise<void> =>
   Call.ByName(`${fil}.Rename`, oldPath, newPath)
 export const FileCopy = (src: string[], dstDir: string): Promise<void> => Call.ByName(`${fil}.Copy`, src, dstDir)
 export const FileMove = (src: string[], dstDir: string): Promise<void> => Call.ByName(`${fil}.Move`, src, dstDir)
+export const FileDragPaths = (paths: string[]): Promise<void> => Call.ByName(`${fil}.DragPaths`, paths)
 export const FileDelete = (paths: string[]): Promise<void> => Call.ByName(`${fil}.Delete`, paths)
 // 删除到回收站（Del）；Shift+Del / F8 走上面的 FileDelete 永久删除。
 export const FileRecycle = (paths: string[]): Promise<void> => Call.ByName(`${fil}.Recycle`, paths)

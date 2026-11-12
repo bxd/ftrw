@@ -1,6 +1,9 @@
 import { createApp, type App } from 'vue'
 import FileManagerView from './components/FileManagerView.vue'
 
+// FmSnapshot 双栏会话快照：两栏路径 + 活动栏，与后端 FMTabState 同形。
+export interface FmSnapshot { panes: string[]; active: number }
+
 // FmTab 是主窗口里的「文件管理器」标签实例（launcher 分支，M-x e 呼出）。
 //
 // 它刻意鸭子类型地对齐 TermTab 里被 App.vue 通用标签逻辑摸到的那一小撮成员
@@ -18,11 +21,22 @@ export class FmTab {
   status = 'ready'
   id = '' // 没有终端会话：空串让通用 closeTab / 发帖 target 一路自然跳过
 
+  // 最近一次双栏快照（路径+活动栏），App.vue 收集落盘用；加载成功前为 null。
+  snapshot: FmSnapshot | null = null
+
   private app: App
 
-  constructor(container: HTMLElement, initialPath?: string) {
+  constructor(container: HTMLElement, opts: { initialPath?: string; state?: FmSnapshot; onState?: (s: FmSnapshot) => void } = {}) {
     this.container = container
-    this.app = createApp(FileManagerView, { initialPath: initialPath || '' })
+    this.app = createApp(FileManagerView, {
+      initialPath: opts.initialPath || '',
+      initialPanes: opts.state?.panes,
+      initialActive: opts.state?.active,
+      onState: (s: FmSnapshot) => {
+        this.snapshot = s
+        opts.onState?.(s)
+      },
+    })
     this.app.mount(container)
   }
 

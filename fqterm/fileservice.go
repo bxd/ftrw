@@ -24,6 +24,8 @@ type FileService struct {
 	// hwndProvider 由 main 在建好主窗后注入（见 shellmenu.go 的 Bind），供原生右键菜单
 	// 取主窗 HWND 作为 InvokeCommand 的父窗；非 Windows 或注入前为 nil。
 	hwndProvider func() uintptr
+	// dw 监听两栏当前目录的外部改动（filewatch.go）；Bind 时创建，失败为 nil 降级。
+	dw *dirWatcher
 }
 
 func NewFileService() *FileService {
@@ -32,6 +34,8 @@ func NewFileService() *FileService {
 		// crypto/rand 正常不会失败；真失败了给个定长兜底，签名照样自洽（只是弱）。
 		copy(secret, []byte("ftrw-fallback-session-secret-please"))
 	}
+	// 上一轮解出预览/打开的临时文件顺手清掉，不让 ftrw-arc-* 在系统 TEMP 里越积越多。
+	cleanArcTemp()
 	return &FileService{sessionSecret: secret, py: newPyRuntime()}
 }
 
@@ -59,6 +63,9 @@ func normalizeDir(path string) string {
 // 单条 stat 失败只是少一项、不影响整目录。"." 与 ".." 由前端导航行合成，这里只出真实条目。
 func (s *FileService) ListDir(path string) ([]FileEntry, error) {
 	dir := normalizeDir(path)
+	if arc, inner, ok := splitVirtualPath(dir); ok {
+		return listVirtualDir(arc, inner)
+	}
 	raw, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("读取目录失败（%s）：%v", dir, err)
@@ -84,6 +91,9 @@ func (s *FileService) ListDir(path string) ([]FileEntry, error) {
 
 // FileStat 取单个条目的信息（前端刷新某一行 / Enter 前进目录前判类型用）。
 func (s *FileService) FileStat(path string) (FileEntry, error) {
+	if arc, inner, ok := splitVirtualPath(path); ok {
+		return statVirtual(arc, inner)
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		return FileEntry{}, fmt.Errorf("无法获取信息（%s）：%v", path, err)
@@ -101,6 +111,9 @@ func (s *FileService) FileStat(path string) (FileEntry, error) {
 
 // MakeDir 新建目录（F7）。父级必须已存在，否则 os.Mkdir 直接报错回传，不悄悄 MkdirAll。
 func (s *FileService) MakeDir(path string) error {
+	if err := rejectVirtual(path); err != nil {
+		return err
+	}
 	if err := os.Mkdir(path, 0o755); err != nil {
 		return fmt.Errorf("新建目录失败（%s）：%v", path, err)
 	}
@@ -109,6 +122,9 @@ func (s *FileService) MakeDir(path string) error {
 
 // Rename 重命名或同卷移动（F2）。newPath 是带新名的全路径。
 func (s *FileService) Rename(oldPath, newPath string) error {
+	if err := rejectVirtual(oldPath, newPath); err != nil {
+		return err
+	}
 	if err := os.Rename(oldPath, newPath); err != nil {
 		return fmt.Errorf("重命名失败（%s → %s）：%v", oldPath, filepath.Base(newPath), err)
 	}
@@ -117,6 +133,9 @@ func (s *FileService) Rename(oldPath, newPath string) error {
 
 // Delete 永久删除（Shift+Del / F8，不走回收站）。逐个 RemoveAll，任一失败即中断并把已删的留在原地。
 func (s *FileService) Delete(paths []string) error {
+	if err := rejectVirtual(paths...); err != nil {
+		return err
+	}
 	for _, p := range paths {
 		if err := os.RemoveAll(p); err != nil {
 			return fmt.Errorf("删除失败（%s）：%v", p, err)
@@ -128,6 +147,9 @@ func (s *FileService) Delete(paths []string) error {
 // Recycle 删除到回收站（Del）。平台实现在 fileservice_*_.go：Windows 走 shell 的
 // FOF_ALLOWUNDO，非 Windows 平台无标准回收站，退化为永久删除。逐个处理，失败即中断。
 func (s *FileService) Recycle(paths []string) error {
+	if err := rejectVirtual(paths...); err != nil {
+		return err
+	}
 	for _, p := range paths {
 		if err := recyclePath(p); err != nil {
 			return fmt.Errorf("移入回收站失败（%s）：%v", p, err)
@@ -138,7 +160,16 @@ func (s *FileService) Recycle(paths []string) error {
 
 // Copy 把 src 里每条复制到 dstDir（F5）。目标同名且源就是目标时拒绝，避免自己套自己。
 func (s *FileService) Copy(src []string, dstDir string) error {
+	if isVirtualPath(dstDir) {
+		return fmt.Errorf("不支持写入压缩包（目标在包内）：%s", dstDir)
+	}
 	for _, from := range src {
+		if arc, inner, ok := splitVirtualPath(from); ok {
+			if err := extractTo(arc, inner, dstDir); err != nil {
+				return fmt.Errorf("复制失败（%s）：%v", from, err)
+			}
+			continue
+		}
 		to := filepath.Join(dstDir, filepath.Base(from))
 		if samePath(from, to) {
 			return fmt.Errorf("源与目标为同一处，无法复制：%s", from)
@@ -153,6 +184,12 @@ func (s *FileService) Copy(src []string, dstDir string) error {
 // Move 把 src 里每条移到 dstDir（F6）。先试 os.Rename（同卷瞬时完成），
 // 失败（跨卷 EXDEV 等）退化为复制+删源。
 func (s *FileService) Move(src []string, dstDir string) error {
+	if err := rejectVirtual(dstDir); err != nil {
+		return err
+	}
+	if err := rejectVirtual(src...); err != nil {
+		return err
+	}
 	for _, from := range src {
 		to := filepath.Join(dstDir, filepath.Base(from))
 		if samePath(from, to) {
@@ -173,6 +210,13 @@ func (s *FileService) Move(src []string, dstDir string) error {
 // OpenPath 用系统默认方式打开一条路径（Enter）：直接复用启动器的 ShellExecuteW 通路，
 // 参数、工作目录、关联处理程序全部由 shell 负责，不自己起进程。
 func (s *FileService) OpenPath(path string) error {
+	if arc, inner, ok := splitVirtualPath(path); ok {
+		tmp, err := extractTemp(arc, inner)
+		if err != nil {
+			return fmt.Errorf("无法打开包内条目（%s）：%v", path, err)
+		}
+		return launcherShellExecute(tmp, "")
+	}
 	return launcherShellExecute(path, "")
 }
 
@@ -182,13 +226,24 @@ func (s *FileService) PeekFile(path string, maxBytes int) (string, error) {
 	if maxBytes <= 0 || maxBytes > 1<<20 {
 		maxBytes = 64 << 10
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("打开文件失败（%s）：%v", path, err)
+	var r io.Reader
+	if arc, inner, ok := splitVirtualPath(path); ok {
+		rc, err := openVirtualEntry(arc, inner)
+		if err != nil {
+			return "", fmt.Errorf("打开文件失败（%s）：%v", path, err)
+		}
+		defer rc.Close()
+		r = rc
+	} else {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("打开文件失败（%s）：%v", path, err)
+		}
+		defer f.Close()
+		r = f
 	}
-	defer f.Close()
 	buf := make([]byte, maxBytes)
-	n, _ := io.ReadFull(f, buf) // EOF / ErrUnexpectedEOF 都算读到了开头那截
+	n, _ := io.ReadFull(r, buf) // EOF / ErrUnexpectedEOF 都算读到了开头那截
 	buf = buf[:n]
 	for n > 0 && !utf8.Valid(buf[:n]) {
 		n--
@@ -278,6 +333,14 @@ func previewKindFor(path string) string {
 
 // Preview 校验文件存在并给出渲染元信息 + 签名 URL。未知扩展名不报错，只置 NeedPlugin。
 func (s *FileService) Preview(path string) (PreviewRef, error) {
+	if arc, inner, ok := splitVirtualPath(path); ok {
+		// 包内条目先解到临时文件再走正常预览：扩展名保留，签名 URL 指向临时文件。
+		tmp, err := extractTemp(arc, inner)
+		if err != nil {
+			return PreviewRef{}, fmt.Errorf("无法预览（%s）：%v", path, err)
+		}
+		path = tmp
+	}
 	abs := canonicalPath(path)
 	fi, err := os.Stat(abs)
 	if err != nil {
