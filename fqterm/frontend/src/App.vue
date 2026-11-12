@@ -466,6 +466,15 @@ registerCommand({
   },
 })
 
+// 按序号启动站点：序号是侧栏视觉顺序（grouped() 展开，含本机 shell），小输入框
+// 浮在视口左上角；焦点在输入框里时 isTextEditing 豁免，按键不会被序列框架抢走。
+registerCommand({
+  id: 'site.launch-by-number',
+  title: '站点：按侧栏序号启动（小输入框）',
+  description: '默认序列 M-x b；输数字回车启动侧栏从上往下第 N 个站点（含本机 shell），Esc 取消',
+  handler: () => openSiteNumPrompt(),
+})
+
 /* ---------------- 发帖动作（编辑工具栏背后那套） ---------------- */
 // 动作本体住在 postactions.ts（读鼠标选区 → 变换 → 原地替换），这里只把界面接上：
 // 目标会话、状态区、以及“上次用过哪个分隔符”那份偏好。
@@ -893,6 +902,72 @@ function cycleTab(delta: number) {
   setActive((active.value + delta + n) % n)
 }
 
+// —— 标签拖动排序（HTML5 DnD）——
+// from 是拖源索引；over/after 记录当前悬停的「插入缝」：标签左半=插它前面、
+// 右半=插它后面，容器空白处=落尾。拖拽期间不动数组，drop 才一次性重排。
+const tabDrag = reactive({ from: -1, over: -1, after: false })
+
+function resetTabDrag() { tabDrag.from = -1; tabDrag.over = -1; tabDrag.after = false }
+
+function onTabDragStart(i: number, e: DragEvent) {
+  tabDrag.from = i
+  tabDrag.over = -1
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', String(i)) // 部分引擎不 setData 就不起拖
+  }
+}
+
+function onTabDragOver(i: number, e: DragEvent) {
+  if (tabDrag.from < 0) return
+  e.preventDefault() // 不放行 drop 就不会触发
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  tabDrag.over = i
+  tabDrag.after = e.clientX > r.left + r.width / 2
+}
+
+// 只处理容器自身的空白区（子标签冒泡上来时 target 不是 currentTarget）：落尾。
+function onTabsDragOver(e: DragEvent) {
+  if (tabDrag.from < 0 || e.target !== e.currentTarget) return
+  e.preventDefault()
+  tabDrag.over = tabs.value.length - 1
+  tabDrag.after = true
+}
+
+// drop 只挂容器一份：落在子标签上会冒泡到这里，统一处理。
+function onTabDrop() {
+  const { from, over, after } = tabDrag
+  resetTabDrag()
+  if (from < 0 || over < 0) return
+  let to = over + (after ? 1 : 0)
+  if (from < to) to-- // 先摘掉拖源，插入缝随之左移一格
+  moveTab(from, to)
+}
+
+function tabDropClass(i: number) {
+  if (tabDrag.from < 0 || tabDrag.over !== i) return ''
+  return tabDrag.after ? 'drop-after' : 'drop-before'
+}
+
+/**
+ * 把标签从 from 挪到 to（最终索引）：insts 与 tabs 同步 splice，active 按位置
+ * 重映射，再 setActive 重刷容器显隐 —— 容器按索引叠放，重排后必须重刷一次。
+ * byId 按会话 id 查、idxOf 即时求值，都与索引无关，重排不影响。
+ */
+function moveTab(from: number, to: number) {
+  if (from === to || from < 0 || to < 0 || from >= insts.length || to >= insts.length) return
+  const [inst] = insts.splice(from, 1)
+  insts.splice(to, 0, inst)
+  const [meta] = tabs.value.splice(from, 1)
+  tabs.value.splice(to, 0, meta)
+  const a = active.value
+  if (a === from) active.value = to
+  else if (from < a) active.value = to < a ? a : a - 1
+  else if (from > a) active.value = to <= a ? a + 1 : a
+  setActive(active.value)
+}
+
 async function closeTab(i: number) {
   const t = insts[i]
   if (!t) return
@@ -1015,6 +1090,49 @@ function grouped(): { name: string; items: { site: api.Site; index: number }[] }
     map.get(g)!.push({ site, index })
   })
   return [...map.entries()].map(([name, items]) => ({ name, items }))
+}
+
+// —— M-x b：按侧栏序号启动站点 ——
+// 序号按侧栏视觉顺序（grouped() 展开序）数，不是 sites 数组原始序：分组交错时
+// 两者不同，用户数的是他看到的。本机 shell 也在列表里，自然计入。
+const numPrompt = reactive({ show: false, value: '' })
+const numPromptEl = ref<HTMLInputElement | null>(null)
+const orderedSiteList = computed(() => grouped().flatMap((g) => g.items))
+
+const numPromptTarget = computed(() => {
+  const n = Number(numPrompt.value.trim())
+  if (!Number.isInteger(n) || n < 1) return null
+  return orderedSiteList.value[n - 1]?.site ?? null
+})
+
+const numPromptHint = computed(() => {
+  if (!numPrompt.value.trim()) return '回车启动 · Esc 取消'
+  const t = numPromptTarget.value
+  return t ? `→ ${siteLabel(t)}` : '无此序号的站点'
+})
+
+function openSiteNumPrompt() {
+  numPrompt.value = ''
+  numPrompt.show = true
+  nextTick(() => { numPromptEl.value?.focus(); numPromptEl.value?.select() })
+}
+
+function closeSiteNumPrompt() {
+  numPrompt.show = false
+  // 焦点还给原活动标签，免得 Esc 之后按键落在 body 上没了响应
+  const t = active.value >= 0 ? insts[active.value] : null
+  if (t) t.focus()
+}
+
+function submitSiteNum() {
+  const site = numPromptTarget.value
+  if (!site) {
+    showEcho(`请输入 1-${orderedSiteList.value.length} 的整数（侧栏从上往下，含本机 shell）`, 'warn')
+    numPromptEl.value?.select()
+    return
+  }
+  numPrompt.show = false
+  void newTab(site) // newTab 内部 setActive 会聚焦新标签，不用这里还焦点
 }
 
 // 工具栏不再放「上传」按钮：BBS 的上传由对端跑 sz 触发，收到 ZRQINIT 后
@@ -1151,8 +1269,8 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       <button @click="openQuickConnect" title="新建连接">＋ 连接</button>
       <button @click="closeTab(active)" :disabled="active < 0" title="关闭当前标签">✕ 断开</button>
       <!-- 标签页跟工具栏共用一行：多一个会话就少不了一行高，窄屏下标签区自己滚动 -->
-      <div class="tabs" v-if="tabs.length">
-        <div v-for="(t, i) in tabs" :key="i" class="tab" :class="{ on: i === active }" @click="setActive(i)">
+      <div class="tabs" v-if="tabs.length" @dragover="onTabsDragOver" @drop.prevent="onTabDrop">
+        <div v-for="(t, i) in tabs" :key="i" class="tab" draggable="true" :class="[{ on: i === active, dragging: tabDrag.from === i }, tabDropClass(i)]" @click="setActive(i)" @dragstart="onTabDragStart(i, $event)" @dragover="onTabDragOver(i, $event)" @dragend="resetTabDrag">
           <span class="tdot" :class="t.status"></span>
           <span class="ttitle" :title="t.title">{{ t.title }}</span>
           <span class="tclose" @click.stop="closeTab(i)">✕</span>
@@ -1226,6 +1344,13 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
           <p>Telnet / SSH / BBS 终端</p>
           <div class="hint">点击「＋ 连接」新建会话；把鼠标移到窗口左缘、或按 Alt+X P 唤出站点栏（失焦自动收起）</div>
           <div class="hint">连上之后把鼠标移到终端顶缘会滑出「编辑工具栏」：先用鼠标框住编辑区里要处理的文字，再一键插分隔符或转竖排（Alt+X 后按 S / V）</div>
+        </div>
+        <!-- M-x b：按序号启动站点的小输入框，浮在视口上不参与布局 -->
+        <div v-if="numPrompt.show" class="numprompt">
+          <label>站点序号（1-{{ orderedSiteList.length }}，从上往下）</label>
+          <input ref="numPromptEl" v-model="numPrompt.value" type="text" inputmode="numeric" autocomplete="off"
+                 @keydown.enter="submitSiteNum" @keydown.esc="closeSiteNumPrompt" @blur="closeSiteNumPrompt">
+          <span class="hint">{{ numPromptHint }}</span>
         </div>
       </div>
     </div>
@@ -1312,11 +1437,21 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 .mini:hover { color: #fff !important; }
 .empty { padding: 20px; text-align: center; color: #555a64; font-size: 12px; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+/* M-x b 序号提示框：浮在视口左上角；z-index 压过侧栏(20)/全屏工具条(30)，低于对话框遮罩(50/60) */
+.numprompt { position: absolute; top: 8px; left: 10px; z-index: 40; display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; background: #24272e; border: 1px solid #4a6b96; border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, .5); }
+.numprompt label { font-size: 12px; color: #8a919e; }
+.numprompt input { width: 150px; background: #1b1d22; color: #fff; border: 1px solid #3d424b; border-radius: 4px; padding: 4px 8px; font-size: 14px; outline: none; }
+.numprompt input:focus { border-color: #6ab0f3; }
+.numprompt .hint { font-size: 12px; color: #6ab0f3; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 标签 chips 内联在工具栏行里：只占自己需要的宽度，不够就横向滚动 */
 .tabs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
-.tab { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; max-width: 180px; padding: 3px 8px; font-size: 13px; cursor: pointer; background: #2f333b; color: #b5bac4; border: 1px solid #3d424b; border-radius: 5px; }
+.tab { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; max-width: 180px; padding: 3px 8px; font-size: 13px; cursor: pointer; user-select: none; background: #2f333b; color: #b5bac4; border: 1px solid #3d424b; border-radius: 5px; }
 .tab:hover { background: #3a3f49; }
 .tab.on { background: #1b1d22; border-color: #4a6b96; color: #fff; }
+/* 拖动排序：拖源半透明，蓝线标插入缝（左半=插前、右半=插后） */
+.tab.dragging { opacity: .4; }
+.tab.drop-before { box-shadow: inset 2px 0 0 #6ab0f3; }
+.tab.drop-after { box-shadow: inset -2px 0 0 #6ab0f3; }
 .tab .ttitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tdot { width: 8px; height: 8px; border-radius: 50%; background: #d0d0d0; }
 .tdot.connected { background: #57d25a; } .tdot.connecting { background: #e0b341; } .tdot.error { background: #e05c5c; } .tdot.closed { background: #777; }

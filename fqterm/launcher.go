@@ -300,6 +300,12 @@ func (s *LauncherService) rebuildIndex() error {
 	s.mu.Unlock()
 
 	entries, err := scanAppShortcuts(prefs)
+	removed := 0
+	if err == nil {
+		deduped := dedupByTarget(entries)
+		removed = len(entries) - len(deduped)
+		entries = deduped
+	}
 
 	s.mu.Lock()
 	s.indexing = false
@@ -312,8 +318,29 @@ func (s *LauncherService) rebuildIndex() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("启动器索引完成：%d 个快捷方式", n)
+	log.Printf("启动器索引完成：%d 个快捷方式（同目标合并 %d 条）", n, removed)
 	return nil
+}
+
+// dedupByTarget 把指向同一目标的条目收敛成一条（大小写不敏感）：同一应用常在
+// 开始菜单与桌面各躺一份 .lnk，指定目录扫描也可能撞上同一个 exe。只留先扫到的
+// 那条（扫描顺序：用户开始菜单 → 全体开始菜单 → 桌面 → 公用桌面 → 指定目录）。
+// Target 为空的（.lnk 解析失败 / UWP）不参与判重：没有可比的目标，宁可多列不误并。
+// 注意与「同名不同目标」是两回事：那种故意保留两条让用户自己选（见索引处注释）。
+func dedupByTarget(entries []LauncherEntry) []LauncherEntry {
+	seen := make(map[string]bool, len(entries))
+	out := make([]LauncherEntry, 0, len(entries))
+	for _, e := range entries {
+		t := strings.ToLower(strings.TrimSpace(e.Target))
+		if t != "" {
+			if seen[t] {
+				continue
+			}
+			seen[t] = true
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // LauncherRebuild 供前端或调试手动重建。

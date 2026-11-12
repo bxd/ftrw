@@ -277,6 +277,14 @@ func DefaultKeymap() KeymapConfig {
 			Enabled: true,
 			Note:    "编辑文件管理器当前栏的路径（回车跳转 · Esc 取消）",
 		},
+		// 按序号启动站点（b = BBS）。序号是侧栏从上往下的视觉顺序（含本机 shell），
+		// 前端按分组展开序数；键位与已占用的 p/f/k/s/r/m/l/v/i/t/e/d 都不撞。
+		{
+			Keys:    "M-x b",
+			Command: "site.launch-by-number",
+			Enabled: true,
+			Note:    "弹小输入框，输数字回车启动侧栏从上往下第 N 个站点（含本机 shell；Esc 取消）",
+		},
 	}
 	return KeymapConfig{
 		Enabled:   true,

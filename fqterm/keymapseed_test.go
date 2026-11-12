@@ -215,3 +215,33 @@ func TestDefaultKeymapSeedsEditPath(t *testing.T) {
 		t.Fatalf("Seeded 台账缺 files.edit-path：%v", km.Seeded)
 	}
 }
+
+func TestDefaultKeymapSeedsSiteNumLaunch(t *testing.T) {
+	// 按序号启动站点（M-x b）出厂绑定要开箱即用且进补种台账。
+	// 键位撞车由 TestDefaultKeymapHasNoDuplicateKeys 统一拦。
+	km := DefaultKeymap()
+	var hit *KeyBinding
+	for i := range km.Bindings {
+		if km.Bindings[i].Command == "site.launch-by-number" {
+			hit = &km.Bindings[i]
+		}
+	}
+	if hit == nil {
+		t.Fatal("出厂绑定里没有 site.launch-by-number")
+	}
+	if hit.Keys != "M-x b" {
+		t.Fatalf("按序号启动出厂键为 %q, want %q", hit.Keys, "M-x b")
+	}
+	if !hit.Enabled {
+		t.Fatal("按序号启动出厂绑定默认是停用的")
+	}
+	found := false
+	for _, id := range km.Seeded {
+		if id == "site.launch-by-number" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Seeded 台账缺 site.launch-by-number：%v", km.Seeded)
+	}
+}
