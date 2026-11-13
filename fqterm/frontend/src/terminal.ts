@@ -535,6 +535,30 @@ export class TermTab {
   get termCols(): number { return this.term.cols }
 
   /**
+   * 鼠标框选的原文，供复制热键（term.copy）直接写剪贴板。
+   * 与 readSelection 不同：复制不做任何光标位置推断，选到什么就是什么，
+   * 也不需要会话连着线（断线后翻回滚缓冲里的旧文字照样能复制）。
+   */
+  selectionText(): string { return this.term.getSelection() }
+
+  /**
+   * 粘贴热键（term.paste）：把剪贴板文本送进会话。行尾先归一成 \n，再走
+   * writeLines 同一套出口（逐行补 \r、分段限速）：慢速 PTY 上一次塞几 KB 会吞字。
+   * 与 insertText 共用 inserting 闸，两批字节不会互相穿插；末尾不补回车，
+   * 贴进去的最后一行留在输入区由用户自己决定要不要执行。
+   */
+  async pasteText(text: string): Promise<{ lines: number; chars: number }> {
+    if (!this.id) throw new Error('没有活动会话，贴不进去')
+    if (this.inserting) throw new Error('上一次灌入还没结束，请稍候')
+    this.inserting = true
+    try {
+      return await this.writeLines(text.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+    } finally {
+      this.inserting = false
+    }
+  }
+
+  /**
    * 把文本送进远端的文章编辑器。
    *
    * 走 api.Write，而不是 term.input / term.paste，两个理由：

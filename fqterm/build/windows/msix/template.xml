@@ -17,7 +17,7 @@
         PackageDisplayName="FQTerm"
         PublisherName="CN=FQTerm"
         PublisherDisplayName="FQTerm"
-        Version="0.5.9.0"
+        Version="0.5.10.0"
         PackageDescription="Telnet/SSH BBS Terminal">
         <Capabilities>
             <Capability Name="runFullTrust" />

@@ -3,7 +3,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'v
 import * as api from './api'
 import { TermTab } from './terminal'
 import { FmTab, type FmSnapshot } from './fmtab'
-import { Dialogs, Window } from '@wailsio/runtime'
+import { Clipboard, Dialogs, Window } from '@wailsio/runtime'
 import SiteDialog from './components/SiteDialog.vue'
 import PrefsDialog from './components/PrefsDialog.vue'
 import SchemeDialog from './components/SchemeDialog.vue'
@@ -463,6 +463,52 @@ registerCommand({
   handler: () => {
     if (tabs.value[active.value]?.kind !== 'files') { showEcho('当前标签不是文件管理器（先 M-x e 开一个）', 'info'); return }
     window.dispatchEvent(new CustomEvent('ftrw:fm-edit-path'))
+  },
+})
+
+// 复制高亮行全路径：与 files.edit-path 同一套广播模式，组件自己判可见性。
+registerCommand({
+  id: 'files.copy-path',
+  title: '文件管理器：复制当前栏高亮文件的全路径',
+  description: '默认序列 M-x c；仅当活动标签是文件管理器时生效，把光标高亮行的全路径写进剪贴板',
+  handler: () => {
+    if (tabs.value[active.value]?.kind !== 'files') { showEcho('当前标签不是文件管理器（先 M-x e 开一个）', 'info'); return }
+    window.dispatchEvent(new CustomEvent('ftrw:fm-copy-path'))
+  },
+})
+
+// 终端复制/粘贴：所有终端标签（本机 shell / SSH / Telnet）都生效，activeTerm() 把
+// 文件管理器标签与未连线的标签挡在外面。键位不用 Ctrl+Shift+C/V：序列引擎对字母
+// 做大小写折叠，C-S-c 与 C-c 归一后是同一个键，而 Ctrl+C 是 shell 的中断键不能占；
+// 取经典控制台键 Ctrl+Insert / Shift+Insert（特殊键名不受折叠影响）。
+registerCommand({
+  id: 'term.copy',
+  title: '终端：复制选区到剪贴板',
+  description: '默认 C-<INS>（Ctrl+Insert）；shell / SSH / Telnet 通用，先用鼠标框选文字；断线后也能复制回滚缓冲里的旧文字',
+  handler: () => {
+    const t = activeTerm()
+    if (!t) { showEcho('当前标签不是终端（shell / SSH / Telnet）；文件管理器复制路径用 M-x c', 'info'); return }
+    const sel = t.selectionText()
+    if (!sel) { showEcho('没有选中文字：先用鼠标框选，再按复制', 'info'); return }
+    Clipboard.SetText(sel)
+      .then(() => showEcho(`已复制选区（${Array.from(sel).length} 字符）到剪贴板`, 'info'))
+      .catch((e: any) => showEcho(`写剪贴板失败：${e?.message || e}`, 'error'))
+  },
+})
+
+registerCommand({
+  id: 'term.paste',
+  title: '终端：粘贴剪贴板内容',
+  description: '默认 S-<INS>（Shift+Insert）；shell / SSH / Telnet 通用，逐行限速送入，末尾不自动回车',
+  handler: () => {
+    const t = activeTerm()
+    if (!t || !t.id) { showEcho('当前标签不是连着线的终端，贴不进去', 'info'); return }
+    void Clipboard.Text()
+      .then((text) => {
+        if (!text) { showEcho('剪贴板里没有文字', 'info'); return }
+        return t.pasteText(text).then((r) => showEcho(`已粘贴 ${r.chars} 字符（${r.lines} 行）`, 'info'))
+      })
+      .catch((e: any) => showEcho(`粘贴失败：${e?.message || e}`, 'error'))
   },
 })
 

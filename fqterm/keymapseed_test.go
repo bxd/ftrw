@@ -245,3 +245,66 @@ func TestDefaultKeymapSeedsSiteNumLaunch(t *testing.T) {
 		t.Fatalf("Seeded 台账缺 site.launch-by-number：%v", km.Seeded)
 	}
 }
+
+func TestDefaultKeymapSeedsTermClipboard(t *testing.T) {
+	// 终端复制/粘贴对所有终端标签（shell / SSH / Telnet）生效，出厂绑定要开箱即用
+	// 且进补种台账。键位取 Ctrl+Insert / Shift+Insert：字母大小写折叠会让 C-S-c 与
+	// C-c 归一成同一个键（shell 中断键不能占），特殊键名不受影响；撞键由
+	// TestDefaultKeymapHasNoDuplicateKeys 统一拦。
+	want := map[string]string{"term.copy": "C-<INS>", "term.paste": "S-<INS>"}
+	got := map[string]string{}
+	for _, b := range DefaultKeymap().Bindings {
+		got[b.Command] = b.Keys
+		if b.Command == "term.copy" || b.Command == "term.paste" {
+			if !b.Enabled {
+				t.Fatalf("终端剪贴板出厂绑定 %s 默认是停用的", b.Command)
+			}
+		}
+	}
+	for cmd, keys := range want {
+		if got[cmd] != keys {
+			t.Fatalf("出厂绑定 %s = %q, want %q", cmd, got[cmd], keys)
+		}
+	}
+	for _, id := range []string{"term.copy", "term.paste"} {
+		found := false
+		for _, s := range DefaultKeymap().Seeded {
+			if s == id {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("Seeded 台账缺 %s", id)
+		}
+	}
+}
+
+func TestDefaultKeymapSeedsCopyPath(t *testing.T) {
+	// 文件管理器“复制高亮行全路径”出厂绑定 M-x c（用户指定键位），同样要
+	// 开箱即用且进补种台账；撞键由 TestDefaultKeymapHasNoDuplicateKeys 统一拦。
+	km := DefaultKeymap()
+	var hit *KeyBinding
+	for i := range km.Bindings {
+		if km.Bindings[i].Command == "files.copy-path" {
+			hit = &km.Bindings[i]
+		}
+	}
+	if hit == nil {
+		t.Fatal("出厂绑定里没有 files.copy-path")
+	}
+	if hit.Keys != "M-x c" {
+		t.Fatalf("复制路径出厂键为 %q, want %q", hit.Keys, "M-x c")
+	}
+	if !hit.Enabled {
+		t.Fatal("复制路径出厂绑定默认是停用的")
+	}
+	found := false
+	for _, id := range km.Seeded {
+		if id == "files.copy-path" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Seeded 台账缺 files.copy-path：%v", km.Seeded)
+	}
+}

@@ -277,6 +277,14 @@ func DefaultKeymap() KeymapConfig {
 			Enabled: true,
 			Note:    "编辑文件管理器当前栏的路径（回车跳转 · Esc 取消）",
 		},
+		// 复制当前高亮行的全路径（c = copy）。与编辑路径同一套广播模式，只在有可见
+		// 文件管理器标签时生效；键位与已占用的 p/f/k/s/r/m/l/v/i/t/e/d/b 都不撞。
+		{
+			Keys:    "M-x c",
+			Command: "files.copy-path",
+			Enabled: true,
+			Note:    "复制文件管理器当前栏高亮文件的全路径到剪贴板",
+		},
 		// 按序号启动站点（b = BBS）。序号是侧栏从上往下的视觉顺序（含本机 shell），
 		// 前端按分组展开序数；键位与已占用的 p/f/k/s/r/m/l/v/i/t/e/d 都不撞。
 		{
@@ -284,6 +292,23 @@ func DefaultKeymap() KeymapConfig {
 			Command: "site.launch-by-number",
 			Enabled: true,
 			Note:    "弹小输入框，输数字回车启动侧栏从上往下第 N 个站点（含本机 shell；Esc 取消）",
+		},
+		// 终端复制/粘贴：所有终端标签（本机 shell / SSH / Telnet）都生效，命令自己判
+		// 活动标签是不是连着线的终端。键位不用 Ctrl+Shift+C/V：序列引擎对字母做大小写
+		// 折叠（S-a ≡ A），C-S-c 与 C-c 归一后是同一个键，而 Ctrl+C 是 shell 的中断键，
+		// 绝不能占。取经典控制台键 Ctrl+Insert / Shift+Insert：特殊键名不受折叠影响，
+		// 与已有绑定都不撞（重键由 TestDefaultKeymapHasNoDuplicateKeys 扫）。
+		{
+			Keys:    "C-<INS>",
+			Command: "term.copy",
+			Enabled: true,
+			Note:    "复制终端选区到剪贴板（shell / SSH / Telnet 通用；先鼠标框选文字）",
+		},
+		{
+			Keys:    "S-<INS>",
+			Command: "term.paste",
+			Enabled: true,
+			Note:    "把剪贴板贴进终端（shell / SSH / Telnet 通用；逐行限速送入，末尾不自动回车）",
 		},
 	}
 	return KeymapConfig{

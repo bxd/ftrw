@@ -10,6 +10,7 @@
 // 出厂序列里（那些要 M-x 前缀或 Shift+方向），keyseq 判 pass 放行到这里；输入浮层聚焦
 // 时 isTextEditing 为真、这里也让路，所以两条路不打架。
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { Clipboard } from '@wailsio/runtime'
 import * as api from '../api'
 import { initials, nameMatches } from '../pinyin'
 
@@ -1101,6 +1102,17 @@ function onEditPathEvent() {
   startPathEdit(active.value)
 }
 
+// M-x c 从 App.vue 广播过来：复制当前栏高亮行的全路径。与 onEditPathEvent 同一套
+// 可见性闸。特殊行 . / .. 也照复制：它们的路径就是当前目录/上级目录，同样是实用目标。
+function onCopyPathEvent() {
+  if (!root.value || root.value.offsetParent === null) return
+  const r = curRow(panes[active.value])
+  if (!r || !r.path) { status.value = '当前行没有可复制的路径'; return }
+  Clipboard.SetText(r.path)
+    .then(() => { status.value = `已复制路径：${r.path}` })
+    .catch((e: any) => { status.value = `复制路径失败：${e?.message || e}` })
+}
+
 // 启动器 Shift+Enter / Alt+Enter 经后端事件→App.vue 广播过来：把 fullPath 定位到左栏
 // （固定 index 0）并选中；preview 为真时额外在右栏（活动栏对侧，active=0 时 other=1）就地
 // 预览。与 onEditPathEvent 同一套可见性闸：只有当前显示出来的那个文件管理器标签响应。
@@ -1136,6 +1148,7 @@ function onRevealEvent(ev: Event) {
 
 onMounted(async () => {
   window.addEventListener('ftrw:fm-edit-path', onEditPathEvent)
+  window.addEventListener('ftrw:fm-copy-path', onCopyPathEvent)
   window.addEventListener('ftrw:fm-reveal', onRevealEvent)
   offDirChanged = api.onFileManagerDirChanged(onDirChanged)
   offTask = api.onFileTask(onTaskEvent)
@@ -1169,6 +1182,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('ftrw:fm-edit-path', onEditPathEvent)
+  window.removeEventListener('ftrw:fm-copy-path', onCopyPathEvent)
   window.removeEventListener('ftrw:fm-reveal', onRevealEvent)
   offDirChanged?.()
   offTask?.()
