@@ -167,11 +167,15 @@ let savedEnabled = true
 
 function toggleRec(i: number) {
   if (rec.row === i) { stopRec(); return }
-  const cur = rows[i]?.keys || ''
-  const { tokens, error } = parseSeq(cur)
-  rec.buf = error ? [] : [...tokens]
+  stopRecG() // 两个录制器互斥：同时开着会抢同一个 keydown
+  // 录制一律从空开始：用户要从头录一条新序列，不是在旧值后面追加；
+  // 旧值只用文案提示（与全局录制器 toggleRecG 同一形状）。
+  const cur = (rows[i]?.keys || '').trim()
+  rec.buf = []
   rec.row = i
-  recHint.value = '按下按键组成序列，回车结束'
+  recHint.value = cur ? `原值 ${cur} · 从头按下按键组成新序列，回车结束` : '按下按键组成序列，回车结束'
+  // 焦点留在「录制」按钮上时，再按空格/回车会二次触发按钮而把录制取消掉
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
 }
 
 function stopRec() {

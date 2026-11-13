@@ -23,7 +23,9 @@ import (
 // 不占主线程；但原生菜单必须由「有消息队列且一直在泵消息」的线程承载，否则第三方外壳扩展
 // （WinRAR 之类）往 owner 窗 SendMessage 会 deadlock。故起一个 runtime.LockOSThread 的常驻
 // goroutine，CoInitializeEx(STA) 永不释放，建一个 message-only 窗做 owner，请求经 channel
-// 串行进来。TrackPopupMenu 自身在模态期间会泵该线程消息，够用。
+// 串行进来。TrackPopupMenu 自身在模态期间会泵该线程消息；空闲等请求时也必须泵
+// （MsgWaitForMultipleObjects + PeekMessage）：InvokeCommand 在本线程上留下的窗口
+// （系统属性页等）靠宿主线程的消息循环才能显示/响应，裸等 channel 会把它们冻住。
 
 var (
 	procSHGetDesktopFolder = modShell32.NewProc("SHGetDesktopFolder")
@@ -31,16 +33,18 @@ var (
 	procILFindLastID       = modShell32.NewProc("ILFindLastID")
 	procILFree             = modShell32.NewProc("ILFree")
 
-	procCreatePopupMenu  = user32Hook.NewProc("CreatePopupMenu")
-	procAppendMenuW      = user32Hook.NewProc("AppendMenuW")
-	procDestroyMenu      = user32Hook.NewProc("DestroyMenu")
-	procTrackPopupMenu   = user32Hook.NewProc("TrackPopupMenu")
-	procGetCursorPos     = user32Hook.NewProc("GetCursorPos")
-	procDefWindowProcW   = user32Hook.NewProc("DefWindowProcW")
-	procRegisterClassExW = user32Hook.NewProc("RegisterClassExW")
-	procCreateWindowExW  = user32Hook.NewProc("CreateWindowExW")
-	procGetModuleHandleW = modKernel32.NewProc("GetModuleHandleW")
-	procPostMessageW     = user32Hook.NewProc("PostMessageW")
+	procCreatePopupMenu           = user32Hook.NewProc("CreatePopupMenu")
+	procAppendMenuW               = user32Hook.NewProc("AppendMenuW")
+	procDestroyMenu               = user32Hook.NewProc("DestroyMenu")
+	procTrackPopupMenu            = user32Hook.NewProc("TrackPopupMenu")
+	procGetCursorPos              = user32Hook.NewProc("GetCursorPos")
+	procDefWindowProcW            = user32Hook.NewProc("DefWindowProcW")
+	procRegisterClassExW          = user32Hook.NewProc("RegisterClassExW")
+	procCreateWindowExW           = user32Hook.NewProc("CreateWindowExW")
+	procGetModuleHandleW          = modKernel32.NewProc("GetModuleHandleW")
+	procPostMessageW              = user32Hook.NewProc("PostMessageW")
+	procPeekMessageW              = user32Hook.NewProc("PeekMessageW")
+	procMsgWaitForMultipleObjects = user32Hook.NewProc("MsgWaitForMultipleObjects")
 	// procSetForegroundWindow 已在 quake_native_windows.go 声明，此处直接复用。
 )
 
@@ -55,6 +59,9 @@ const (
 
 	cmfNormal  = 0x0000
 	cmfExplore = 0x0004
+
+	pmRemove   = 0x0001 // PeekMessage：取走消息
+	qsAllInput = 0x04FF // MsgWaitForMultipleObjects：任何输入/消息都唤醒
 
 	// IUnknown vtable 槽位。
 	slotQueryInterface = 0
@@ -117,8 +124,33 @@ func shellMenuThread() {
 		log.Printf("右键菜单线程 COM 初始化失败：%v", err)
 	}
 	owner := ensureMenuOwner()
-	for job := range shellMenuJobs {
-		job.reply <- runShellMenuSafe(owner, job)
+	for {
+		select {
+		case job := <-shellMenuJobs:
+			job.reply <- runShellMenuSafe(owner, job)
+		default:
+			// 空闲必须泵消息：InvokeCommand 在本线程上创建的窗口（系统属性页等）
+			// 靠宿主线程的消息循环显示/绘制/响应。旧版裸等 channel，属性页建好后
+			// 被冻住，要等下一次右键的 COM 调用顺带泵消息才冒出来——看上去就是
+			// 「再点一次右键才出来」。MsgWait 阻塞等消息或 10ms 超时，不空转。
+			if r, _, _ := procMsgWaitForMultipleObjects.Call(0, 0, 0, 10, qsAllInput); r == 0 {
+				pumpShellMessages()
+			}
+		}
+	}
+}
+
+// pumpShellMessages 一轮取空本线程消息队列。msg 布局与 Translate/Dispatch 复用
+// kbdhook_windows.go（同包）；只泵消息不读字段，与那边消息循环同一套用法。
+func pumpShellMessages() {
+	var m msg
+	for {
+		r, _, _ := procPeekMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0, pmRemove)
+		if r == 0 {
+			return
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
 }
 
@@ -382,17 +414,23 @@ func contextMenuQuery(icm unsafe.Pointer, menu, indexMenu, idFirst, idLast, flag
 	return r, nil
 }
 
-// cminvoke 是 CMINVOKECOMMANDINFO（经典 6 字段版，非 EX）；verb 走 MAKEINTRESOURCE 偏移形式，
-// lpDirectory 传 NULL（项已由 PIDL 定位，省掉宽/ANSI 目录串转换）。x64 下 Go 结构对齐与 Windows
-// 一致：DWORD+pad+4*pointer+int，cbSize 用 unsafe.Sizeof 即 48。
+// cminvoke 是 CMINVOKECOMMANDINFO（ShObjIdl_core.h 原文 9 字段，非 EX）；verb 走 MAKEINTRESOURCE
+// 偏移形式（QueryContextMenu 的 idFirst=0，菜单 id 即偏移），lpDirectory 传 NULL
+// （项已由 PIDL 定位，省掉宽/ANSI 目录串转换）。
+// 曾误写成缺 fMask/dwHotKey/hIcon 的「6 字段版」，cbSize=48；Shell 按
+// sizeof(CMINVOKECOMMANDINFO)=56（x64）校验 cbSize，不等直接 E_INVALIDARG
+// （0x80070057），属性等所有原生动词全失败。字段序与尺寸已对照 SDK 头文件核实，
+// 并由 TestCMInvokeCommandInfoLayout 锁死防再犯。
 type cminvoke struct {
 	cbSize       uint32
-	_pad         uint32
+	fMask        uint32
 	hwnd         uintptr
 	lpVerb       uintptr
 	lpParameters uintptr
 	lpDirectory  uintptr
 	nShow        int32
+	dwHotKey     uint32
+	hIcon        uintptr
 }
 
 func invokeCommand(icm unsafe.Pointer, hwnd uintptr, verb uint32) error {
