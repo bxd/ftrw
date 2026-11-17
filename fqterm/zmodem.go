@@ -828,19 +828,39 @@ func (e *zmodemEngine) sender() error {
 			okCount++
 		}
 	}
-	// End of batch：发 ZFIN，等服务器最终 ZRINIT，再发 "**OO" 让对端 rz 退出 ZMODEM
-	// 回到命令模式（lrzsz sz 的标准断会序列）。不干净断会，服务器 rz 会残留、
+	// End of batch（FQTerm ZmodemTFinish/TFinishOps）：发 ZFIN，对端 ZRINIT/ZNAK→重发 ZFIN，
+	// 对端 ZFIN→发 "OO" 退出 ZMODEM 回命令模式。不干净断会，服务器 rz 会残留、
 	// 后续字节泄到 BBS 导致行为异常（如误发无附件文章）。
+	// 用户实测：100% 后要发两个空命令——水木 rz 结算附件时会吞掉第一发 ZFIN（取证：
+	// ZFIN 后沉默 10s、服务器自己发 ZFIN 收尾），故第一发 ZFIN 500ms 无回应就主动补
+	// 第二发空 ZFIN；对端 ZFIN 也立即退出，不再傻等 ZRINIT 到超时。
 	e.sendHexHeader(zfin, 0)
-	e.setReadDeadline(time.Now().Add(10 * time.Second))
+	resent := false
+	finDeadline := time.Now().Add(500 * time.Millisecond)
 	for {
-		fr, err := e.readFrame()
-		if err != nil || fr.typ == zrinit {
-			break
+		e.setReadDeadline(finDeadline)
+		fr, rerr := e.readFrame()
+		if rerr != nil {
+			if !resent {
+				resent = true
+				e.sendHexHeader(zfin, 0) // 补第二发空命令
+				finDeadline = time.Now().Add(10 * time.Second)
+				continue
+			}
+			break // 超时兜底：仍发 OO 尝试退出
+		}
+		e.dbg("sender: TFinish frame typ=%d pos=%d", fr.typ, fr.pos)
+		if fr.typ == zfin {
+			break // 对端确认断会
+		}
+		if fr.typ == zrinit || fr.typ == znak {
+			resent = true
+			e.sendHexHeader(zfin, 0) // FQTerm TFinishOps：ZRINIT/ZNAK→重发 ZFIN
+			finDeadline = time.Now().Add(10 * time.Second)
 		}
 	}
 	e.setReadDeadline(time.Time{})
-	e.writeRaw([]byte{zpad, zpad, 'O', 'O'})
+	e.writeRaw([]byte{'O', 'O'}) // FQTerm OverAndOut：裸 "OO"，不带 ZPAD
 	// 收尾事件按批次结果区分：全成功才报“上传完成”；部分跳过要注明；
 	// 全部被拒/失败时不发 done，保留 skipped/error 终态避免误报成功。
 	switch {
