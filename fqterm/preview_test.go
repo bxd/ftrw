@@ -210,6 +210,25 @@ func TestKindFromContentType(t *testing.T) {
 	}
 }
 
+func TestKindFromName(t *testing.T) {
+	cases := []struct{ name, want string }{
+		{"aaa.mp4", KindVideo},
+		{"photo.PNG", KindImage},
+		{"song.m4a", KindAudio},
+		{"Q07XEFRH0grT9akQFL3rZAgAAIOYEAHwBAAAfe6Nx.mp4", KindVideo},
+		{"att.php", ""},
+		{"47743632", ""},
+		{"archive.zip", ""},
+		{"trailing.", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := kindFromName(c.name); got != c.want {
+			t.Errorf("kindFromName(%q) = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 // 探测是这两轮修复的根：水木的图走 att.php?... 与纯附件号，扩展名判不出来，只能问服务器。
 // 这里钉住四件事：HEAD 能拿到类型、服务器不认 HEAD 时要退化成 GET、其余情况一律当没探到、
 // Content-Disposition 里的真名字要带回来。

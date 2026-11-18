@@ -534,6 +534,35 @@ func kindFromContentType(ct string) string {
 	return ""
 }
 
+// mediaExtKind 与前端 linkscan.ts 的 IMAGE_EXT/AUDIO_EXT/VIDEO_EXT 同源。
+// 服务器把媒体按 octet-stream 下发、却在 Content-Disposition 或存储名里给了
+// 带媒体后缀的真名时，按名字后缀认类型——水木的 mp4 附件就是这一种。
+var mediaExtKind = map[string]string{
+	"jpg": KindImage, "jpeg": KindImage, "jfif": KindImage, "png": KindImage, "gif": KindImage,
+	"webp": KindImage, "bmp": KindImage, "avif": KindImage, "svg": KindImage, "ico": KindImage,
+	"tif": KindImage, "tiff": KindImage,
+	"mp3": KindAudio, "wav": KindAudio, "ogg": KindAudio, "oga": KindAudio, "m4a": KindAudio,
+	"aac": KindAudio, "flac": KindAudio, "opus": KindAudio, "wma": KindAudio, "amr": KindAudio,
+	"mp4": KindVideo, "webm": KindVideo, "ogv": KindVideo, "mov": KindVideo, "m4v": KindVideo,
+	"mkv": KindVideo, "avi": KindVideo, "wmv": KindVideo, "flv": KindVideo, "ts": KindVideo, "3gp": KindVideo,
+}
+
+// kindFromName 按文件名后缀认类型；认不出返回空，保留原判。
+func kindFromName(name string) string {
+	dot := strings.LastIndex(name, ".")
+	if dot < 0 || dot == len(name)-1 {
+		return ""
+	}
+	return mediaExtKind[strings.ToLower(name[dot+1:])]
+}
+
+// isOpaqueBinary 头里没说类型（或明说 octet-stream）：这时名字后缀才是唯一信号。
+// text/html 一类明确非媒体的不在此列，保留网页原判。
+func isOpaqueBinary(ct string) bool {
+	media, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(ct)), ";")
+	return media == "" || media == "application/octet-stream" || media == "binary/octet-stream"
+}
+
 // contentTypeExt 常见媒体的后缀对照。表外的一律不猜：把 image/vnd.microsoft.icon
 // 当成 ".vnd" 只会让存出来的文件更难认。
 var contentTypeExt = map[string]string{
@@ -656,10 +685,14 @@ func probeOnce(ctx context.Context, rawURL, method string) (ProbeResult, bool) {
 	if err != nil {
 		origURL = nil
 	}
-	return ProbeResult{
-		Kind: kind,
-		Name: probeName(resp.Header.Get("Content-Disposition"), ct, kind, finalURL, origURL),
-	}, true
+	name := probeName(resp.Header.Get("Content-Disposition"), ct, kind, finalURL, origURL)
+	// 服务器把媒体当 octet-stream 下发、却用 Content-Disposition/存储名说了真名
+	// （水木 mp4 附件即如此）：按名字后缀认类型，否则判成网页后顶层导航
+	// 撞上 attachment 头就变成下载。
+	if kind == "" && isOpaqueBinary(ct) {
+		kind = kindFromName(name)
+	}
+	return ProbeResult{Kind: kind, Name: name}, true
 }
 
 // 查询串里的附件号参数：水木以外常见的写法，值本身就是这张图的身份。

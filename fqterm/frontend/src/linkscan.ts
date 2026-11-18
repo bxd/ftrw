@@ -101,7 +101,23 @@ export function classifyURL(u: string): PreviewKind {
   if (IMAGE_EXT.has(ext)) return 'image'
   if (AUDIO_EXT.has(ext)) return 'audio'
   if (VIDEO_EXT.has(ext)) return 'video'
+  const se = storageExt(u)
+  if (IMAGE_EXT.has(se)) return 'image'
+  if (AUDIO_EXT.has(se)) return 'audio'
+  if (VIDEO_EXT.has(se)) return 'video'
   return 'page'
+}
+
+/**
+ * BBS 附件地址把扩展名藏在查询串里：att.php?…存储名.mp4，整串就是带后缀的
+ * 存储名、没有键值对。路径末段是脚本名时类型只能靠这个尾缀认；带 = / & 的
+ * 正常查询不碰，免得把 view.php?id=1 一类误判成媒体。
+ */
+function storageExt(u: string): string {
+  const q = (u.split('?')[1] || '').split('#')[0]
+  if (!q || q.includes('=') || q.includes('&')) return ''
+  const dot = q.lastIndexOf('.')
+  return dot < 0 ? '' : q.slice(dot + 1).toLowerCase()
 }
 
 /** 给人看的短名：路径末段（还原 %xx），拿不到就退回主机名。 */
