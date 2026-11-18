@@ -438,15 +438,14 @@ func (s *AppService) forceShowFront() {
 	forceForeground(hwnd)
 }
 
-// RestoreMainFocus 在预览这类独立弹窗关闭后把前台收回主窗口：Wails 的模态清理
-// 只做 EnableWindow(main, true)，不还前台——弹窗销毁那一刻系统按 z 序把前台交给
-// 别的应用，主窗口就这么丢了焦点。不可见时不抢：焦点还回来不该顺手把窗口呼出。
+// RestoreMainFocus 在预览这类独立弹窗关闭后把焦点补回主窗口：Wails 的模态清理
+// 只做 EnableWindow(main, true)，不还前台。只补焦点、不动几何与层级——不走
+// forceShowFront（SW_RESTORE 会解除最大化、BringWindowToTop 强抢前台会改 z 序），
+// 关弹窗不该改变主窗口的大小或层级状态。不可见时不抢：焦点还回来不该顺手把窗口呼出。
 func (s *AppService) RestoreMainFocus() {
 	if s.win == nil || !s.win.IsVisible() {
 		return
 	}
-	s.raiseQuake()
-	s.forceShowFront()
 	s.win.Focus()
 }
 

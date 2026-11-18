@@ -130,6 +130,13 @@ func main() {
 		BackgroundColour:           application.NewRGB(24, 26, 30),
 		URL:                        "/",
 		StartState:                 application.WindowStateNormal,
+		Windows: application.WindowsWindow{
+			// Wails 对 frameless 窗每次 WM_ACTIVATE 都重拉 DWM 边框（framelessWithDecorations），
+			// 预览窗关闭、主窗被系统重新激活时会闪一下。关掉逐激活的装饰，
+			// Win11 圆角在 ApplicationStarted 里用 setWindowRoundCorners 一次性补回，
+			// 边缘轮廓改由前端 .app 的 inset 描边承担。
+			DisableFramelessWindowDecorations: true,
+		},
 	})
 
 	appService.Bind(app, win)
@@ -147,6 +154,15 @@ func main() {
 	appService.SetupTray()
 	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		appService.Start()
+		// 补 Win11 圆角（Win10 及以下静默无效）。不能在 Run 之前调 InvokeSync：
+		// 那时主循环还没起来，投递会被挂进 earlyDispatch 队列里死等。
+		var mainHWND uintptr
+		application.InvokeSync(func() {
+			if p := win.NativeWindow(); p != nil {
+				mainHWND = uintptr(p)
+			}
+		})
+		setWindowRoundCorners(mainHWND)
 		// 启动器预建隐藏窗 + 后台建索引：热键呼出时只剩 Show 与抢前台，不为 webview
 		// 冷启动买单。
 		launcherService.Init()

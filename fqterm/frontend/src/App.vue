@@ -37,16 +37,22 @@ const zmodemMsg = ref('')
 // 自动隐藏”与热键切换共用一套机制，不会出现“卡住收不起来”的互斥开关。
 const SIDEBAR_W = 260
 const EDGE_PX = 8            // 收起状态下“贴边”的判定宽度（只算坐标，不拿透明层挡住终端）
+const EDGE_DWELL_MS = 1000   // 左缘/顶缘停满 1 秒才唤出：扫过不弹，与全屏底缘同一套手感
 const sidebarEl = ref<HTMLElement | null>(null)
 const sidebarHover = ref(false)
 const sidebarFocused = ref(false)
 let sideHideTimer: number | undefined
+let sideDwellTimer: number | undefined
 
 const sidebarShown = computed(() => !dialogOpen.value && (sidebarHover.value || sidebarFocused.value))
 const sidebarTransform = computed(() => (sidebarShown.value ? 'none' : `translateX(-${SIDEBAR_W}px)`))
 
 function clearSideHide() {
   if (sideHideTimer) { clearTimeout(sideHideTimer); sideHideTimer = undefined }
+}
+
+function clearSideDwell() {
+  if (sideDwellTimer) { clearTimeout(sideDwellTimer); sideDwellTimer = undefined }
 }
 
 /** 鼠标离开后延时收起：留出从边缘斜移进面板的时间，也避免扫过时闪烁。 */
@@ -73,17 +79,37 @@ function onBodyMove(ev: MouseEvent) {
   feedToolbar(ev.clientY - rect.top)
 }
 
-/** 站点栏那一半：判定依旧带迟滞，收起时只认左缘 EDGE_PX，展开后整块面板宽度都算。 */
+/**
+ * 站点栏那一半：判定依旧带迟滞，收起时只认左缘 EDGE_PX，展开后整块面板宽度都算。
+ * 收起状态下光标贴到左缘要停满 1 秒才展开（与全屏底缘同一套 dwell）：横向扫过、
+ * 往左拖选文本都会路过这条边，一碰就弹会把终端左边几列反复盖住。
+ * 停留计时一旦开始就不被后续 mousemove 重置，离带才取消。
+ */
 function feedSidebar(x: number) {
-  const over = x <= (sidebarShown.value ? SIDEBAR_W : EDGE_PX)
-  if (over === sidebarHover.value) return
-  if (over) {
-    clearSideHide()
-    sidebarHover.value = true
-  } else {
-    sidebarHover.value = false
-    if (!sidebarFocused.value) scheduleSideHide()
+  if (sidebarShown.value) {
+    // 已展开（hover/焦点/热键）：整块面板都算“还在上面”，保持原迟滞
+    clearSideDwell()
+    const over = x <= SIDEBAR_W
+    if (over === sidebarHover.value) return
+    if (over) {
+      clearSideHide()
+      sidebarHover.value = true
+    } else {
+      sidebarHover.value = false
+      if (!sidebarFocused.value) scheduleSideHide()
+    }
+    return
   }
+  if (x <= EDGE_PX) {
+    if (sideDwellTimer) return
+    sideDwellTimer = window.setTimeout(() => {
+      sideDwellTimer = undefined
+      // 这一秒里可能开了对话框或被热键唤出，届时不该再叠一层 hover
+      if (!dialogOpen.value && !sidebarShown.value) sidebarHover.value = true
+    }, EDGE_DWELL_MS)
+    return
+  }
+  clearSideDwell()
 }
 
 /* ---------------- 编辑工具栏（终端顶部的浮条） ---------------- */
@@ -94,9 +120,14 @@ const TB_EDGE_PX = 6
 const TB_H = 30            // 与 EditToolbar 里 .ebt-bar 的实际高度对齐（运行量得 29px，留 1px 免得贴底那一排抽抖）
 const tbHover = ref(false)
 let tbHideTimer: number | undefined
+let tbEdgeDwellTimer: number | undefined
 
 function clearTbHide() {
   if (tbHideTimer) { clearTimeout(tbHideTimer); tbHideTimer = undefined }
+}
+
+function clearTbDwell() {
+  if (tbEdgeDwellTimer) { clearTimeout(tbEdgeDwellTimer); tbEdgeDwellTimer = undefined }
 }
 
 function scheduleTbHide(ms = 350) {
@@ -111,17 +142,32 @@ function scheduleTbHide(ms = 350) {
 const tbShown = computed(() => !dialogOpen.value && active.value >= 0
   && (toolbarPinned.value || tbHover.value || sepPickerOpen.value))
 
+/** 顶缘那一半与侧栏同构：收起时贴顶停满 1 秒才浮出，展开后整条高度都算“还在上面”。 */
 function feedToolbar(y: number) {
-  const over = y <= (tbShown.value ? TB_H : TB_EDGE_PX)
-  if (over) {
-    clearTbHide()
-    tbHover.value = true
+  if (tbShown.value) {
+    clearTbDwell()
+    if (y <= TB_H) {
+      clearTbHide()
+      tbHover.value = true
+      return
+    }
+    if (tbHover.value && !toolbarPinned.value && !sepPickerOpen.value) scheduleTbHide()
     return
   }
-  if (tbHover.value && !toolbarPinned.value && !sepPickerOpen.value) scheduleTbHide()
+  if (y <= TB_EDGE_PX) {
+    if (tbEdgeDwellTimer) return
+    tbEdgeDwellTimer = window.setTimeout(() => {
+      tbEdgeDwellTimer = undefined
+      if (!dialogOpen.value && !tbShown.value) tbHover.value = true
+    }, EDGE_DWELL_MS)
+    return
+  }
+  clearTbDwell()
 }
 
 function onBodyLeave() {
+  clearSideDwell()
+  clearTbDwell()
   if (sidebarHover.value && !sidebarFocused.value) {
     sidebarHover.value = false
     scheduleSideHide()
@@ -130,7 +176,9 @@ function onBodyLeave() {
 }
 
 function onWindowBlur() {
-  // 离开应用（Alt+Tab）也算失焦，收起悬浮面板
+  // 离开应用（Alt+Tab）也算失焦，收起悬浮面板；没停满的 dwell 一并作废
+  clearSideDwell()
+  clearTbDwell()
   sidebarFocused.value = false
   scheduleSideHide(120)
   if (!toolbarPinned.value && !sepPickerOpen.value) {
@@ -226,6 +274,7 @@ function onSidebarFocusOut(ev: FocusEvent) {
 /** 点面板空白处也要能进入“已聚焦”态：容器带 tabindex="-1"，直接把焦点收到根节点。 */
 function focusSidebar() {
   clearSideHide()
+  clearSideDwell()
   sidebarEl.value?.focus({ preventScroll: true })
 }
 
@@ -308,6 +357,7 @@ function runFocusedSite() {
 function toggleSidebar() {
   if (dialogOpen.value) return
   clearSideHide()
+  clearSideDwell()
   if (sidebarShown.value) {
     sidebarHover.value = false
     sidebarFocused.value = false
@@ -408,7 +458,7 @@ registerBuiltinCommands({
 registerCommand({
   id: 'app.toggle-sidebar',
   title: '界面：显示 / 隐藏站点栏（浮动）',
-  description: '默认序列 M-x p；也可把鼠标移到窗口左缘唤出，失焦自动收起',
+  description: '默认序列 M-x p；也可把鼠标在窗口左缘停 1 秒唤出，失焦自动收起',
   handler: () => toggleSidebar(),
 })
 
@@ -1468,7 +1518,7 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
 </template>
 
 <style scoped>
-.app { display: flex; flex-direction: column; height: 100%; width: 100%; overflow: hidden; background: #1b1d22; color: #c8ccd4; font-family: system-ui, "Segoe UI", sans-serif; }
+.app { display: flex; flex-direction: column; height: 100%; width: 100%; overflow: hidden; background: #1b1d22; color: #c8ccd4; font-family: system-ui, "Segoe UI", sans-serif; box-shadow: inset 0 0 0 1px #33373f; /* 关掉 DWM 逐激活装饰后，边缘轮廓由这条描边承担 */ }
 .topbar { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #24272e; border-bottom: 1px solid #33373f; --wails-draggable: drag; }
 .topbar button, .topbar select, .topbar .wctl, .topbar .tabs { --wails-draggable: no-drag; }
 /* 右侧控件不参与收缩：标签再多也只能挤压标签区自己滚动，不能把关闭/最小化按钮顶出窗口 */

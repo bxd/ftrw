@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -54,12 +55,30 @@ const (
 	previewPageURL = "/?view=preview"
 
 	// previewWindowName 给窗口一个稳定的名字：Wails 按名字投递事件，
-	// 也让 AttachModal 之类的调试有得认。
+	// 也让挂 owner 之类的调试有得认。
 	previewWindowName = "preview"
 
 	// previewEventLoad 是「窗口已经开着，换内容」的通知。新建窗口时不发：
 	// 那时文档还没挂上监听者，靠 pending 取。
 	previewEventLoad = "preview:load"
+)
+
+// 预览窗弹出/收起的动画参数。滑动距离按物理像素算，随停泊位一起换算成 DIP；
+// 节奏与主窗前端 .16s ease-out 一族相近，两个窗口的动效看起来是一套。
+const (
+	previewSlideInMS  = 220
+	previewSlideOutMS = 170
+	previewGlideMS    = 180
+	previewSlideDist  = 64
+	previewAnimTick   = 16 * time.Millisecond
+)
+
+// 预览窗关闭流程的三态。hook 拦下第一次关闭请求播淡出；淡出期间再来关闭请求
+// （连按 ESC / Alt+F4）跳过动画立即关；pvClosing 是淡出播完后的正式关闭，hook 放行。
+const (
+	pvIdle      = 0
+	pvFadingOut = 1
+	pvClosing   = 2
 )
 
 // PreviewItem 一条链接。Name 是给人看的短名（前端从路径末段取），Kind 见上面四个常量。
@@ -98,6 +117,11 @@ type PreviewService struct {
 	hwnd    uintptr
 	mode    string
 	pending *PreviewRequest
+
+	pvState   int              // pvIdle / pvFadingOut / pvClosing
+	anim      *previewAnim     // 正在跑的窗口动画（淡入 / 淡出 / 停泊滑移）
+	dock      application.Rect // 停泊位（DIP）：window 模式贴主窗底缘，quake 贴工作区顶缘
+	dockStart application.Rect // 弹出起始位（DIP）：停泊位向主窗一侧偏一个滑动距离
 }
 
 func NewPreviewService() *PreviewService {
@@ -124,6 +148,8 @@ func (s *PreviewService) OpenPreview(items []PreviewItem, index int) error {
 	if len(items) == 0 {
 		return errors.New("没有可预览的内容")
 	}
+	// 撞上正在淡出的预览：等它关完再走复用/新建的正常判断。
+	s.waitFadeOut()
 	index = clampIndex(index, len(items))
 	item := items[index]
 	u, err := checkPreviewURL(item.URL)
@@ -161,6 +187,7 @@ func (s *PreviewService) openMedia(req *PreviewRequest, item PreviewItem) error 
 		win.EmitEvent(previewEventLoad, req)
 	}
 	s.frontPreview(win)
+	s.redock(win)
 	return nil
 }
 
@@ -180,6 +207,7 @@ func (s *PreviewService) openPage(rawURL string, item PreviewItem) error {
 	win.SetTitle(title)
 	s.setMode(PreviewPage)
 	s.frontPreview(win)
+	s.redock(win)
 	log.Printf("预览窗口导航到网页：%s", rawURL)
 	return nil
 }
@@ -189,36 +217,100 @@ func (s *PreviewService) newWindow(startURL, title, mode string) error {
 	if s.app == nil || s.main == nil {
 		return errors.New("预览服务还没接上主窗口（应用尚未启动）")
 	}
-	w, h := s.geometry()
+	// 护栏必须赶在 frontPreview 的 Show/Focus 之前：抢焦点会同步
+	// 触发主窗失焦钩子，quake 不加护栏会把下拉当「用户切走了」吞掉。
+	if s.ctl != nil {
+		s.ctl.SetDialogGuard(true)
+	}
+	dock, start := s.dockGeometry()
+	// 最小尺寸跟着停泊位走：主窗本身很小时预览要能装进去，
+	// 不让 Wails 的最小尺寸钳制把窗口又撑回主窗外面。
+	minW, minH := 360, 260
+	if dock.Width < minW {
+		minW = dock.Width
+	}
+	if dock.Height < minH {
+		minH = dock.Height
+	}
 	win := s.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name:             previewWindowName,
-		Title:            title,
-		Width:            w,
-		Height:           h,
-		MinWidth:         360,
-		MinHeight:        260,
-		URL:              startURL,
-		BackgroundColour: application.NewRGB(24, 26, 30),
+		Name:            previewWindowName,
+		Title:           title,
+		Width:           dock.Width,
+		Height:          dock.Height,
+		MinWidth:        minW,
+		MinHeight:       minH,
+		InitialPosition: application.WindowXY,
+		X:               start.X,
+		Y:               start.Y,
+		URL:             startURL,
+		// 底色与预览页 CSS 根色 #1b1d22 一致（也与主窗口同源），开窗瞬间不闪色差。
+		BackgroundColour: application.NewRGB(27, 29, 34),
+		// Hidden 建窗：位置与透明度都由弹出动画接管，Wails 默认的「建窗即居中显示」
+		// 没机会闪出来。
+		Hidden: true,
 		// 无边框：系统那条白标题栏跟整窗的深色完全不搭。媒体模式下预览页自己的工具条
 		// 就是标题栏（能拖、能关）。代价在网页模式 —— 那时窗口整个交给对方文档，我们
 		// 画不出任何东西，退路只剩 ESC（低级键盘钩子接住）与 Alt+F4；frameless 仍保留
 		// WS_THICKFRAME/WS_SYSMENU，所以拖边框缩放和 Win+方向键贴边照旧能用。
 		Frameless: true,
-		Windows:   application.WindowsWindow{HiddenOnTaskbar: true},
+		Windows: application.WindowsWindow{
+			HiddenOnTaskbar: true,
+			// Wails 对 frameless 窗每次 WM_ACTIVATE 都重拉 DWM 边框，预览关闭、
+			// 主窗被激活时会闪一下；关掉装饰，Win11 圆角用 setWindowRoundCorners 一次性补。
+			DisableFramelessWindowDecorations: true,
+		},
 	})
 	if win == nil {
 		return errors.New("创建预览窗口失败")
 	}
 
 	// HWND 要在主线程上取（impl 里的字段是那边写的）。取不到不影响功能，
-	// 只是 ESC 只能由页面自己的 keydown 兜着（网页模式就没有了）。
+	// 只是 ESC 只能由页面自己的 keydown 兜着（网页模式就没有了），动画也退化为直显。
 	var hwnd uintptr
 	application.InvokeSync(func() {
 		if p := win.NativeWindow(); p != nil {
 			hwnd = uintptr(p)
 		}
+		// 全透明起步：frontPreview 的 SW_SHOW 露出的是隐形窗，fadeIn 从这里接手。
+		previewSetLayered(hwnd, true)
+		previewSetAlpha(hwnd, 0)
+		// 只挂 owner 关系，不走 AttachModal：后者会 EnableWindow(main,false)，
+		// 关窗时再启用 + 销毁子窗 + 系统重新激活主窗，主窗在关闭那一刻
+		// 多一轮禁用/启用与激活切换，正是残闪的根源。
+		if p := s.main.NativeWindow(); p != nil {
+			previewSetOwner(hwnd, uintptr(p))
+		}
 	})
 
+	// quake 下主窗是 WS_EX_TOPMOST：置顶要赶在 frontPreview 的 SW_SHOW/
+	// SetForegroundWindow 之前，预览从露面那一刻就压在主窗上一层，
+	// 而不是靠主窗被收起才显得在上面。
+	if s.ctl != nil && s.ctl.Mode() == ModeQuake {
+		win.SetAlwaysOnTop(true)
+	}
+
+	// 关闭拦截：第一次关闭请求播淡出，淡出中再请求立即关，淡出完毕的正式关闭放行。
+	// 状态机见 pvIdle/pvFadingOut/pvClosing 注释。
+	win.RegisterHook(events.Common.WindowClosing, func(ev *application.WindowEvent) {
+		s.mu.Lock()
+		if s.win != win || !s.alive {
+			s.mu.Unlock()
+			return // 窗口已被替换/已死：放行
+		}
+		switch s.pvState {
+		case pvFadingOut:
+			s.pvState = pvClosing // 连按 ESC/Alt+F4：跳过动画立即关
+			s.mu.Unlock()
+			return
+		case pvClosing:
+			s.mu.Unlock()
+			return // 淡出播完的正式关闭：放行
+		}
+		s.pvState = pvFadingOut
+		s.mu.Unlock()
+		ev.Cancel()
+		go s.fadeOut(win)
+	})
 	// 关闭回调里一个窗口 API 都不能碰：它跑在主线程上，而 Close/Hide 内部是
 	// InvokeSync（要等主线程），在这儿等下去就是自锁。见 installCloseHook 的同类处理。
 	win.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
@@ -232,24 +324,22 @@ func (s *PreviewService) newWindow(startURL, title, mode string) error {
 	s.alive = true
 	s.hwnd = hwnd
 	s.mode = mode
+	s.pvState = pvIdle
+	s.dock, s.dockStart = dock, start
 	s.mu.Unlock()
 
-	// 护栏赶在抢焦点之前置位：AttachModal 内部的 SetForegroundWindow 会在主线程上
-	// 同步触发主窗口的 WindowLostFocus，护栏晚一步置位，quake 收起钩子就把自家预览
-	// 当成「用户切走了」，下拉直接被藏掉。
-	if s.ctl != nil {
-		s.ctl.SetDialogGuard(true)
-	}
-	// 真模态：把预览设成主窗口的 owner 并 EnableWindow(main, false)，
-	// 关窗时 Wails 自己把主窗口放回来（见 windowsWebviewWindow 的 parentHWND 清理）。
-	s.main.AttachModal(win)
+	// owner 关系已在取 HWND 时挂好（只设 GWLP_HWNDPARENT、不禁用主窗），
+	// 预览始终压在主窗之上、随主窗最小化；关闭时 commitClose 主动交还前台，
+	// 销毁那一刻系统不再「补」owner 激活。
+	// 护栏已在建窗前设好，这里 frontPreview 抢焦点不会触发 quake 误收起。
 	s.frontPreview(win)
 	if hwnd != 0 {
 		armEscWatch(hwnd, func() { s.ClosePreview() })
 	} else {
 		log.Printf("预览窗口未取得 HWND，ESC 只能靠页面内按键处理（网页模式下会失灵）")
 	}
-	log.Printf("预览窗口已打开（%s 模式，%dx%d，hwnd=%#x）：%s", mode, w, h, hwnd, title)
+	go s.fadeIn(win, hwnd)
+	log.Printf("预览窗口已打开（%s 模式，%dx%d @%d,%d，hwnd=%#x）：%s", mode, dock.Width, dock.Height, dock.X, dock.Y, hwnd, title)
 	return nil
 }
 
@@ -294,6 +384,9 @@ func (s *PreviewService) onWindowClosed(win *application.WebviewWindow, hwnd uin
 	s.hwnd = 0
 	s.mode = ""
 	s.pending = nil
+	s.pvState = pvIdle
+	s.anim = nil
+	s.dock, s.dockStart = application.Rect{}, application.Rect{}
 	s.mu.Unlock()
 
 	if hwnd != 0 {
@@ -301,10 +394,10 @@ func (s *PreviewService) onWindowClosed(win *application.WebviewWindow, hwnd uin
 	}
 	if s.ctl != nil {
 		s.ctl.SetDialogGuard(false)
-		// 焦点还给主窗：Wails 的模态清理只重新启用主窗、不还前台（见
-		// RestoreMainFocus）。本回调在 WindowClosing 里、主窗还没销毁完，窗口 API
-		// 又全是 InvokeSync，故起 goroutine 略等一下，免得抢完前台又被销毁流程把
-		// 焦点交出去（同 installCloseHook 的线程考量）。
+		// 焦点还给主窗兜底：正常路径 commitClose 已在关前交还前台，
+		// 这里补没走动画的路（如未取得 HWND）。本回调在 WindowClosing 里，
+		// 窗口 API 又全是 InvokeSync，故起 goroutine 略等一下，免得和
+		// 销毁流程抢焦点（同 installCloseHook 的线程考量）。
 		go func() {
 			time.Sleep(120 * time.Millisecond)
 			s.ctl.RestoreMainFocus()
@@ -1058,31 +1151,290 @@ func (s *PreviewService) setMode(mode string) {
 	s.mu.Unlock()
 }
 
-// geometry 按主窗口所在屏幕的工作区取一个合适的尺寸（换显示器、改缩放都不用配）。
-func (s *PreviewService) geometry() (int, int) {
+// dockGeometry 算停泊位与弹出起始位（都是 DIP）。
+//
+//	window 模式：弹进主窗口显示区域里面——与主窗同宽、底缘对齐主窗底缘，
+//	             像从主窗底部推上来的抽屉；高度先按屏幕比例取，再夹到主窗
+//	             高度的 3/4，留住顶部工具条和几行终端。
+//	quake 模式：主窗本就挂在屏幕顶，预览从工作区顶缘弹出，盖住主窗上半截。
+//
+// 高度按工作区高度的 62% 取，再夹进 [260, 1200] 与可用空间。中间量一律用物理
+// 像素（Bounds 是 DIP、WorkArea 是物理，两者不能混算），最后统一换算。
+func (s *PreviewService) dockGeometry() (dock, start application.Rect) {
 	const defW, defH = 1000, 700
-	if s.main == nil {
-		return defW, defH
+	fallback := application.Rect{Width: defW, Height: defH}
+	if s.main == nil || s.app == nil {
+		return fallback, fallback
 	}
+	mb := application.DipToPhysicalRect(s.main.Bounds())
 	screen, err := s.main.GetScreen()
 	if err != nil || screen == nil {
-		return defW, defH
+		return fallback, fallback
 	}
-	wa := screen.WorkArea
-	w, h := wa.Width*62/100, wa.Height*72/100
-	clamp := func(v, lo, hi, def int) int {
-		if v <= 0 {
-			return def
-		}
-		if v < lo {
-			return lo
-		}
-		if v > hi {
-			return hi
-		}
-		return v
+	wa := screen.PhysicalWorkArea
+	w, h := mb.Width, wa.Height*62/100
+	if h < 260 {
+		h = 260
 	}
-	return clamp(w, 560, 1600, defW), clamp(h, 380, 1200, defH)
+	if h > 1200 {
+		h = 1200
+	}
+	if h > wa.Height {
+		h = wa.Height
+	}
+	if w > wa.Width {
+		w = wa.Width
+	}
+	x := mb.X
+	if x < wa.X {
+		x = wa.X
+	}
+	if x+w > wa.X+wa.Width {
+		x = wa.X + wa.Width - w
+	}
+	quake := s.ctl != nil && s.ctl.Mode() == ModeQuake
+	var y int
+	if quake {
+		y = wa.Y
+	} else {
+		// window 模式：泊在主窗里面、底缘对齐。主窗很小时高度跟着它走，
+		// 最小尺寸下限已在 newWindow 按停泊位放宽，不会被钳制撑回去。
+		if capH := mb.Height * 3 / 4; h > capH {
+			h = capH
+		}
+		if h > mb.Height {
+			h = mb.Height
+		}
+		y = mb.Y + mb.Height - h
+	}
+	dockPhys := application.Rect{X: x, Y: y, Width: w, Height: h}
+	startPhys := dockPhys
+	// 起始位允许越出屏幕：quake 从顶缘上方滑入，window 从主窗底缘下方推入，不夹。
+	if quake {
+		startPhys.Y -= previewSlideDist
+	} else {
+		startPhys.Y += previewSlideDist
+	}
+	return application.PhysicalToDipRect(dockPhys), application.PhysicalToDipRect(startPhys)
+}
+
+/* --------------------------------------------------------------------------- */
+/* 弹出 / 收起动画                                                                */
+/* --------------------------------------------------------------------------- */
+
+// previewAnim 一次窗口动画的令牌：cancel 通知中途放弃，done 等它真正退出。
+// 新动画总是先取消上一个并等它退出，保证不会有两个动画同时写一个窗口。
+type previewAnim struct {
+	cancel chan struct{}
+	done   chan struct{}
+}
+
+// beginAnim 接管动画槽。调用方不能在主播线程：等上一个动画退出可能需要它
+// 跑完手里那一帧 InvokeSync，而 InvokeSync 要等主线程空出来。
+func (s *PreviewService) beginAnim() *previewAnim {
+	a := &previewAnim{cancel: make(chan struct{}), done: make(chan struct{})}
+	s.mu.Lock()
+	prev := s.anim
+	s.anim = a
+	s.mu.Unlock()
+	if prev != nil {
+		close(prev.cancel)
+		<-prev.done
+	}
+	return a
+}
+
+// sameWindow 窗口还是服务手里那个且活着：动画半途窗口被关/被换就必须立刻放弃。
+func (s *PreviewService) sameWindow(win *application.WebviewWindow) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.alive && s.win == win
+}
+
+func (s *PreviewService) rects() (dock, start application.Rect) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dock, s.dockStart
+}
+
+// waitFadeOut 新的打开请求撞上正在淡出的预览：等它关完再走正常流程（新建窗口）。
+// 淡出最多 170ms，10ms 一轮 poll 40 轮足够宽裕；真卡住了也不会死等。
+func (s *PreviewService) waitFadeOut() {
+	for i := 0; i < 40; i++ {
+		s.mu.Lock()
+		fading := s.alive && s.pvState == pvFadingOut
+		s.mu.Unlock()
+		if !fading {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func easeOutCubic(t float64) float64  { u := 1 - t; return 1 - u*u*u }
+func easeInQuad(t float64) float64    { return t * t }
+func lerpInt(a, b int, t float64) int { return a + int(math.Round(float64(b-a)*t)) }
+
+// fadeIn 把预览窗从起始位滑进停泊位并淡入，落定后摘掉分层风格。
+func (s *PreviewService) fadeIn(win *application.WebviewWindow, hwnd uintptr) {
+	a := s.beginAnim()
+	defer close(a.done)
+	dock, start := s.rects()
+	t0 := time.Now()
+	tick := time.NewTicker(previewAnimTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-a.cancel:
+			return
+		case <-tick.C:
+		}
+		if !s.sameWindow(win) {
+			return
+		}
+		t := float64(time.Since(t0)) / float64(previewSlideInMS*time.Millisecond)
+		if t >= 1 {
+			break
+		}
+		e := easeOutCubic(t)
+		x, y := lerpInt(start.X, dock.X, e), lerpInt(start.Y, dock.Y, e)
+		// 淡入比滑动稍快：弹出早期就看得见内容，不是滑到位才突然冒出来。
+		alpha := byte(math.Min(255, 255*e*1.5))
+		application.InvokeSync(func() {
+			// SetPosition 内部会把分层窗的 alpha 重置回 255（Wails setPhysicalBounds），
+			// 所以移动之后必须补回目标透明度；两句同批落在主线程，外面看不到中间帧。
+			win.SetPosition(x, y)
+			previewSetAlpha(hwnd, alpha)
+		})
+	}
+	application.InvokeSync(func() {
+		win.SetPosition(dock.X, dock.Y)
+		previewSetAlpha(hwnd, 255)
+		previewSetLayered(hwnd, false)
+		setWindowRoundCorners(hwnd)
+	})
+}
+
+// fadeOut 把预览窗沿弹出路径收起并淡出，然后正式关闭。起点取窗口当前的实际
+// 位置/透明度：淡入半途被打断、或用户拖过窗口，都从当下状态顺順当当地收。
+func (s *PreviewService) fadeOut(win *application.WebviewWindow) {
+	a := s.beginAnim()
+	defer close(a.done)
+	s.mu.Lock()
+	hwnd, dock, start := s.hwnd, s.dock, s.dockStart
+	s.mu.Unlock()
+	if hwnd == 0 {
+		s.commitClose(win)
+		return
+	}
+	var curX, curY int
+	var fromAlpha byte
+	application.InvokeSync(func() {
+		curX, curY = win.Position()
+		fromAlpha = previewAlpha(hwnd)
+		previewSetLayered(hwnd, true)
+		previewSetAlpha(hwnd, fromAlpha)
+	})
+	// 沿原弹出路径收回：用户挪过窗口就把整条路径平移同样的偏移，保持「从哪来回哪去」。
+	dx, dy := start.X-dock.X, start.Y-dock.Y
+	toX, toY := curX+dx, curY+dy
+	t0 := time.Now()
+	tick := time.NewTicker(previewAnimTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-a.cancel:
+			return
+		case <-tick.C:
+		}
+		if !s.sameWindow(win) {
+			return
+		}
+		t := float64(time.Since(t0)) / float64(previewSlideOutMS*time.Millisecond)
+		if t >= 1 {
+			break
+		}
+		e := easeInQuad(t)
+		x, y := lerpInt(curX, toX, e), lerpInt(curY, toY, e)
+		alpha := byte(float64(fromAlpha) * (1 - e))
+		application.InvokeSync(func() {
+			win.SetPosition(x, y)
+			previewSetAlpha(hwnd, alpha)
+		})
+	}
+	application.InvokeSync(func() { previewSetAlpha(hwnd, 0) })
+	s.commitClose(win)
+}
+
+// commitClose 淡出的收尾：动画没被接管、窗口没被替换才正式关。先置 pvClosing
+// 让 hook 放行这一次 Close，否则会被再拦下来没完没了。
+func (s *PreviewService) commitClose(win *application.WebviewWindow) {
+	s.mu.Lock()
+	if s.pvState != pvFadingOut || s.win != win || !s.alive {
+		s.mu.Unlock()
+		return
+	}
+	s.pvState = pvClosing
+	hwnd := s.hwnd
+	s.mu.Unlock()
+	// 预览还在前台时主动把前台交还主窗，销毁子窗时系统就不会再「补」一次
+	// owner 激活——主窗在关闭那一刻看不到激活切换。用户已 Alt+Tab 去别的
+	// 应用时不抢前台。
+	if hwnd != 0 && foregroundHWND() == hwnd && s.main != nil {
+		application.InvokeSync(func() {
+			if p := s.main.NativeWindow(); p != nil {
+				previewFocusMain(uintptr(p))
+			}
+		})
+	}
+	win.Close()
+}
+
+// redock 复用已开着的预览窗时（主窗可能挪过/改过大小/切过形态）滑回停泊位。
+// 顺带收拾淡入被打断的残局：先恢复不透明、摘掉分层，再滑。
+func (s *PreviewService) redock(win *application.WebviewWindow) {
+	dock, start := s.dockGeometry()
+	s.mu.Lock()
+	s.dock, s.dockStart = dock, start
+	hwnd := s.hwnd
+	s.mu.Unlock()
+	a := s.beginAnim()
+	defer close(a.done)
+	var cur application.Rect
+	application.InvokeSync(func() {
+		previewSetAlpha(hwnd, 255)
+		previewSetLayered(hwnd, false)
+		cur = win.Bounds()
+	})
+	if cur == dock {
+		return
+	}
+	t0 := time.Now()
+	tick := time.NewTicker(previewAnimTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-a.cancel:
+			return
+		case <-tick.C:
+		}
+		if !s.sameWindow(win) {
+			return
+		}
+		t := float64(time.Since(t0)) / float64(previewGlideMS*time.Millisecond)
+		if t >= 1 {
+			break
+		}
+		e := easeOutCubic(t)
+		r := application.Rect{
+			X:      lerpInt(cur.X, dock.X, e),
+			Y:      lerpInt(cur.Y, dock.Y, e),
+			Width:  lerpInt(cur.Width, dock.Width, e),
+			Height: lerpInt(cur.Height, dock.Height, e),
+		}
+		application.InvokeSync(func() { win.SetBounds(r) })
+	}
+	application.InvokeSync(func() { win.SetBounds(dock) })
 }
 
 /* --------------------------------------------------------------------------- */

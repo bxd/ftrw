@@ -31,6 +31,12 @@ const panX = ref(0)
 const panY = ref(0)
 const dragging = ref(false)
 
+// 翻页入场方向：下一条从右滑入、上一条从左滑入，跳转/新开只做淡入。
+// 动画挂在媒体包装层上，载入完成（state=ready）才播放，spinner 期间保持隐藏。
+const enterAnim = ref('pv-fade')
+// 缩放要不要带缓动：滚轮/拖拽必须逐帧跟手，按钮与键盘缩放才加一段短过渡。
+const smoothZoom = ref(false)
+
 const SCALE_LO = 0.2
 const SCALE_HI = 30
 
@@ -84,11 +90,13 @@ function zoomBy(mult: number, cx?: number, cy?: number) {
 
 function setActual() {
   if (!isImage.value) return
+  smoothZoom.value = true
   scale.value = natScale.value || 1
   clampPan()
 }
 
 function fitView() {
+  smoothZoom.value = true
   scale.value = 1
   panX.value = 0
   panY.value = 0
@@ -101,6 +109,7 @@ function toggleFitActual() {
 
 function onWheel(ev: WheelEvent) {
   if (!isImage.value || state.value !== 'ready') return
+  smoothZoom.value = false
   // 触控板的捏合是 ctrl+wheel，步长得比滚轮细得多
   const mult = ev.deltaY < 0 ? (ev.ctrlKey ? 1.04 : 1.18) : 1 / (ev.ctrlKey ? 1.04 : 1.18)
   zoomBy(mult, ev.clientX, ev.clientY)
@@ -110,6 +119,7 @@ let drag: { x: number; y: number; px: number; py: number } | null = null
 
 function onDown(ev: MouseEvent) {
   if (ev.button !== 0 || !canPan.value) return
+  smoothZoom.value = false
   drag = { x: ev.clientX, y: ev.clientY, px: panX.value, py: panY.value }
   dragging.value = true
   window.addEventListener('mousemove', onMove)
@@ -135,6 +145,7 @@ function onUp() {
 
 function show(req: api.PreviewRequest | null | undefined) {
   if (!req || !req.items?.length) return
+  enterAnim.value = 'pv-fade'
   items.value = req.items
   index.value = Math.min(Math.max(0, req.index), req.items.length - 1)
   restart()
@@ -149,12 +160,14 @@ function restart() {
 
 function step(delta: number) {
   if (total.value < 2) return
+  enterAnim.value = delta > 0 ? 'pv-from-right' : 'pv-from-left'
   index.value = (index.value + delta + total.value) % total.value
   restart()
 }
 
 function jump(i: number) {
   if (!total.value) return
+  enterAnim.value = 'pv-fade'
   index.value = Math.min(total.value - 1, Math.max(0, i))
   restart()
 }
@@ -267,6 +280,7 @@ function onKey(ev: KeyboardEvent) {
     case '=':
       if (isImage.value) {
         ev.preventDefault()
+        smoothZoom.value = true
         zoomBy(1.25)
       }
       break
@@ -274,6 +288,7 @@ function onKey(ev: KeyboardEvent) {
     case '_':
       if (isImage.value) {
         ev.preventDefault()
+        smoothZoom.value = true
         zoomBy(1 / 1.25)
       }
       break
@@ -320,9 +335,9 @@ onBeforeUnmount(() => {
   <div class="pv">
     <div class="bar">
       <button :disabled="total < 2" @click="step(-1)" title="上一个（←）">◀</button>
-      <span class="pos">{{ total ? index + 1 : 0 }} / {{ total }}</span>
+      <span class="pos count" :key="index">{{ total ? index + 1 : 0 }} / {{ total }}</span>
       <button :disabled="total < 2" @click="step(1)" title="下一个（→）">▶</button>
-      <span class="badge">{{ kindLabel }}</span>
+      <span class="badge" :class="cur?.kind || 'page'">{{ kindLabel }}</span>
       <span class="name" :title="cur?.url">{{ cur?.name || '—' }}</span>
       <div class="spacer" />
       <template v-if="isImage && state === 'ready'">
@@ -340,10 +355,13 @@ onBeforeUnmount(() => {
         <button class="fb" :disabled="saving" @click="saveAs" :title="saving ? '保存中…' : '另存为本地文件'">⤓</button>
         <button class="fb" @click="toggleMax" :title="maxed ? '还原窗口大小' : '最大化窗口'">{{ maxed ? '❐' : '□' }}</button>
       </div>
-      <div v-if="note" class="note" :class="{ err: noteErr }">{{ note }}</div>
+      <Transition name="pv-toast">
+        <div v-if="note" class="note" :class="{ err: noteErr }">{{ note }}</div>
+      </Transition>
 
       <!-- 媒体元素必须在 loading 就在场：state 只能由它们自己的 load 事件置成 ready，
-           把元素挡在 ready 之后才渲染就等于永远载入中。 -->
+           把元素挡在 ready 之后才渲染就等于永远载入中。入场动画挂在外层包装上，
+           靠 animation-play-state 等到 ready 才播，加载期间元素隐形但照常布局。 -->
       <div v-if="state === 'error'" class="hint err">
         加载失败<br />
         <code>{{ cur?.url }}</code>
@@ -351,21 +369,30 @@ onBeforeUnmount(() => {
       </div>
       <div v-else-if="!cur" class="hint">没有可预览的内容<br /><span class="sub">回到终端点一条超链接试试</span></div>
 
-      <template v-else>
-        <img v-if="cur.kind === 'image'" :key="cur.url" ref="imgEl" :src="cur.url" :style="imgStyle" alt=""
+      <div v-else class="media" :key="cur.url" :class="[enterAnim, { in: state === 'ready' }]">
+        <img v-if="cur.kind === 'image'" ref="imgEl" :src="cur.url" :style="imgStyle"
+             :class="{ smooth: smoothZoom && !dragging }" alt=""
              draggable="false" referrerpolicy="no-referrer"
              @load="onReady" @error="onError" @dblclick="toggleFitActual" @mousedown="onDown" />
-        <video v-else-if="cur.kind === 'video'" :key="cur.url" :src="cur.url" controls autoplay playsinline
+        <video v-else-if="cur.kind === 'video'" :src="cur.url" controls autoplay playsinline
                referrerpolicy="no-referrer" @loadedmetadata="onReady" @error="onError" />
         <div v-else class="audio">
           <div class="anote">♫</div>
           <div class="aname">{{ cur.name }}</div>
-          <audio :key="cur.url" :src="cur.url" controls autoplay referrerpolicy="no-referrer"
+          <audio :src="cur.url" controls autoplay referrerpolicy="no-referrer"
                  @loadedmetadata="onReady" @error="onError" />
         </div>
-      </template>
+      </div>
 
-      <div v-if="cur && state === 'loading'" class="busy">载入中…</div>
+      <Transition name="pv-toast">
+        <div v-if="cur && state === 'loading'" class="busy"><span class="spin" />载入中…</div>
+      </Transition>
+
+      <!-- 多图导航圆点：当前项拉长成药丸，点击直达；条目太多时退回纯计数 -->
+      <div v-if="total > 1 && total <= 24" class="dots">
+        <button v-for="(it, i) in items" :key="it.url + i" class="dot" :class="{ on: i === index }"
+                :title="it.name" @click="jump(i)" />
+      </div>
     </div>
 
     <div class="foot">
@@ -378,41 +405,148 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.pv { display: flex; flex-direction: column; height: 100%; width: 100%; overflow: hidden; background: #14161a; color: #c8ccd4; font-family: system-ui, "Segoe UI", sans-serif; }
+/* 设计令牌与主窗口（App.vue）同源：底色 #1b1d22、面板 #24272e、描边 #33373f、
+   按钮 #2f333b/#3d424b、悬停 #3a3f49、品牌蓝 #6ab0f3/#2f74c0、关闭红 #e05c5c，
+   动效节奏也沿用主窗的 .16s ease-out 一族，两个窗口看起来才像一套东西。 */
+.pv {
+  display: flex; flex-direction: column; height: 100%; width: 100%; overflow: hidden;
+  background: #1b1d22; color: #c8ccd4; font-family: system-ui, "Segoe UI", sans-serif;
+  box-shadow: inset 0 0 0 1px #33373f; /* 与主窗同一套边缘轮廓 */
+  animation: pv-in .22s ease-out both;
+}
+@keyframes pv-in { from { opacity: 0; transform: scale(.985); } to { opacity: 1; transform: none; } }
+
 /* 窗口是 frameless，这条工具栏就是标题栏：空白处可拖，控件本身不参与拖拽。 */
-.bar { display: flex; align-items: center; gap: 6px; padding: 5px 8px; background: #24272e; border-bottom: 1px solid #33373f; flex: 0 0 auto; --wails-draggable: drag; }
-.bar button { background: #2f333b; color: #c8ccd4; border: 1px solid #3d424b; border-radius: 5px; padding: 3px 9px; font-size: 12px; cursor: pointer; --wails-draggable: no-drag; }
-.bar button:hover:not(:disabled) { background: #3a3f49; }
+.bar {
+  position: relative; display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+  background: linear-gradient(180deg, #262a31, #24272e);
+  border-bottom: 1px solid #33373f; flex: 0 0 auto; --wails-draggable: drag;
+}
+/* 栏底一条极细的品牌色光线：蓝→青，借主窗 brand 与站点圆点的两个色相 */
+.bar::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px; pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(106, 176, 243, .5) 22%, rgba(78, 201, 176, .35) 58%, transparent 92%);
+}
+.bar button {
+  background: #2f333b; color: #c8ccd4; border: 1px solid #3d424b; border-radius: 5px;
+  padding: 3px 9px; font-size: 12px; cursor: pointer; --wails-draggable: no-drag;
+  transition: background .12s ease-out, border-color .12s ease-out, color .12s ease-out, transform .06s ease-out;
+}
+.bar button:hover:not(:disabled) { background: #3a3f49; border-color: #4a505b; }
+.bar button:active:not(:disabled) { transform: scale(.96); }
+.bar button:focus-visible { outline: 1px solid #6ab0f3; outline-offset: 1px; }
 .bar button:disabled { opacity: .35; cursor: default; }
 .bar button.close { border-color: #4a4f58; }
 .bar button.close:hover { background: #e05c5c; border-color: #e05c5c; color: #fff; }
 .pos { font-size: 12px; color: #8a919e; font-family: Consolas, monospace; min-width: 44px; text-align: center; }
-.badge { font-size: 11px; color: #6ab0f3; border: 1px solid #33506b; border-radius: 4px; padding: 1px 6px; }
+/* 翻页时计数轻轻跳一下：key 随 index 重建，动画只播一次 */
+.pos.count { animation: pv-pop .18s ease-out; }
+@keyframes pv-pop { from { transform: scale(1.22); color: #6ab0f3; } to { transform: none; } }
+
+/* 类型徽章借主窗站点圆点的色相：图=蓝(ssh)、音=青(tel)、视=琥珀(local) */
+.badge { font-size: 11px; border-radius: 4px; padding: 1px 6px; border: 1px solid #3d424b; color: #8a919e; transition: color .16s ease-out, border-color .16s ease-out, background .16s ease-out; }
+.badge.image { color: #6ab0f3; border-color: #33506b; background: rgba(106, 176, 243, .08); }
+.badge.audio { color: #4ec9b0; border-color: #2c5a50; background: rgba(78, 201, 176, .08); }
+.badge.video { color: #d7b45a; border-color: #5c4d28; background: rgba(215, 180, 90, .08); }
 .name { font-size: 12px; color: #b5bac4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34%; }
 .spacer { flex: 1; min-width: 6px; }
-.stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #101215; }
-.stage img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; }
+
+/* 舞台：中心略亮、四角压暗的晕影，给媒体一层「展厅」般的纵深 */
+.stage {
+  position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden;
+  background: radial-gradient(120% 95% at 50% 42%, #1a1d22 0%, #14161a 62%, #0f1114 100%);
+}
+/* 媒体包装层：入场动画先暂停在首帧（隐形），ready 后才播；
+   加载期间元素照常布局，load 事件才能正常触发。 */
+.media { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; animation-duration: .24s; animation-timing-function: ease-out; animation-fill-mode: both; animation-play-state: paused; }
+.media.in { animation-play-state: running; }
+.pv-fade { animation-name: pv-fade; }
+.pv-from-right { animation-name: pv-from-right; }
+.pv-from-left { animation-name: pv-from-left; }
+@keyframes pv-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pv-from-right { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: none; } }
+@keyframes pv-from-left { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: none; } }
+
+.stage img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; box-shadow: 0 12px 44px rgba(0, 0, 0, .5); }
+/* 按钮/键盘缩放才带缓动；滚轮与拖拽时逐帧跟手，不能拖影 */
+.stage img.smooth { transition: transform .14s ease-out; }
 /* 缩放后才是「拖动看局部」的语义：适应窗口时拖动没有意义，光标也不给抓手 */
 .stage.panning img { cursor: grab; }
 .stage.grabbing img { cursor: grabbing; }
-.stage video { max-width: 100%; max-height: 100%; background: #000; }
-.float { position: absolute; top: 8px; right: 10px; z-index: 6; display: flex; gap: 6px; }
-.float .fb { width: 27px; height: 25px; display: flex; align-items: center; justify-content: center; background: rgba(36, 39, 46, .74); color: #c8ccd4; border: 1px solid rgba(96, 102, 114, .7); border-radius: 5px; font-size: 14px; line-height: 1; cursor: pointer; }
-.float .fb:hover:not(:disabled) { background: #3a3f49; border-color: #6ab0f3; }
+.stage video { max-width: 100%; max-height: 100%; background: #000; box-shadow: 0 12px 44px rgba(0, 0, 0, .5); }
+
+.float { position: absolute; top: 8px; right: 10px; z-index: 6; display: flex; gap: 6px; animation: pv-fade .3s ease-out both; }
+.float .fb {
+  width: 27px; height: 25px; display: flex; align-items: center; justify-content: center;
+  background: rgba(36, 39, 46, .6); color: #c8ccd4; border: 1px solid rgba(96, 102, 114, .7);
+  border-radius: 5px; font-size: 14px; line-height: 1; cursor: pointer; backdrop-filter: blur(6px);
+  transition: background .12s ease-out, border-color .12s ease-out, transform .12s ease-out, box-shadow .12s ease-out;
+}
+.float .fb:hover:not(:disabled) { background: rgba(58, 63, 73, .85); border-color: #6ab0f3; transform: translateY(-1px); box-shadow: 0 3px 12px rgba(106, 176, 243, .22); }
+.float .fb:active:not(:disabled) { transform: scale(.94); }
 .float .fb:disabled { opacity: .45; cursor: default; }
-.note { position: absolute; left: 12px; bottom: 10px; z-index: 6; max-width: 72%; padding: 3px 10px; border-radius: 5px; background: rgba(36, 39, 46, .88); border: 1px solid #3d424b; color: #b5bac4; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.note {
+  position: absolute; left: 12px; bottom: 10px; z-index: 6; max-width: calc(50% - 40px);
+  padding: 3px 10px; border-radius: 5px; background: rgba(36, 39, 46, .88); border: 1px solid #3d424b;
+  color: #b5bac4; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  backdrop-filter: blur(6px); box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+}
 .note.err { color: #e06c5b; border-color: #5c3130; }
-.audio { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 20px; width: min(560px, 90%); }
-.audio .anote { font-size: 48px; color: #4a6b96; }
+/* toast 一族：浮入浮出都从下方轻推一下 */
+.pv-toast-enter-active, .pv-toast-leave-active { transition: opacity .18s ease-out, transform .18s ease-out; }
+.pv-toast-enter-from, .pv-toast-leave-to { opacity: 0; transform: translateY(6px); }
+
+.audio {
+  display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 26px 24px;
+  width: min(560px, 90%); background: #202329; border: 1px solid #33373f; border-radius: 10px;
+  box-shadow: 0 12px 44px rgba(0, 0, 0, .45);
+}
+.audio .anote { font-size: 48px; color: #4ec9b0; animation: pv-breathe 2.6s ease-in-out infinite; }
+@keyframes pv-breathe { 0%, 100% { transform: translateY(0); opacity: .75; } 50% { transform: translateY(-4px); opacity: 1; } }
 .audio .aname { font-size: 13px; color: #b5bac4; word-break: break-all; text-align: center; }
 .audio audio { width: 100%; }
-.hint { color: #6a7180; font-size: 13px; text-align: center; line-height: 1.9; padding: 20px; }
+
+.hint { color: #6a7180; font-size: 13px; text-align: center; line-height: 1.9; padding: 20px; animation: pv-fade .24s ease-out both; }
 .hint.err { color: #e06c5b; }
 .hint code { display: block; margin: 6px auto; max-width: 80vw; overflow: hidden; text-overflow: ellipsis; color: #8a919e; font-size: 12px; word-break: break-all; }
 .hint .sub { color: #6a7180; font-size: 12px; }
+
 /* 载入提示浮在内容上：不能占布局位置，否则会把正在加载的图挤到一边 */
-.busy { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 5; padding: 3px 12px; border-radius: 5px; background: rgba(36, 39, 46, .88); border: 1px solid #3d424b; color: #8a919e; font-size: 12px; }
+.busy {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 5;
+  display: flex; align-items: center; gap: 8px; padding: 4px 14px; border-radius: 999px;
+  background: rgba(36, 39, 46, .88); border: 1px solid #3d424b; color: #8a919e; font-size: 12px;
+  backdrop-filter: blur(6px); box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+}
+/* toast 的位移过渡会覆盖 busy 自己的居中 translateX，这里补回来 */
+.busy.pv-toast-enter-from, .busy.pv-toast-leave-to { transform: translateX(-50%) translateY(-6px); }
+.spin { width: 13px; height: 13px; border-radius: 50%; border: 2px solid rgba(106, 176, 243, .25); border-top-color: #6ab0f3; animation: pv-rot .8s linear infinite; }
+@keyframes pv-rot { to { transform: rotate(360deg); } }
+
+/* 多图导航圆点：当前项拉长成品牌蓝药丸，悬停提亮 */
+.dots {
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 6;
+  display: flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 999px;
+  background: rgba(36, 39, 46, .6); border: 1px solid rgba(96, 102, 114, .5); backdrop-filter: blur(6px);
+  animation: pv-fade .3s ease-out both;
+}
+.dots .dot {
+  width: 7px; height: 7px; border-radius: 999px; padding: 0; border: none; cursor: pointer;
+  background: #565d69; transition: width .2s ease-out, background .16s ease-out, transform .12s ease-out;
+}
+.dots .dot:hover { background: #8a919e; transform: scale(1.25); }
+.dots .dot.on { width: 20px; background: #6ab0f3; box-shadow: 0 0 8px rgba(106, 176, 243, .5); }
+.dots .dot.on:hover { transform: none; }
+
 /* 底栏不当拖拽区：那行完整 URL 得能选中复制 */
 .foot { display: flex; align-items: center; gap: 14px; padding: 3px 10px; background: #24272e; border-top: 1px solid #33373f; font-size: 11px; color: #6a7180; flex: 0 0 auto; height: 22px; }
 .foot .url { color: #4d5460; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+
+/* 系统开了「减少动态效果」时全部动画退化为瞬时，功能不受影响 */
+@media (prefers-reduced-motion: reduce) {
+  .pv, .media, .pos.count, .float, .hint, .dots, .audio .anote, .spin { animation: none !important; }
+  .pv, .media, .float, .hint, .dots { opacity: 1 !important; transform: none !important; }
+  .stage img.smooth, .bar button, .float .fb, .dots .dot { transition: none !important; }
+}
 </style>

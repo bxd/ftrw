@@ -165,7 +165,11 @@ func (s *LauncherService) ensureWindow() error {
 		Hidden:           true,
 		URL:              launcherPageURL,
 		BackgroundColour: application.NewRGB(24, 26, 30),
-		Windows:          application.WindowsWindow{HiddenOnTaskbar: true},
+		Windows: application.WindowsWindow{
+			HiddenOnTaskbar: true,
+			// 与主窗/预览窗同一套：关掉逐激活的 DWM 装饰，避免呼出时闪一下。
+			DisableFramelessWindowDecorations: true,
+		},
 	})
 	if win == nil {
 		return errors.New("创建启动器窗口失败")
@@ -176,6 +180,7 @@ func (s *LauncherService) ensureWindow() error {
 		if p := win.NativeWindow(); p != nil {
 			hwnd = uintptr(p)
 		}
+		setWindowRoundCorners(hwnd)
 	})
 
 	// 失焦即收起：与 quake 的 blur hook 同形状。护栏置位期间（本窗可见期间）主窗
