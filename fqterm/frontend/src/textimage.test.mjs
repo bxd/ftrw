@@ -1,20 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { renderTextImage } from './textimage.ts'
+import { renderTextImage, TEXT_IMAGE_DEFAULTS, textImageFileName } from './textimage.ts'
 
 const baseOptions = {
   text: '短文字',
-  width: 800,
-  fontSize: 24,
-  foreground: '#202020',
-  background: '#ffffff',
-  padding: 28,
-  lineGap: 8,
+  ...TEXT_IMAGE_DEFAULTS,
 }
 
 function mockCanvas(t, measure = (text) => Array.from(text).length * 10) {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'document')
   const drawn = []
+  const painted = []
   const canvas = {
     width: 0,
     height: 0,
@@ -25,8 +21,8 @@ function mockCanvas(t, measure = (text) => Array.from(text).length * 10) {
         fillStyle: '',
         textBaseline: '',
         measureText(text) { return { width: measure(text) } },
-        fillRect() {},
-        fillText(text) { drawn.push(text) },
+        fillRect() { painted.push({ fillStyle: this.fillStyle, text: null }) },
+        fillText(text) { drawn.push(text); painted.push({ fillStyle: this.fillStyle, text }) },
       }
     },
     toDataURL(type) {
@@ -48,8 +44,25 @@ function mockCanvas(t, measure = (text) => Array.from(text).length * 10) {
     if (previous) Object.defineProperty(globalThis, 'document', previous)
     else delete globalThis.document
   })
-  return { canvas, drawn }
+  return { canvas, drawn, painted }
 }
+
+test('文字图片默认黑底白字', async (t) => {
+  const { painted } = mockCanvas(t)
+  assert.equal(TEXT_IMAGE_DEFAULTS.foreground, '#ffffff')
+  assert.equal(TEXT_IMAGE_DEFAULTS.background, '#000000')
+  await renderTextImage(baseOptions)
+  assert.deepEqual(painted, [
+    { fillStyle: '#000000', text: null },
+    { fillStyle: '#ffffff', text: '短文字' },
+  ])
+})
+
+test('文字图片文件名只含 ASCII，并按本地时间补齐日期时间', () => {
+  const name = textImageFileName(new Date(2026, 0, 2, 3, 4, 5))
+  assert.equal(name, 'text-image-20260102-030405')
+  assert.match(name, /^[A-Za-z0-9-]+$/)
+})
 
 test('短文字图片按最长行收缩宽度，不再保留配置宽度右侧空白', async (t) => {
   const { canvas, drawn } = mockCanvas(t)

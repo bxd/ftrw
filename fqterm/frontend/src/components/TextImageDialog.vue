@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import * as api from '../api'
-import { renderTextImage } from '../textimage'
+import { renderTextImage, TEXT_IMAGE_DEFAULTS, textImageFileName } from '../textimage'
 
 const props = defineProps<{ initialText: string }>()
 const emit = defineEmits<{
@@ -11,12 +11,7 @@ const emit = defineEmits<{
 
 const opts = reactive({
   text: props.initialText,
-  width: 800,
-  fontSize: 24,
-  foreground: '#202020',
-  background: '#ffffff',
-  padding: 28,
-  lineGap: 8,
+  ...TEXT_IMAGE_DEFAULTS,
 })
 const preview = ref('')
 const size = ref({ width: 0, height: 0 })
@@ -52,9 +47,7 @@ async function add() {
   error.value = ''
   try {
     const result = await renderTextImage({ ...opts, text: opts.text })
-    const now = new Date()
-    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
-    const path = await api.SaveEditorImage(`文字图片-${stamp}`, result.dataUrl)
+    const path = await api.SaveEditorImage(textImageFileName(new Date()), result.dataUrl)
     const stat = await api.FileStat(path)
     emit('add', { name: stat.name, path: stat.path, size: stat.size, generated: true })
   } catch (e: any) {

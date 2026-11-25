@@ -14,6 +14,21 @@ export interface TextImageResult {
   height: number
 }
 
+export const TEXT_IMAGE_DEFAULTS: Omit<TextImageOptions, 'text'> = {
+  width: 800,
+  fontSize: 24,
+  foreground: '#ffffff',
+  background: '#000000',
+  padding: 28,
+  lineGap: 8,
+}
+
+/** 附件名只使用 ASCII，避免 BBS 页面和 ZMODEM 链路处理中文文件名。 */
+export function textImageFileName(now: Date): string {
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
+  return `text-image-${stamp}`
+}
+
 /** 按显示宽度折行；中文与 ASCII 都逐码点测量，避免把代理对拆成两半。 */
 function wrapLine(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
   if (!text) return ['']
