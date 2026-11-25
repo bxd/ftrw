@@ -106,6 +106,8 @@ type Session struct {
 	uploadFiles []string     // pending ZMODEM upload (sender) files
 	zmCancel    atomic.Bool  // ZMODEM 传输取消请求（进度弹窗的取消按钮置位，引擎在检查点响应）
 	zmCooldown  atomic.Int64 // 取消冷却截止（UnixNano）：期内丢弃在途残留 ZMODEM 帧，防误启假会话
+	zmDrain     atomic.Bool  // 异常退出后丢弃残留二进制，直到数据静默超过 zmDrainQuiet
+	zmLastRaw   atomic.Int64 // 最近一次残留二进制接收时刻（UnixNano），用于静默窗口判定
 
 	// 空闲保活 / 自动重连 / 自动登录（对齐原版 idleTimer_、reconnectProcess、doAutoLogin 语义）
 	lastAct      atomic.Int64 // 最近一次用户输入时刻（UnixNano）：防空闲据此判定静默时长
@@ -120,6 +122,23 @@ type Session struct {
 	loginAt    atomic.Int64 // 进入当前阶段的时刻（UnixNano），超时兜底推进
 	tailMu     sync.Mutex
 	tail       []byte // 最近输出纯文本副本（已剔 ANSI），用于登录提示匹配
+}
+
+// zmDrainQuiet 是 ZMODEM 异常退出后的残留二进制静默窗口。
+// 水木服务端可能继续发送多批裸子包；只要仍连续到达就丢弃，静默后再恢复终端解码。
+const zmDrainQuiet = 2 * time.Second
+
+func (s *Session) discardZmodemTail(now time.Time) bool {
+	if !s.zmDrain.Load() {
+		return false
+	}
+	last := s.zmLastRaw.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) >= zmDrainQuiet {
+		s.zmDrain.Store(false)
+		return false
+	}
+	s.zmLastRaw.Store(now.UnixNano())
+	return true
 }
 
 var sessionSeq int64
@@ -283,24 +302,32 @@ func (ts *TerminalService) readLoop(s *Session) {
 		n, err := conn.Read(buf)
 		if n > 0 {
 			raw := buf[:n]
+			handled := false
 			if s.Site.EnableZmodem {
-				ts.dbgChunk(raw)
-				if detectZmodem(raw) {
-					// 取消后的冷却期：服务器 rz 退出前在途回发的 ZACK/ZRPOS 残留在 TCP 缓冲里，
-					// 若再次触发 runZmodem 会误启假会话并向 BBS 广播 ZRINIT，被主程序当用户输入
-					// 读进命令行导致失去交互。冷却期内直接丢弃这类残留帧。
-					if cd := s.zmCooldown.Load(); cd != 0 && time.Now().UnixNano() < cd {
-						ts.dbg("readLoop: 冷却期内丢弃残留 ZMODEM 帧 len=%d", len(raw))
-						continue
+				if s.discardZmodemTail(time.Now()) {
+					ts.dbg("readLoop: 丢弃 ZMODEM 异常退出后的残留二进制 len=%d", len(raw))
+					handled = true
+				} else {
+					ts.dbgChunk(raw)
+					if detectZmodem(raw) {
+						// 取消后的冷却期：服务器 rz 退出前在途回发的 ZACK/ZRPOS 残留在 TCP 缓冲里，
+						// 若再次触发 runZmodem 会误启假会话并向 BBS 广播 ZRINIT，被主程序当用户输入
+						// 读进命令行导致失去交互。冷却期内直接丢弃这类残留帧。
+						if cd := s.zmCooldown.Load(); cd != 0 && time.Now().UnixNano() < cd {
+							ts.dbg("readLoop: 冷却期内丢弃残留 ZMODEM 帧 len=%d", len(raw))
+						} else {
+							ts.runZmodem(s, raw)
+						}
+						handled = true
 					}
-					ts.runZmodem(s, raw)
-					continue
 				}
 			}
-			text := s.cdc.decode(raw)
-			if len(text) > 0 {
-				ts.emitData(s.ID, string(text))
-				ts.feedLogin(s, text) // 自动登录：扇入输出流匹配登录提示
+			if !handled {
+				text := s.cdc.decode(raw)
+				if len(text) > 0 {
+					ts.emitData(s.ID, string(text))
+					ts.feedLogin(s, text) // 自动登录：扇入输出流匹配登录提示
+				}
 			}
 		}
 		if err != nil {
@@ -360,6 +387,7 @@ func (ts *TerminalService) Write(id string, text string) error {
 		return errors.New("not connected")
 	}
 	s.lastAct.Store(time.Now().UnixNano()) // 用户有输入即重新计时（等价原版 leaveIdle）
+	s.zmDrain.Store(false)                 // 用户主动输入时恢复终端输出，避免残留丢弃状态吞掉后续提示
 	_, err := s.conn.Write(b)
 	return err
 }
@@ -424,6 +452,7 @@ func (ts *TerminalService) SendFile(id string, paths []string) error {
 		return errors.New("no files selected")
 	}
 	s.zmCooldown.Store(0) // 用户主动发起新上传，解除取消后的残留帧冷却，保证 rz 的 ZRINIT 能被识别
+	s.zmDrain.Store(false)
 	s.uploadFiles = paths
 	return ts.Write(id, "rz\r")
 }
@@ -437,6 +466,8 @@ func (ts *TerminalService) CancelTransfer(id string) error {
 		return errors.New("session not found")
 	}
 	s.zmCancel.Store(true)
+	s.zmDrain.Store(true)
+	s.zmLastRaw.Store(time.Now().UnixNano())
 	s.zmCooldown.Store(time.Now().Add(3 * time.Second).UnixNano())
 	if s.conn != nil {
 		if rd, ok := s.conn.(interface{ SetReadDeadline(time.Time) error }); ok {

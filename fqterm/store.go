@@ -270,8 +270,23 @@ func (s *Store) SaveFMState() error {
 	return s.saveJSON("fmstate.json", s.FMState)
 }
 
-// Dir returns the config directory (used for default zmodem download path).
+// Dir returns the config directory.
 func (s *Store) Dir() string { return s.dir }
+
+// DownloadDir 是 ZMODEM 下载与下载管理器共用的根目录。留空时默认落在程序所在
+// 目录下的 download；只有取不到 exe 路径时才退回配置目录。
+func (s *Store) DownloadDir() string {
+	s.mu.RLock()
+	configured, configDir := s.Prefs.ZmodemDir, s.dir
+	s.mu.RUnlock()
+	if configured != "" {
+		return configured
+	}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "download")
+	}
+	return filepath.Join(configDir, "download")
+}
 
 func defaultSchemes() []ColorScheme {
 	green := ColorScheme{

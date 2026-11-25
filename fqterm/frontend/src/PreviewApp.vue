@@ -4,7 +4,7 @@
  *
  * 网页模式不会走到这里 —— 那时后端把整个 webview 顶层导航到对方站点（水木一类
  * 发 X-Frame-Options 的页面嵌套不进来，只能这么绕），这一页的脚本也就不在场了。
- * 所以这个组件只管三件事：放图片/音频/视频、在这一屏采到的媒体之间循环、ESC 关窗。
+ * 所以这个组件只管三件事：放图片/音频/视频/文本/PDF/文件、在这一组内容之间循环、ESC 关窗。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as api from './api'
@@ -18,6 +18,8 @@ const maxed = ref(false)
 const saving = ref(false)
 const note = ref('')
 const noteErr = ref(false)
+const textContent = ref('')
+let textLoadSeq = 0
 
 /* --- 图片视图：滚轮缩放 + 左键平移 ------------------------------------------ */
 
@@ -43,7 +45,11 @@ const SCALE_HI = 30
 const cur = computed<api.PreviewItem | null>(() => items.value[index.value] ?? null)
 const total = computed(() => items.value.length)
 const isImage = computed(() => cur.value?.kind === 'image')
-const kindLabel = computed(() => ({ image: '图片', audio: '音频', video: '视频', page: '网页' }[cur.value?.kind || 'page'] || '链接'))
+const isLocal = computed(() => !!cur.value?.path)
+const kindLabel = computed(() => ({
+  image: '图片', audio: '音频', video: '视频', page: '网页',
+  text: '文本', pdf: 'PDF', file: '文件',
+}[cur.value?.kind || 'page'] || '文件'))
 const pct = computed(() => Math.round((scale.value / (natScale.value || 1)) * 100))
 const canPan = computed(() => isImage.value && scale.value > 1.001)
 const imgStyle = computed(() => {
@@ -109,6 +115,7 @@ function toggleFitActual() {
 
 function onWheel(ev: WheelEvent) {
   if (!isImage.value || state.value !== 'ready') return
+  ev.preventDefault()
   smoothZoom.value = false
   // 触控板的捏合是 ctrl+wheel，步长得比滚轮细得多
   const mult = ev.deltaY < 0 ? (ev.ctrlKey ? 1.04 : 1.18) : 1 / (ev.ctrlKey ? 1.04 : 1.18)
@@ -155,7 +162,38 @@ function show(req: api.PreviewRequest | null | undefined) {
 function restart() {
   resetView()
   setNote('')
-  state.value = cur.value ? 'loading' : 'empty'
+  textContent.value = ''
+  textLoadSeq++
+  const item = cur.value
+  state.value = item ? 'loading' : 'empty'
+  if (!item) return
+  if (item.kind === 'file') {
+    state.value = 'ready'
+  } else if (item.kind === 'text') {
+    void loadText(item)
+  }
+}
+
+/** 正文优先按严格 UTF-8 解；水木文章通常是 GBK，失败后再按 GBK 显示。 */
+async function loadText(item: api.PreviewItem) {
+  const seq = textLoadSeq
+  try {
+    const res = await fetch(item.url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const bytes = await res.arrayBuffer()
+    let text: string
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      text = new TextDecoder('gbk').decode(bytes)
+    }
+    if (seq !== textLoadSeq || cur.value?.url !== item.url) return
+    textContent.value = text
+    state.value = 'ready'
+  } catch {
+    if (seq !== textLoadSeq || cur.value?.url !== item.url) return
+    state.value = 'error'
+  }
 }
 
 function step(delta: number) {
@@ -183,7 +221,8 @@ async function close() {
 async function openExternal() {
   if (!cur.value) return
   try {
-    await api.OpenExternalURL(cur.value.url)
+    if (cur.value.path) await api.FileOpenPath(cur.value.path)
+    else await api.OpenExternalURL(cur.value.url)
   } catch {
     state.value = 'error'
   }
@@ -345,14 +384,16 @@ onBeforeUnmount(() => {
         <button @click="fitView" title="缩回适应窗口（空格 / 0）">适应</button>
         <button @click="setActual" title="按原始像素显示 1:1（双击图片 / 空格 / 1）">1:1</button>
       </template>
-      <button @click="openExternal" title="交给系统默认浏览器（防盗链拦不住它）">↗ 浏览器</button>
+      <button @click="openExternal" :title="isLocal ? '交给系统默认程序打开' : '交给系统默认浏览器（防盗链拦不住它）'">
+        {{ isLocal ? '↗ 打开' : '↗ 浏览器' }}
+      </button>
       <button class="close" @click="close" title="关闭预览（ESC）">✕ 关闭</button>
     </div>
 
-    <div class="stage" ref="stageEl" :class="{ panning: canPan, grabbing: dragging }" @wheel.prevent="onWheel">
+    <div class="stage" ref="stageEl" :class="{ panning: canPan, grabbing: dragging }" @wheel="onWheel">
       <!-- 右上角浮动按钮：贴在内容区上沿，不跟工具栏挤在一起 -->
       <div v-if="cur" class="float">
-        <button class="fb" :disabled="saving" @click="saveAs" :title="saving ? '保存中…' : '另存为本地文件'">⤓</button>
+        <button v-if="!isLocal" class="fb" :disabled="saving" @click="saveAs" :title="saving ? '保存中…' : '另存为本地文件'">⤓</button>
         <button class="fb" @click="toggleMax" :title="maxed ? '还原窗口大小' : '最大化窗口'">{{ maxed ? '❐' : '□' }}</button>
       </div>
       <Transition name="pv-toast">
@@ -364,8 +405,8 @@ onBeforeUnmount(() => {
            靠 animation-play-state 等到 ready 才播，加载期间元素隐形但照常布局。 -->
       <div v-if="state === 'error'" class="hint err">
         加载失败<br />
-        <code>{{ cur?.url }}</code>
-        <div class="sub">可能是防盗链、需要登录、或地址已经失效。可以试「↗ 浏览器」。</div>
+        <code>{{ cur?.path || cur?.url }}</code>
+        <div class="sub">可能是防盗链、需要登录、或地址已经失效。可以试右上角的打开按钮。</div>
       </div>
       <div v-else-if="!cur" class="hint">没有可预览的内容<br /><span class="sub">回到终端点一条超链接试试</span></div>
 
@@ -376,11 +417,20 @@ onBeforeUnmount(() => {
              @load="onReady" @error="onError" @dblclick="toggleFitActual" @mousedown="onDown" />
         <video v-else-if="cur.kind === 'video'" :src="cur.url" controls autoplay playsinline
                referrerpolicy="no-referrer" @loadedmetadata="onReady" @error="onError" />
-        <div v-else class="audio">
+        <div v-else-if="cur.kind === 'audio'" class="audio">
           <div class="anote">♫</div>
           <div class="aname">{{ cur.name }}</div>
           <audio :src="cur.url" controls autoplay referrerpolicy="no-referrer"
                  @loadedmetadata="onReady" @error="onError" />
+        </div>
+        <pre v-else-if="cur.kind === 'text'" class="text-view" tabindex="0">{{ textContent }}</pre>
+        <iframe v-else-if="cur.kind === 'pdf'" class="pdf-view" :src="cur.url"
+                @load="onReady" @error="onError" />
+        <div v-else class="file-card">
+          <div class="ficon">▤</div>
+          <div class="fname">{{ cur.name }}</div>
+          <div class="fpath">{{ cur.path || cur.url }}</div>
+          <button @click="openExternal">用系统默认程序打开</button>
         </div>
       </div>
 
@@ -399,7 +449,7 @@ onBeforeUnmount(() => {
       <span>ESC 关闭</span><span>← / → 翻页</span>
       <span v-if="isImage">滚轮缩放 · 按住左键拖动</span>
       <div class="spacer" />
-      <span class="url" :title="cur?.url">{{ cur?.url }}</span>
+      <span class="url" :title="cur?.path || cur?.url">{{ cur?.path || cur?.url }}</span>
     </div>
   </div>
 </template>
@@ -448,6 +498,9 @@ onBeforeUnmount(() => {
 .badge.image { color: #6ab0f3; border-color: #33506b; background: rgba(106, 176, 243, .08); }
 .badge.audio { color: #4ec9b0; border-color: #2c5a50; background: rgba(78, 201, 176, .08); }
 .badge.video { color: #d7b45a; border-color: #5c4d28; background: rgba(215, 180, 90, .08); }
+.badge.text { color: #9fc6ff; border-color: #3c5273; background: rgba(159, 198, 255, .08); }
+.badge.pdf { color: #ef8b82; border-color: #693d3a; background: rgba(239, 139, 130, .08); }
+.badge.file { color: #b8a7e8; border-color: #4f456d; background: rgba(184, 167, 232, .08); }
 .name { font-size: 12px; color: #b5bac4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34%; }
 .spacer { flex: 1; min-width: 6px; }
 
@@ -474,6 +527,27 @@ onBeforeUnmount(() => {
 .stage.panning img { cursor: grab; }
 .stage.grabbing img { cursor: grabbing; }
 .stage video { max-width: 100%; max-height: 100%; background: #000; box-shadow: 0 12px 44px rgba(0, 0, 0, .5); }
+
+/* 正文占满内容区并自行滚动；保留换行与缩进，长行允许折行。 */
+.text-view {
+  width: 100%; height: 100%; margin: 0; padding: 24px 28px; box-sizing: border-box; overflow: auto;
+  color: #c8ccd4; background: #181b20; text-align: left; white-space: pre-wrap; word-break: break-word;
+  font: 13px/1.7 Consolas, "Cascadia Mono", "Microsoft YaHei", monospace;
+}
+.pdf-view { width: 100%; height: 100%; border: 0; background: #fff; }
+.file-card {
+  display: flex; flex-direction: column; align-items: center; gap: 12px; width: min(560px, 90%);
+  padding: 30px 28px; background: #202329; border: 1px solid #33373f; border-radius: 10px;
+  box-shadow: 0 12px 44px rgba(0, 0, 0, .45); text-align: center;
+}
+.file-card .ficon { font-size: 52px; color: #b8a7e8; line-height: 1; }
+.file-card .fname { font-size: 15px; color: #d8dce4; word-break: break-all; }
+.file-card .fpath { max-width: 100%; color: #777f8d; font-size: 12px; word-break: break-all; }
+.file-card button {
+  margin-top: 4px; padding: 6px 14px; color: #c8ccd4; background: #2f333b;
+  border: 1px solid #4a505b; border-radius: 5px; cursor: pointer;
+}
+.file-card button:hover { background: #3a3f49; border-color: #6ab0f3; }
 
 .float { position: absolute; top: 8px; right: 10px; z-index: 6; display: flex; gap: 6px; animation: pv-fade .3s ease-out both; }
 .float .fb {

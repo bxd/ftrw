@@ -12,8 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"golang.org/x/text/transform"
 )
 
 // ---- ZMODEM protocol constants (fqterm zmodem.h / Oden spec) ----
@@ -158,21 +160,121 @@ type ZmodemProgress struct {
 	Message   string `json:"message"`
 }
 
+// ZmodemDownloaded is emitted on event "zmodem:downloaded" after a receive has
+// been saved and, when possible, split into article body and attachments.
+// Paths is in preview order: body first, then attachments in their original order.
+// For an ordinary file or a failed split it contains only the original file.
+type ZmodemDownloaded struct {
+	ID        string   `json:"id"`
+	Direction string   `json:"direction"`
+	Filename  string   `json:"filename"`
+	Directory string   `json:"directory"`
+	Paths     []string `json:"paths"`
+	Split     bool     `json:"split"`
+	Size      int64    `json:"size"`
+}
+
 func isHexDigit(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
-// detectZmodem strictly matches the canonical ZMODEM header introducer.
-// 与 FQTerm IdleChar 一致：ZDLE 前必须有 ZPAD('*')。hex 帧为 `**X`、
-// 二进制帧为 `*X`，两者都含子串 `ZPAD ZDLE`。旧版额外匹配“裸 ZDLE+格式字节”
-// 会把屏幕数据里偶发的 0x18 'A'/'B'/'C' 误判为帧头。
+// detectZmodem 只接受能通过帧头 CRC 校验的 ZMODEM 头。
+// 仅匹配 `* ZDLE` 会把 JPEG 等二进制数据里的随机字节误判为新会话；
+// 会话异常退出后，这些假会话会分块吞掉数据，间隙又把二进制泄漏到终端。
 func detectZmodem(raw []byte) bool {
-	for i := 0; i+1 < len(raw); i++ {
-		if raw[i] == zpad && raw[i+1] == zdle {
-			return true // ZPAD ZDLE ...
+	for i := 0; i+2 < len(raw); i++ {
+		if raw[i] != zpad || raw[i+1] != zdle {
+			continue
+		}
+		switch raw[i+2] {
+		case zhex:
+			if validZHexHeader(raw[i+3:]) {
+				return true
+			}
+		case zbin, zbin32:
+			if validZBinHeader(raw[i+3:], raw[i+2] == zbin32) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func validZHexHeader(raw []byte) bool {
+	var hx []byte
+	for _, c := range raw {
+		if len(hx) == 16 {
+			break
+		}
+		if !isHexDigit(c) {
+			break
+		}
+		hx = append(hx, c)
+	}
+	if len(hx) != 14 && len(hx) != 16 {
+		return false
+	}
+	b := make([]byte, len(hx)/2)
+	for i := range b {
+		b[i] = byte(hexVal(hx[i*2])<<4 | hexVal(hx[i*2+1]))
+	}
+	want := binary.BigEndian.Uint16(b[5:7])
+	got := crc16XMODEM(b[:5])
+	return got == want || crc16XMODEM(append(append([]byte{}, b[:5]...), 0, 0)) == want
+}
+
+func readZWireByte(raw []byte, idx *int) (byte, bool) {
+	if *idx >= len(raw) {
+		return 0, false
+	}
+	c := raw[*idx]
+	*idx++
+	if c == '\r' && *idx < len(raw) && raw[*idx] == 0 {
+		*idx++
+	}
+	return c, true
+}
+
+func readZBinHeaderByte(raw []byte, idx *int) (byte, bool) {
+	c, ok := readZWireByte(raw, idx)
+	if !ok || c != zdle {
+		return c, ok
+	}
+	escaped, ok := readZWireByte(raw, idx)
+	if !ok {
+		return 0, false
+	}
+	return unescape(escaped), true
+}
+
+func validZBinHeader(raw []byte, crc32f bool) bool {
+	idx := 0
+	var h [5]byte
+	for i := range h {
+		c, ok := readZBinHeaderByte(raw, &idx)
+		if !ok {
+			return false
+		}
+		h[i] = c
+	}
+	crcLen := 2
+	if crc32f {
+		crcLen = 4
+	}
+	b := make([]byte, crcLen)
+	for i := range b {
+		c, ok := readZBinHeaderByte(raw, &idx)
+		if !ok {
+			return false
+		}
+		b[i] = c
+	}
+	if crc32f {
+		return zcrc32(h[:]) == binary.LittleEndian.Uint32(b)
+	}
+	want := binary.BigEndian.Uint16(b)
+	got := crc16XMODEM(h[:])
+	return got == want || crc16XMODEM(append(append([]byte{}, h[:]...), 0, 0)) == want
 }
 
 // zmodemEngine drives one ZMODEM session on top of a protoConn.
@@ -212,11 +314,12 @@ func (ts *TerminalService) dbgChunk(raw []byte) {
 
 // frame is a parsed ZMODEM header + optional data payload.
 type frame struct {
-	typ   byte
-	pos   uint32
-	data  []byte
-	subch byte
-	crcOK bool
+	typ    byte
+	pos    uint32
+	data   []byte
+	subch  byte
+	crc32f bool // 帧头为 ZBIN32：帧内后续裸子包的 CRC 也是 CRC32（LE）
+	crcOK  bool
 }
 
 func (ts *TerminalService) runZmodem(s *Session, initial []byte) {
@@ -225,14 +328,12 @@ func (ts *TerminalService) runZmodem(s *Session, initial []byte) {
 			ts.emitData(s.ID, fmt.Sprintf("\r\n\x1b[31m[ZMODEM 异常: %v]\x1b[0m\r\n", r))
 		}
 	}()
-	dlDir := ts.store.Prefs.ZmodemDir
-	if dlDir == "" {
-		dlDir = filepath.Join(ts.store.Dir(), "downloads")
-	}
+	dlDir := ts.store.DownloadDir()
 	os.MkdirAll(dlDir, 0o755)
 	_ = initial
 	s.zmCancel.Store(false) // 新一轮传输，清除上一轮可能残留的取消标志
 	s.zmCooldown.Store(0)   // 会话已正式启动，解除残留帧冷却
+	s.zmDrain.Store(false)  // 新会话开始时恢复终端输出
 	s.zmActive.Store(true)  // 传输期间防空闲必须静默（注入的 NUL 会打乱帧流）
 	defer s.zmActive.Store(false)
 	e := &zmodemEngine{sess: s, rwc: s.conn, dlDir: dlDir, direction: "recv", prebuf: initial, ts: ts, dbgOn: ts.dbgPath != ""}
@@ -241,11 +342,20 @@ func (ts *TerminalService) runZmodem(s *Session, initial []byte) {
 		e.direction = "send"
 		s.uploadFiles = nil
 	}
-	if err := e.run(); err != nil {
-		if !errors.Is(err, errCancelled) { // 取消已由 checkCancel 上报过 cancelled，不重复报错误
+	err := e.run()
+	if err != nil {
+		if !errors.Is(err, errCancelled) && !errors.Is(err, errNotZmodem) {
 			e.progress("error", "", 0, 0, "ZMODEM: "+err.Error())
 		}
+		// 异常/误判退出后，TCP 缓冲里可能仍有大量裸二进制子包。
+		// readLoop 在静默窗口内继续丢弃，避免重新解码成终端乱码。
+		s.zmDrain.Store(true)
+		s.zmLastRaw.Store(time.Now().UnixNano())
+		s.zmCooldown.Store(time.Now().Add(3 * time.Second).UnixNano())
 	}
+	// 接收循环会设逐帧读超时，退出时一律清除：陈旧 deadline 若留给 readLoop，
+	// 下一次正常 Read 会被误杀成超时、连接被平白判死断开。
+	e.setReadDeadline(time.Time{})
 	ts.emitData(s.ID, "\r\n")
 }
 
@@ -270,6 +380,30 @@ func (e *zmodemEngine) rxByte() (byte, error) {
 	}
 }
 
+// unread 把一个多读到的字节退回读流头部。
+func (e *zmodemEngine) unread(c byte) {
+	e.prebuf = append([]byte{c}, e.prebuf...)
+}
+
+// rxBinaryByte 读取 ZMODEM 二进制段，并还原 Telnet 对 CR 的 NUL 展开。
+// 水木的 sz 会直接把数据中的 0x0d 发给 Telnet 层，链路随后插入 0x00；
+// 这个 NUL 不属于文件内容，也不算 ZMODEM CRC，必须在转义解码前消费掉。
+func (e *zmodemEngine) rxBinaryByte() (byte, error) {
+	c, err := e.rxByte()
+	if err != nil || c != '\r' {
+		return c, err
+	}
+	next, err := e.rxByte()
+	if err != nil {
+		return 0, err
+	}
+	if next == 0 {
+		return c, nil
+	}
+	e.unread(next)
+	return c, nil
+}
+
 func (e *zmodemEngine) writeRaw(b []byte) error {
 	e.sess.writeMu.Lock()
 	defer e.sess.writeMu.Unlock()
@@ -291,14 +425,35 @@ func (e *zmodemEngine) setReadDeadline(d time.Time) {
 }
 
 func (e *zmodemEngine) progress(state, name string, size, done int64, msg string) {
-	application.Get().Event.Emit("zmodem:progress", &ZmodemProgress{
+	app := application.Get()
+	if app == nil { // 单元测试不启动 Wails 应用，事件静默丢弃
+		return
+	}
+	app.Event.Emit("zmodem:progress", &ZmodemProgress{
 		ID: e.sess.ID, Direction: e.direction, Filename: name,
 		Size: size, Done: done, State: state, Message: msg,
 	})
 }
 
+func (e *zmodemEngine) emitDownloaded(name, dir string, paths []string, split bool, size int64) {
+	app := application.Get()
+	if app == nil {
+		return
+	}
+	app.Event.Emit("zmodem:downloaded", &ZmodemDownloaded{
+		ID: e.sess.ID, Direction: e.direction, Filename: name, Directory: dir,
+		Paths: paths, Split: split, Size: size,
+	})
+}
+
 // errCancelled 表示用户通过进度弹窗取消了传输，区别于真实协议错误。
 var errCancelled = errors.New("zmodem: 已取消")
+
+// errSessionFinished 表示 receiveFile 已替外层完成 ZFIN 握手，receiver 不应再等待下一帧。
+var errSessionFinished = errors.New("zmodem: session finished")
+
+// errNotZmodem 表示自动检测命中的字节没有合法开场帧；不报传输错误，但需进入残留数据丢弃窗口。
+var errNotZmodem = errors.New("zmodem: no valid opening frame")
 
 // abortSeq 是 FQTerm ZmodemAbort(行 748-750) 的中止序列：CAN×8 + BS×10。
 // lrzsz 类服务器 rz/sz 收到连续 CAN 会立即退出并回到命令提示符。
@@ -359,14 +514,16 @@ func (e *zmodemEngine) readFrame() (frame, error) {
 		case zhex:
 			fr, ferr := e.readHexFrame()
 			if ferr != nil {
-				continue // 畸形帧，重新同步
+				return frame{}, ferr // 流级错误（EOF/超时）必须上报，只有帧前噪声在上方扫描循环里重新同步
 			}
+			e.dbg("recv frame: typ=%d pos=%d data=%d subch=%c crc32=%v crcOK=%v", fr.typ, fr.pos, len(fr.data), fr.subch, fr.crc32f, fr.crcOK)
 			return fr, nil
 		case zbin, zbin32:
 			fr, ferr := e.readBinFrame(f == zbin32)
 			if ferr != nil {
-				continue
+				return frame{}, ferr
 			}
+			e.dbg("recv frame: typ=%d pos=%d data=%d subch=%c crc32=%v crcOK=%v", fr.typ, fr.pos, len(fr.data), fr.subch, fr.crc32f, fr.crcOK)
 			return fr, nil
 		default:
 			continue
@@ -378,25 +535,20 @@ func (e *zmodemEngine) readHexFrame() (frame, error) {
 	// 长度容错：本服务器发 14 位 hex（7 字节），标准 lrzsz 发 16 位；
 	// 读到非 hex 字符（行尾 CR）即结束，最多取 16 位。
 	var hx []byte
+	var end byte
 	for len(hx) < 16 {
 		c, err := e.rxByte()
 		if err != nil {
 			return frame{}, err
 		}
 		if !isHexDigit(c) {
+			end = c // 行尾分隔符已消费，不要再从流里读一次
 			break
 		}
 		hx = append(hx, c)
 	}
 	if len(hx) < 2 {
 		return frame{}, fmt.Errorf("bad hex header")
-	}
-	// 消费行尾 CR/LF（尽力，忽略可选 XON）。
-	for i := 0; i < 2; i++ {
-		c, err := e.rxByte()
-		if err != nil || c == '\n' {
-			break
-		}
 	}
 	n := len(hx) / 2
 	b := make([]byte, n)
@@ -405,13 +557,48 @@ func (e *zmodemEngine) readHexFrame() (frame, error) {
 	}
 	var h [5]byte
 	copy(h[:], b)
-	return frame{typ: b[0], pos: headerPos(h), crcOK: true}, nil
+	typ := b[0]
+
+	// 行尾兼容 CRLF 与水木的 CR NUL：CR 后只消费一个字节；若不是 LF/NUL 就退回。
+	// 关键：无数据帧（尤其 ZRQINIT）必须在此立即返回，绝不能前瞻等下一帧——
+	// 水木发完 ZRQINIT 就停住等我们回 ZRINIT，前瞻会把应答拖到读超时，服务端已放弃握手。
+	switch end {
+	case '\r':
+		c, err := e.rxByte()
+		if err != nil {
+			return frame{}, err
+		}
+		if c != '\n' && c != 0 {
+			e.unread(c)
+		}
+	case '\n', 0:
+		// 已完整消费行尾
+	default:
+		e.unread(end)
+	}
+
+	if typ == zfile || typ == zsinit || typ == zdata {
+		// hex 头后紧跟二进制数据（与水木自己 sendHexHdrData 同构：描述符/子包 + CRC16）。
+		// 旧版不读这段 —— ZFILE 到来时 fr.data 为空、parseFileDesc 失败回 ZSKIP，
+		// 正是水木 sz 下载不了的根因。hex 头行尾的 XON 不属于数据段，仅在这里兼容。
+		if c, err := e.rxByte(); err != nil {
+			return frame{}, err
+		} else if c != 0x11 {
+			e.unread(c)
+		}
+		data, subch, ok, derr := e.readDataSection(false)
+		if derr != nil {
+			return frame{}, derr
+		}
+		return frame{typ: typ, pos: headerPos(h), data: data, subch: subch, crcOK: ok}, nil
+	}
+	return frame{typ: typ, pos: headerPos(h), crcOK: true}, nil
 }
 
 func (e *zmodemEngine) readBinFrame(crc32f bool) (frame, error) {
 	h := make([]byte, 5)
 	for i := 0; i < 5; i++ {
-		c, err := e.rxByte()
+		c, err := e.rxBinaryByte()
 		if err != nil {
 			return frame{}, err
 		}
@@ -435,7 +622,7 @@ func (e *zmodemEngine) readBinFrame(crc32f bool) (frame, error) {
 		crcLen = 4
 	}
 	for i := 0; i < crcLen; {
-		c, err := e.rxByte()
+		c, err := e.rxBinaryByte()
 		if err != nil {
 			return frame{}, err
 		}
@@ -449,52 +636,236 @@ func (e *zmodemEngine) readBinFrame(crc32f bool) (frame, error) {
 
 	hasData := typ == zfile || typ == zsinit || typ == zdata || typ == zcommand
 	if !hasData {
-		return frame{typ: typ, pos: pos, crcOK: true}, nil
+		return frame{typ: typ, pos: pos, crc32f: crc32f, crcOK: true}, nil
 	}
+	data, subch, ok, derr := e.readDataSection(crc32f)
+	if derr != nil {
+		return frame{}, derr
+	}
+	return frame{typ: typ, pos: pos, data: data, subch: subch, crc32f: crc32f, crcOK: ok}, nil
+}
 
-	// 数据块（到 ZDLE+子包类型字节为止），后面自带另一个独立 CRC。
-	data := make([]byte, 0, 1024)
-	var subch byte
+// readDataSection 读取帧头的二进制数据段：转义数据直到 ZDLE+子包类型字节，再读尾部 CRC。
+// crc32f 时子包 CRC 为 CRC32（小端）；否则 CRC16（大端）。CRC 字节同样经过转义，必须去转义——
+// 旧版裸读，遇到 0x18 就错位。CRC16 同时接受「不终算 XMODEM」（水木自家变体，上传端由
+// 真实 ZRINIT 帧反推确认）与「补两 0 终算」（标准 lrzsz）——接收端没得选，命中其一即算好。
+func (e *zmodemEngine) readDataSection(crc32f bool) (data []byte, subch byte, crcOK bool, err error) {
+	if e.dbgOn {
+		e.rxRaw = e.rxRaw[:0] // 只保留当前子包的线上原始字节，失败时可直接取证
+	}
+	data = make([]byte, 0, 1024)
+	// Telnet 对 CR NUL 的扩展可能与文件原有的 CR NUL 重合。主候选删除所有
+	// 二义 NUL；fullData 保留全部，并记录每个可选的 NUL 位置。同一个包里若
+	// 既有真扩展又有原始 NUL，必须逐点组合，不能只在“全删/全留”两个端点里选。
+	var fullData []byte
+	var nulPositions []int
 	for {
 		c, err := e.rxByte()
 		if err != nil {
-			return frame{}, err
+			return nil, 0, false, err
 		}
 		if c == zdle {
 			c2, err := e.rxByte()
 			if err != nil {
-				return frame{}, err
+				return nil, 0, false, err
 			}
 			switch c2 {
 			case zcRCE, zcRCG, zcRCQ, zcRCW:
 				subch = c2
-				goto readdatacrc
+				goto readcrc
 			default:
-				data = append(data, unescape(c2))
+				c = unescape(c2)
+			}
+			data = append(data, c)
+			if fullData != nil {
+				fullData = append(fullData, c)
+			}
+			continue
+		}
+		if c == '\r' {
+			next, err := e.rxByte()
+			if err != nil {
+				return nil, 0, false, err
+			}
+			if next == 0 {
+				if fullData == nil {
+					fullData = append([]byte(nil), data...)
+				}
+				nulPositions = append(nulPositions, len(fullData)+1)
+				data = append(data, c)
+				fullData = append(fullData, c, 0)
 				continue
 			}
+			e.unread(next)
 		}
 		data = append(data, c)
+		if fullData != nil {
+			fullData = append(fullData, c)
+		}
 	}
-readdatacrc:
-	dcover := append(append([]byte{}, data...), subch)
-	ok := true
+readcrc:
+	crcLen := 2
 	if crc32f {
-		b := make([]byte, 4)
-		for i := 0; i < 4; i++ {
-			c, _ := e.rxByte()
-			b[i] = c
-		}
-		ok = zcrc32(dcover) == binary.LittleEndian.Uint32(b)
-	} else {
-		b := make([]byte, 2)
-		for i := 0; i < 2; i++ {
-			c, _ := e.rxByte()
-			b[i] = c
-		}
-		ok = crc16XMODEM(dcover) == binary.BigEndian.Uint16(b)
+		crcLen = 4
 	}
-	return frame{typ: typ, pos: pos, data: data, subch: subch, crcOK: ok}, nil
+	b := make([]byte, crcLen)
+	for i := 0; i < crcLen; i++ {
+		c, err := e.rxBinaryByte()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if c == zdle {
+			if c, err = e.rxByte(); err != nil {
+				return nil, 0, false, err
+			}
+			c = unescape(c)
+		}
+		b[i] = c
+	}
+	var want, got uint64
+	if crc32f {
+		want = uint64(binary.LittleEndian.Uint32(b))
+		got = uint64(zcrc32(dataSectionCover(data, subch)))
+		crcOK = got == want
+	} else {
+		want = uint64(binary.BigEndian.Uint16(b))
+		cover := dataSectionCover(data, subch)
+		got = uint64(crc16XMODEM(cover))
+		crcOK = got == want || uint64(crc16XMODEM(append(cover, 0, 0))) == want
+	}
+	if !crcOK && len(nulPositions) > 0 {
+		candidate, ok, kept := resolveAmbiguousNULs(fullData, nulPositions, subch, crc32f, want)
+		if ok {
+			data = candidate
+			crcOK = true
+			e.dbg("readDataSection: CRC 二义 CR NUL 组合还原成功 ambiguous=%d kept=%d len=%d", len(nulPositions), kept, len(data))
+		}
+	}
+	if !crcOK && crc32f {
+		// 水木的 Telnet 链路偶尔把文件中的 FF 00 当 IAC NUL 吞掉，但发送方仍按
+		// 原始数据计算 CRC32。实测三个坏包都在补回一个 FF 00 后完全吻合。
+		base := data
+		if fullData != nil {
+			base = fullData
+		}
+		if candidate, ok, kept, insertAt := repairDroppedIACNUL(base, nulPositions, subch, uint32(want)); ok {
+			data = candidate
+			crcOK = true
+			e.dbg("readDataSection: CRC32 IAC NUL 丢失还原成功 ambiguous=%d kept=%d insert=%d len=%d", len(nulPositions), kept, insertAt, len(data))
+		}
+	}
+	if !crcOK {
+		rawHex := ""
+		if e.dbgOn && len(e.rxRaw) > 0 {
+			raw := e.rxRaw
+			if len(raw) > 16*1024 {
+				raw = raw[len(raw)-16*1024:]
+			}
+			rawHex = hex.EncodeToString(raw)
+		}
+		if crc32f {
+			e.dbg("readDataSection: CRC32 失败 subch=%c len=%d/%d ambiguous=%d got=%08x want=%08x raw=%s", subch, len(data), len(fullData), len(nulPositions), got, want, rawHex)
+		} else {
+			e.dbg("readDataSection: CRC16 失败 subch=%c len=%d/%d ambiguous=%d got=%04x want=%04x raw=%s", subch, len(data), len(fullData), len(nulPositions), got, want, rawHex)
+		}
+	}
+	return data, subch, crcOK, nil
+}
+
+func dataSectionCover(data []byte, subch byte) []byte {
+	cover := make([]byte, len(data)+1)
+	copy(cover, data)
+	cover[len(data)] = subch
+	return cover
+}
+
+func dataSectionCRC(data []byte, subch byte, crc32f, finalized bool) uint64 {
+	cover := dataSectionCover(data, subch)
+	if crc32f {
+		return uint64(zcrc32(cover))
+	}
+	if finalized {
+		cover = append(cover, 0, 0)
+	}
+	return uint64(crc16XMODEM(cover))
+}
+
+func applyNULChoices(full []byte, positions []int, keep []bool) []byte {
+	if len(positions) == 0 {
+		return full
+	}
+	keepAt := make([]bool, len(full))
+	for i, pos := range positions {
+		if i < len(keep) && keep[i] {
+			keepAt[pos] = true
+		}
+	}
+	out := make([]byte, 0, len(full)-len(positions))
+	for i, c := range full {
+		if !keepAt[i] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// resolveAmbiguousNULs 枚举每个二义 NUL 的保留/删除组合，并由线上 CRC 选定。
+// 1024 字节子包里出现多个二义点仍很少见；限制 16 个，最坏 65536 次短 CRC，
+// 避免异常数据造成指数级计算失控。
+func resolveAmbiguousNULs(full []byte, positions []int, subch byte, crc32f bool, want uint64) ([]byte, bool, int) {
+	if len(positions) > 16 {
+		return nil, false, 0
+	}
+	for _, finalized := range []bool{false, true} {
+		if crc32f && finalized {
+			continue
+		}
+		for mask := 0; mask < 1<<len(positions); mask++ {
+			keep := make([]bool, len(positions))
+			kept := 0
+			for i := range keep {
+				if mask&(1<<i) != 0 {
+					keep[i] = true
+					kept++
+				}
+			}
+			candidate := applyNULChoices(full, positions, keep)
+			if dataSectionCRC(candidate, subch, crc32f, finalized) == want {
+				return candidate, true, kept
+			}
+		}
+	}
+	return nil, false, 0
+}
+
+// repairDroppedIACNUL 反查被 Telnet 吞掉的一个 FF 00 数据对。CRC32 会随插入位置
+// 明显变化，因此可用来精确定位；误命中概率约 1/2^32。与 CR NUL 二义组合时，
+// 枚举上限降到 8，避免异常包造成过大的 CPU 开销。
+func repairDroppedIACNUL(full []byte, positions []int, subch byte, want uint32) ([]byte, bool, int, int) {
+	if len(positions) > 8 {
+		return nil, false, 0, 0
+	}
+	for mask := 0; mask < 1<<len(positions); mask++ {
+		keep := make([]bool, len(positions))
+		kept := 0
+		for i := range keep {
+			if mask&(1<<i) != 0 {
+				keep[i] = true
+				kept++
+			}
+		}
+		base := applyNULChoices(full, positions, keep)
+		for pos := 0; pos <= len(base); pos++ {
+			candidate := make([]byte, 0, len(base)+2)
+			candidate = append(candidate, base[:pos]...)
+			candidate = append(candidate, 0xff, 0)
+			candidate = append(candidate, base[pos:]...)
+			if zcrc32(dataSectionCover(candidate, subch)) == want {
+				return candidate, true, kept, pos
+			}
+		}
+	}
+	return nil, false, 0, 0
 }
 
 func hexVal(c byte) int {
@@ -594,6 +965,15 @@ func (e *zmodemEngine) sendSubpacket(data []byte, subch byte) error {
 	return e.writeRaw(out)
 }
 
+// rxFrameTimeout 是下载会话中等待下一帧的上限。水木 sz 在要求重传后可能等待约
+// 30 秒才重发，因此超时后先补发 ZRPOS 续收，不能立刻把连接还给终端输出。
+const rxFrameTimeout = 30 * time.Second
+
+// zrinitFlagsField 是 ZRINIT 的 32 位字段：flags 放线上第 4 字节，与水木 rz 自己发的
+// ZRINIT「01 00 00 00 23」完全同构 —— CANFDX|CANOVIO|CANFC32，广告全双工、流式接收与
+// CRC32 能力，让 sz 以 ZBIN32 数据帧高速连发（接收端对两种 CRC 都已验证兼容）。
+const zrinitFlagsField = uint32(0x23) << 24
+
 // run decides the role and drives the transfer.
 func (e *zmodemEngine) run() error {
 	if e.direction == "send" {
@@ -604,11 +984,12 @@ func (e *zmodemEngine) run() error {
 	//             于是弹出系统文件对话框，选定后作为发送方上传。
 	//   ZRQINIT -> 对端是发送方（BBS 端跑了 sz），我们作为接收方下载。
 	// 读不到帧（EOF/非 ZMODEM）则退回接收方广播，兼容老式发起。
+	e.setReadDeadline(time.Now().Add(rxFrameTimeout))
 	fr, err := e.readFrame()
 	if err != nil {
 		// 残留噪声/半帧：不回应、不启动会话。旧版在此广播 ZRINIT 会把垃圾注入 BBS 命令行。
 		e.dbg("run: readFrame err=%v -> 不启动会话（避免向 BBS 误发 ZRINIT）", err)
-		return nil
+		return errNotZmodem
 	}
 	if e.ts != nil {
 		e.ts.dbg("run: first frame typ=%d pos=%d", fr.typ, fr.pos)
@@ -617,7 +998,7 @@ func (e *zmodemEngine) run() error {
 		// 只有 ZRINIT（对端 rz 等收）/ ZRQINIT（对端 sz 待发）才是合法开场帧；
 		// 取消后在途的 ZACK/ZRPOS/ZEOF 等一律视为残留噪声，不启动会话、不回应。
 		e.dbg("run: 非开场帧 typ=%d，视为残留噪声，不启动会话", fr.typ)
-		return nil
+		return errNotZmodem
 	}
 	if fr.typ == zrinit {
 		paths, perr := e.promptUploadFiles()
@@ -652,9 +1033,12 @@ func (e *zmodemEngine) run() error {
 		return e.sender()
 	}
 	// ZRQINIT 或其它：作为接收方应答并进入接收循环。
-	if err := e.sendHexHeader(zrinit, 0); err != nil {
+	if err := e.sendHexHeader(zrinit, zrinitFlagsField); err != nil {
 		return err
 	}
+	// 让下载卡片立即出现：水木 Ctrl+Y 会先显示“请输入文件名”再发 ZFILE，
+	// 用户此时需在 BBS 提示处按回车；没有这条等待事件会误以为客户端卡死。
+	e.progress("waiting", "", 0, 0, "已应答下载，等待 BBS 发送文件信息…")
 	return e.receiver()
 }
 
@@ -686,24 +1070,46 @@ func (e *zmodemEngine) receiver() error {
 		if cerr := e.checkCancel(); cerr != nil {
 			return cerr
 		}
+		e.setReadDeadline(time.Now().Add(rxFrameTimeout))
 		fr, err := e.readFrame()
 		if err != nil {
 			if cerr := e.checkCancel(); cerr != nil {
 				return cerr
 			}
-			return err
+			return fmt.Errorf("等待发送帧失败: %w", err)
 		}
 		switch fr.typ {
 		case zsinit:
+			// 发送方初始化帧携带 attention 字符串；FQTerm GotSinitData 回 ZACK(SerialNo)。
+			// 水木会停在这里等确认，旧版直接 continue 导致后续 ZFILE 永不到来。
+			if fr.crcOK {
+				e.sendHexHeader(zack, 0)
+			} else {
+				e.sendHexHeader(znak, 0)
+			}
 			continue
 		case zfile:
 			if err := e.receiveFile(fr); err != nil {
+				if errors.Is(err, errSessionFinished) {
+					return nil
+				}
 				return err
 			}
-		case zack, zrinit, zrqinit:
+		case zack, zrinit:
 			continue
-		case zfin, zcompl:
-			e.writeRaw([]byte{zpad, zpad, 'O', 'O'})
+		case zrqinit:
+			// 服务端没及时看到上一发 ZRINIT 时会重发 ZRQINIT，补答一次；
+			// 旧版只 continue，错过握手窗口后就一直等不到 ZFILE。
+			e.sendHexHeader(zrinit, zrinitFlagsField)
+			continue
+		case zcompl:
+			// 发送方要求确认 CRC32 能力：回带 CANFC32 的 ZRINIT 继续。
+			e.sendHexHeader(zrinit, zrinitFlagsField)
+			continue
+		case zfin:
+			// 水木对应的 FQTerm 接收状态机 GotFin：回 ZFIN 让发送方退出，不能回 ZRINIT。
+			// 也不能发「**OO」—— sz 退出后 BBS 主程序会把多余字节当命令行输入。
+			e.sendHexHeader(zfin, 0)
 			return nil
 		case zabort:
 			return nil
@@ -715,13 +1121,19 @@ func (e *zmodemEngine) receiver() error {
 }
 
 func (e *zmodemEngine) receiveFile(fileHdr frame) error {
-	name, size, descErr := parseFileDesc(fileHdr.data)
+	name, size, descErr := parseFileDesc(fileHdr.data, e.sess.encID)
 	if descErr != nil {
 		e.sendHexHeader(zskip, 0)
-		return e.receiver()
+		return nil
 	}
-	path := uniquePath(e.dlDir, sanitizeName(name))
-	f, err := os.Create(path)
+	safeName := sanitizeName(name)
+	dir, err := e.createDownloadDir(safeName)
+	if err != nil {
+		e.sendHexHeader(zferr, 0)
+		return fmt.Errorf("create download directory for %s: %w", name, err)
+	}
+	path := filepath.Join(dir, safeName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		e.sendHexHeader(zferr, 0)
 		return fmt.Errorf("create %s: %w", name, err)
@@ -731,59 +1143,121 @@ func (e *zmodemEngine) receiveFile(fileHdr frame) error {
 	e.sendHexHeader(zrpos, 0)
 
 	var offset int64
+	frameTimeouts := 0
 	for {
 		if cerr := e.checkCancel(); cerr != nil {
 			return cerr
 		}
+		e.setReadDeadline(time.Now().Add(rxFrameTimeout))
 		fr, err := e.readFrame()
 		if err != nil {
 			if cerr := e.checkCancel(); cerr != nil {
 				return cerr
 			}
-			return err
-		}
-		switch fr.typ {
-		case zdata:
-			if !fr.crcOK {
-				// Resync request.
+			// 水木 sz 的重传/继续发送可能超过 30 秒。会话中一律补发 ZRPOS
+			// 并继续等，不能按固定次数退出；否则后续裸二进制子包会污染终端。
+			if os.IsTimeout(err) {
+				frameTimeouts++
+				e.dbg("receiveFile: %s 等待帧超时，补发 ZRPOS(%d) 续收（第 %d 次）", name, offset, frameTimeouts)
 				e.sendHexHeader(zrpos, uint32(offset))
 				continue
 			}
-			if len(fr.data) > 0 {
-				f.Write(fr.data)
-				offset += int64(len(fr.data))
+			return fmt.Errorf("等待数据帧失败: %w", err)
+		}
+		frameTimeouts = 0
+		switch fr.typ {
+		case zdata:
+			if uint64(fr.pos) != uint64(offset) {
+				e.dbg("receiveFile: %s ZDATA 偏移不符 pos=%d actual=%d，请求重发", name, fr.pos, offset)
+				e.sendHexHeader(zrpos, uint32(offset))
+				continue
 			}
-			switch fr.subch {
-			case zcRCW, zcRCQ:
-				e.sendHexHeader(zack, uint32(offset))
-			case zcRCE:
-				e.progress("transfer", name, size, offset, "")
+			// 一个 ZDATA 帧可含多个背靠背的裸子包（发送方流式，帧首才带头），
+			// 必须连读到 ZCRCW/ZCRCE；旧版只读一个子包，其余字节被当噪声丢弃——数据丢失。
+			for {
+				e.setReadDeadline(time.Now().Add(rxFrameTimeout))
+				if !fr.crcOK {
+					// 坏子包：要求从已确认的 offset 重发（发送方会重开一个新 ZDATA 帧）。
+					e.sendHexHeader(zrpos, uint32(offset))
+					break
+				}
+				if len(fr.data) > 0 {
+					if _, werr := f.Write(fr.data); werr != nil {
+						e.sendHexHeader(zferr, 0)
+						return werr
+					}
+					offset += int64(len(fr.data))
+					e.progress("transfer", name, size, offset, "")
+					e.dbg("receiveFile: %s offset=%d len=%d subch=%c crcOK=%v", name, offset, len(fr.data), fr.subch, fr.crcOK)
+				}
+				switch fr.subch {
+				case zcRCW, zcRCQ:
+					e.sendHexHeader(zack, uint32(offset))
+				}
+				if fr.subch == zcRCG || fr.subch == zcRCQ {
+					// 同帧内无头续子包，CRC 宽度跟随帧头格式。
+					data, subch, ok, rerr := e.readDataSection(fr.crc32f)
+					if rerr != nil {
+						if os.IsTimeout(rerr) {
+							e.dbg("receiveFile: %s 子包读取超时，补发 ZRPOS(%d) 续收", name, offset)
+							e.sendHexHeader(zrpos, uint32(offset))
+							break
+						}
+						return rerr
+					}
+					fr = frame{typ: zdata, data: data, subch: subch, crc32f: fr.crc32f, crcOK: ok}
+					continue
+				}
+				break // ZCRCW/ZCRCE：本数据帧结束，等下一个帧头（ZEOF/ZACK/重发 ZDATA）
 			}
 		case zeof:
+			if uint64(fr.pos) != uint64(offset) || (size > 0 && offset != size) {
+				e.dbg("receiveFile: %s ZEOF 提前或偏移不符 pos=%d declared=%d actual=%d，请求从 actual 续传", name, fr.pos, size, offset)
+				e.sendHexHeader(zrpos, uint32(offset))
+				continue
+			}
 			f.Close()
-			e.progress("done", name, size, offset, "已保存到 "+path)
-			e.sendHexHeader(zrinit, 0)
+			if size <= 0 {
+				// 水木文章常在 ZFILE 中声明 0，直到 ZEOF 才知道实际长度。
+				size = offset
+				e.progress("transfer", name, size, offset, "")
+			}
+			e.finishDownload(path, name, size, offset)
+			e.sendHexHeader(zrinit, zrinitFlagsField)
 			return nil
 		case zfin:
 			f.Close()
-			e.progress("done", name, size, offset, "已保存到 "+path)
-			return nil
+			if size > 0 && offset != size {
+				// 发送方在文件完成前断会：必须回 ZFIN 让它退出，但不能假报下载成功。
+				e.sendHexHeader(zfin, 0)
+				return fmt.Errorf("传输提前结束: %s 声明 %d 字节，实际仅收到 %d 字节", name, size, offset)
+			}
+			if size <= 0 {
+				size = offset
+			}
+			e.finishDownload(path, name, size, offset)
+			if err := e.sendHexHeader(zfin, 0); err != nil {
+				return err
+			}
+			return errSessionFinished
 		case zabort, zferr:
-			return nil
+			return fmt.Errorf("发送方中止/错误(typ=%d)", fr.typ)
 		default:
-			return nil
+			// ZACK/ZRINIT/ZRQINIT 等陈旧或保活帧：忽略，继续等数据。
+			continue
 		}
 	}
 }
 
-func parseFileDesc(data []byte) (string, int64, error) {
+func parseFileDesc(data []byte, encID int) (string, int64, error) {
 	s := string(data)
 	s = strings.ReplaceAll(s, "\x00", " ")
 	fields := strings.Fields(s)
 	if len(fields) == 0 {
 		return "", 0, fmt.Errorf("empty descriptor")
 	}
-	name := filepath.Base(fields[0])
+	// ZFILE 的文件名是原始字节，按站点编码解；GBK 字节偶然合法 UTF-8 时也不能误判。
+	name := filepath.Base(decodeZmodemName(fields[0], encID))
 	var size int64
 	if len(fields) >= 2 {
 		size, _ = strconv.ParseInt(fields[1], 10, 64)
@@ -791,12 +1265,182 @@ func parseFileDesc(data []byte) (string, int64, error) {
 	return name, size, nil
 }
 
+func decodeZmodemName(raw string, encID int) string {
+	if enc := encodingFor(encID); enc != nil {
+		if s, _, err := transform.String(enc.NewDecoder(), raw); err == nil && !strings.ContainsRune(s, utf8.RuneError) {
+			return s
+		}
+	}
+	return decodeArchiveName(raw)
+}
+
 func sanitizeName(name string) string {
-	name = filepath.Base(name)
-	if name == "" || name == "." || name == "/" {
+	name = sanitizeFileName(filepath.Base(strings.ReplaceAll(name, "\\", "/")))
+	if name == "" || name == "." {
 		return "zmodem_file"
 	}
+	if reservedWindowsName(name) {
+		return "zmodem_file" + filepath.Ext(name)
+	}
 	return name
+}
+
+func reservedWindowsName(name string) bool {
+	stem := strings.TrimSuffix(name, filepath.Ext(name))
+	stem = strings.ToUpper(strings.TrimRight(stem, " ."))
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL", "CLOCK$":
+		return true
+	}
+	if len(stem) == 4 && (strings.HasPrefix(stem, "COM") || strings.HasPrefix(stem, "LPT")) && stem[3] >= '1' && stem[3] <= '9' {
+		return true
+	}
+	return false
+}
+
+// createDownloadDir atomically reserves a fresh per-download directory. Mkdir
+// rather than Stat+Create avoids two simultaneous downloads choosing the same name.
+func (e *zmodemEngine) createDownloadDir(name string) (string, error) {
+	root, err := filepath.Abs(e.dlDir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	ext := filepath.Ext(name)
+	base := sanitizeFileName(strings.TrimSuffix(name, ext))
+	if base == "" || base == "." {
+		base = "zmodem_file"
+	}
+	for i := 1; ; i++ {
+		dirName := base
+		if i > 1 {
+			dirName += "_" + itoa(i)
+		}
+		dir := filepath.Join(root, dirName)
+		if err := os.Mkdir(dir, 0o755); err == nil {
+			return dir, nil
+		} else if !os.IsExist(err) {
+			return "", err
+		}
+	}
+}
+
+// finishDownload keeps the original file untouched and adds a preview-friendly
+// split when the payload is a waterwood article with appended attachment records.
+func (e *zmodemEngine) finishDownload(path, name string, size, done int64) {
+	paths, split, err := splitDownloadedArticle(path, e.sess.encID)
+	message := "已保存到 " + path
+	switch {
+	case err != nil:
+		message += "（附件拆分失败：" + err.Error() + "）"
+	case split:
+		message += fmt.Sprintf("（已拆出正文和 %d 个附件）", len(paths)-1)
+	}
+	e.progress("done", name, size, done, message)
+	e.emitDownloaded(name, filepath.Dir(path), paths, split, size)
+}
+
+var attachmentPad = []byte{0, 0, 0, 0, 0, 0, 0, 0}
+
+type articleAttachment struct {
+	name string
+	data []byte
+}
+
+// parseArticleAttachments parses the deterministic record format written by
+// KBS_BBS/upload_post_append: 8 NUL, NUL-terminated name, big-endian uint32 size,
+// then exactly that many payload bytes. Records are contiguous through EOF.
+func parseArticleAttachments(data []byte, encID int) ([]byte, []articleAttachment, bool) {
+	marker := bytes.Index(data, attachmentPad)
+	if marker < 0 {
+		return nil, nil, false
+	}
+	body := data[:marker]
+	if bytes.HasSuffix(body, []byte("\r\n")) {
+		body = body[:len(body)-2]
+	} else if bytes.HasSuffix(body, []byte("\n")) {
+		body = body[:len(body)-1]
+	}
+
+	pos := marker
+	attachments := make([]articleAttachment, 0, 4)
+	for pos < len(data) {
+		if len(data)-pos < len(attachmentPad) || !bytes.Equal(data[pos:pos+len(attachmentPad)], attachmentPad) {
+			return nil, nil, false
+		}
+		pos += len(attachmentPad)
+		nameEnd := bytes.IndexByte(data[pos:], 0)
+		if nameEnd <= 0 || nameEnd > 1024 {
+			return nil, nil, false
+		}
+		rawName := string(data[pos : pos+nameEnd])
+		pos += nameEnd + 1
+		if len(data)-pos < 4 {
+			return nil, nil, false
+		}
+		size := binary.BigEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		if uint64(size) > uint64(len(data)-pos) {
+			return nil, nil, false
+		}
+		end := pos + int(size)
+		attachments = append(attachments, articleAttachment{name: sanitizeName(decodeZmodemName(rawName, encID)), data: data[pos:end]})
+		pos = end
+	}
+	if len(attachments) == 0 {
+		return nil, nil, false
+	}
+	return body, attachments, true
+}
+
+func splitDownloadedArticle(path string, encID int) ([]string, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return []string{path}, false, err
+	}
+	body, attachments, ok := parseArticleAttachments(data, encID)
+	if !ok {
+		return []string{path}, false, nil
+	}
+	paths, err := writeArticleParts(path, body, attachments)
+	if err != nil {
+		return []string{path}, false, err
+	}
+	return paths, true, nil
+}
+
+func writeArticleParts(original string, body []byte, attachments []articleAttachment) (paths []string, err error) {
+	created := make([]string, 0, len(attachments)+1)
+	defer func() {
+		if err != nil {
+			for _, path := range created {
+				_ = os.Remove(path)
+			}
+		}
+	}()
+	write := func(name string, data []byte) error {
+		path := uniquePath(filepath.Dir(original), name)
+		if werr := os.WriteFile(path, data, 0o644); werr != nil {
+			return werr
+		}
+		created = append(created, path)
+		paths = append(paths, path)
+		return nil
+	}
+
+	ext := filepath.Ext(original)
+	stem := strings.TrimSuffix(filepath.Base(original), ext)
+	if err = write(sanitizeName(stem+"_正文.txt"), body); err != nil {
+		return nil, err
+	}
+	for _, attachment := range attachments {
+		if err = write(attachment.name, attachment.data); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
 }
 
 // ---- sender (upload) ----

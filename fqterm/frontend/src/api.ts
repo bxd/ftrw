@@ -148,6 +148,7 @@ const pvsvc = 'main.PreviewService'
 const lan = 'main.LauncherService'
 const ipsvc = 'main.IPService'
 const fil = 'main.FileService'
+const downloads = 'main.DownloadManagerService'
 
 export const ListSites = (): Promise<Site[]> => Call.ByName(`${cfg}.ListSites`)
 export const SaveSite = (index: number, site: Site): Promise<void> => Call.ByName(`${cfg}.SaveSite`, index, site)
@@ -242,8 +243,10 @@ export const ApplyAppPreferences = (): Promise<void> => Call.ByName(`${appsvc}.A
 // 媒体→我们自己的预览页，网页→整窗顶层导航（frame 限制就是这么绕开的）。
 export interface PreviewItem {
   url: string
-  kind: 'image' | 'audio' | 'video' | 'page'
+  kind: 'image' | 'audio' | 'video' | 'page' | 'text' | 'pdf' | 'file'
   name: string
+  // 本地下载预览携带原路径，打开时交给系统默认程序而不是浏览器。
+  path?: string
 }
 
 export interface PreviewRequest {
@@ -488,6 +491,24 @@ export const FilePreview = (path: string): Promise<PreviewRef> => Call.ByName(`$
 export const FilePluginPreview = (pluginID: string, path: string, ctx: PluginContext): Promise<PluginArtifact> =>
   Call.ByName(`${fil}.PluginPreview`, pluginID, path, ctx)
 
+// ---- 下载管理器（只操作自动建立的下载目录） ----
+
+export interface DownloadEntry {
+  name: string
+  path: string
+  size: number
+  fileCount: number
+  mtime: number // UnixNano
+}
+
+export const DownloadRootDir = (): Promise<string> => Call.ByName(`${downloads}.RootDir`)
+export const ListDownloads = (): Promise<DownloadEntry[]> => Call.ByName(`${downloads}.List`)
+export const DeleteDownloads = (paths: string[]): Promise<void> =>
+  Call.ByName(`${downloads}.DeleteMany`, paths)
+// 后端已签好本地 URL，并按正文、附件顺序排除拆分前的原始容器。
+export const PreviewDownload = (path: string): Promise<PreviewItem[]> =>
+  Call.ByName(`${downloads}.Preview`, path)
+
 // ---- Terminal service ----
 
 export const Connect = (site: Site): Promise<string> => Call.ByName(`${term}.Connect`, site)
@@ -507,12 +528,19 @@ export interface ZmodemProgress {
   size: number; done: number; state: string; message: string
 }
 
+export interface ZmodemDownloaded {
+  id: string; direction: string; filename: string; directory: string
+  paths: string[]; split: boolean; size: number
+}
+
 export const onTermData = (cb: (d: TermData) => void) =>
   Events.On('term:data', (e: any) => cb(e.data))
 export const onTermStatus = (cb: (d: TermStatus) => void) =>
   Events.On('term:status', (e: any) => cb(e.data))
 export const onZmodem = (cb: (d: ZmodemProgress) => void) =>
   Events.On('zmodem:progress', (e: any) => cb(e.data))
+export const onZmodemDownloaded = (cb: (d: ZmodemDownloaded) => void) =>
+  Events.On('zmodem:downloaded', (e: any) => cb(e.data))
 export const onWindowMode = (cb: (d: WindowModeState) => void) =>
   Events.On('app:mode', (e: any) => cb(e.data))
 // 预览窗口已开着时换内容。事件走全局总线（每个窗口都会收到），但只有预览页注册了

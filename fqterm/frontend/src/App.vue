@@ -8,6 +8,7 @@ import SiteDialog from './components/SiteDialog.vue'
 import PrefsDialog from './components/PrefsDialog.vue'
 import SchemeDialog from './components/SchemeDialog.vue'
 import ZmodemDialog from './components/ZmodemDialog.vue'
+import DownloadManagerDialog from './components/DownloadManagerDialog.vue'
 import KeymapDialog from './components/KeymapDialog.vue'
 import EditToolbar from './components/EditToolbar.vue'
 import { keyseq, registerCommand, type EchoInfo } from './keyseq'
@@ -376,6 +377,7 @@ const km = ref<api.KeymapConfig>({ enabled: true, timeoutMs: 1000, echo: true, b
 // 跨应用热键表：后端低级键盘钩子那份，界面只负责读出来交给编辑器
 const gk = ref<api.GlobalKeymap>({ enabled: true, doubleTapMs: 400, bindings: [] })
 const kmDlg = reactive({ show: false })
+const downloadDlg = reactive({ show: false })
 const echoMsg = ref('')
 const echoKind = ref<EchoInfo['kind']>('info')
 let echoTimer: number | undefined
@@ -402,6 +404,7 @@ function applyKeymap(c: api.KeymapConfig) {
  * 工具栏按钮后焦点就停在按钮上（不在 viewport 里），M-x p 这类绑定会全部失效。
  */
 function onGlobalKey(ev: KeyboardEvent) {
+  if (downloadDlg.show) return // 下载管理器自己处理列表/删除确认按键，不触发背后的应用命令
   const el = document.activeElement
   // 焦点在终端里 → 交给 xterm 回调，不查两遍。但活动标签若是文件管理器（也挂在
   // viewport 里、没有 xterm）就不能早退：得让 M-x / S-<方向> 这些出厂序列在这也能用
@@ -502,6 +505,13 @@ registerCommand({
   title: '文件管理器：新建一个双栏文件管理器标签（Total Commander 式）',
   description: '默认序列 M-x e；Tab 切栏，F5/F6 复制移动、F7/F8/F2 建目录/删除/重命名，Enter 打开、F3/Space 预览',
   handler: () => { void newFileManagerTab() },
+})
+
+registerCommand({
+  id: 'downloads.open-manager',
+  title: '下载管理器：预览或删除已下载文章',
+  description: '默认序列 M-z d（Alt+Z 后再按 D）；只按自动建立的下载目录操作，不进入目录内部',
+  handler: () => { downloadDlg.show = true },
 })
 
 // 编辑路径：命令住在 App 侧，但路径栏状态住在独立的 FileManagerView 里，
@@ -700,9 +710,14 @@ const siteDlg = reactive({ show: false, site: null as api.Site | null, index: -1
 const prefsDlg = reactive({ show: false })
 const schemeDlg = reactive({ show: false })
 
+function closeDownloadManager() {
+  downloadDlg.show = false
+  nextTick(() => insts[active.value]?.focus())
+}
+
 // 任何全屏对话框开着时，悬浮面板不得浮现（它会滑到遮罩后面，看起来像残留的鬼影）。
 // sidebarShown 在上方已引用这里，但它的 getter 只在渲染时求值，不会碰到 TDZ。
-const dialogOpen = computed(() => siteDlg.show || prefsDlg.show || schemeDlg.show || kmDlg.show)
+const dialogOpen = computed(() => siteDlg.show || prefsDlg.show || schemeDlg.show || kmDlg.show || downloadDlg.show)
 
 // ZMODEM 进度弹窗状态（由 zmodem:progress 事件驱动）
 const zm = reactive({ show: false, id: '', direction: 'send', filename: '', size: 0, done: 0, state: '', message: '' })
@@ -1008,6 +1023,53 @@ async function probeInfos(urls: string[]): Promise<api.ProbeResult[]> {
   }
 }
 
+function localPreviewKind(kind: string): api.PreviewItem['kind'] {
+  switch (kind) {
+    case 'image': case 'audio': case 'video': return kind
+    case 'text': case 'html': return 'text' // 本地 HTML 按源码显示，不在带后端绑定的窗口里执行
+    case 'pdf': return 'pdf'
+    default: return 'file'
+  }
+}
+
+function localPathName(path: string): string {
+  return path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || path
+}
+
+let downloadPreviewSeq = 0
+
+/** 下载完成后由后端给出正文/附件路径，前端签成本地 URL 后直接打开预览窗口。 */
+async function openDownloadedPreview(d: api.ZmodemDownloaded) {
+  if (!d || d.direction !== 'recv' || !Array.isArray(d.paths) || !d.paths.length) return
+  const seq = ++downloadPreviewSeq
+  const items: api.PreviewItem[] = []
+  for (let i = 0; i < d.paths.length; i++) {
+    const path = d.paths[i]
+    try {
+      const ref = await api.FilePreview(path)
+      if (!ref?.url) continue
+      items.push({
+        url: ref.url,
+        kind: localPreviewKind(ref.kind),
+        name: d.split && i === 0 ? '正文' : localPathName(path),
+        path,
+      })
+    } catch {
+      // 单个附件失效不应挡住其余内容；后端已保证原始文件仍在下载目录。
+    }
+  }
+  if (seq !== downloadPreviewSeq) return
+  if (!items.length) {
+    showEcho(`下载已完成，但没有可预览的文件：${d.directory}`, 'warn')
+    return
+  }
+  try {
+    await api.OpenPreview(items, 0)
+  } catch (e) {
+    showEcho(`下载预览打开失败：${e}`, 'error')
+  }
+}
+
 function setActive(i: number) {
   active.value = i
   insts.forEach((t, idx) => { t.container.style.display = idx === i ? 'block' : 'none' })
@@ -1264,7 +1326,7 @@ function submitSiteNum() {
 // 工具栏不再放「上传」按钮：BBS 的上传由对端跑 sz 触发，收到 ZRQINIT 后
 // zmodemEngine.promptUploadFiles 会自己弹原生选文件框，手动入口反而容易误操作。
 
-let offData: () => void, offStatus: () => void, offZ: () => void, offMode: (() => void) | undefined
+let offData: () => void, offStatus: () => void, offZ: () => void, offDownloaded: () => void, offMode: (() => void) | undefined
 let offIP: (() => void) | undefined
 let offReveal: (() => void) | undefined
 
@@ -1300,7 +1362,6 @@ onMounted(async () => {
     zm.filename = d.filename || (fin ? zm.filename : '')
     zm.size = d.size > 0 ? d.size : (fin ? zm.size : 0)
     zm.done = d.done > 0 ? d.done : (d.state === 'done' ? (d.size > 0 ? d.size : zm.done) : (fin ? zm.done : 0))
-    if (d.state === 'done' && zm.size > 0) zm.done = zm.size
     zm.state = d.state
     zm.message = d.message
     if (fin) {
@@ -1315,6 +1376,7 @@ onMounted(async () => {
       setTimeout(() => { if (zmodemMsg.value === d.message) zmodemMsg.value = '' }, 5000)
     }
   })
+  offDownloaded = api.onZmodemDownloaded((d) => { void openDownloadedPreview(d) })
   offIP = api.onIPUpdate(onIPProgress)
   // 启动器发来的“在文件管理器里显示这条路径”（Shift+Enter 定位、Alt+Enter 额外预览）。
   offReveal = api.onFileManagerReveal((d) => { if (d && d.path) revealInFileManager(d.path, !!d.preview) })
@@ -1352,7 +1414,7 @@ onMounted(async () => {
   window.addEventListener('beforeunload', onSaveFmBeforeUnload)
 })
 
-onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offMode?.(); offIP?.(); offReveal?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); if (fmSaveTimer) clearTimeout(fmSaveTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true); window.removeEventListener('beforeunload', onSaveFmBeforeUnload) })
+onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offDownloaded?.(); offMode?.(); offIP?.(); offReveal?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); if (fmSaveTimer) clearTimeout(fmSaveTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true); window.removeEventListener('beforeunload', onSaveFmBeforeUnload) })
 
 function onWinResize() {
   insts[active.value]?.fitNow()
@@ -1425,6 +1487,7 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
       <select v-model="activeScheme" :disabled="active < 0" title="配色方案">
         <option v-for="s in schemes" :key="s.name" :value="s.name">{{ s.name }}</option>
       </select>
+      <button @click="downloadDlg.show = true" title="下载管理器（Alt+Z 后再按 D）">下载</button>
       <button @click="schemeDlg.show = true" title="配色方案编辑">🎨</button>
       <button @click="kmDlg.show = true" title="键序列 / 热键编辑器（Emacs 风格）">⌨ 热键</button>
       <button @click="prefsDlg.show = true" title="偏好设置">⚙ 设置</button>
@@ -1512,6 +1575,7 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
     <PrefsDialog v-if="prefsDlg.show" :prefs="prefs!" @save="savePrefs" @close="prefsDlg.show = false" />
     <SchemeDialog v-if="schemeDlg.show" :schemes="schemes" @close="schemeDlg.show = false"
                   @changed="async () => { schemes = await api.ListSchemes(); applySchemeToActive() }" />
+    <DownloadManagerDialog v-if="downloadDlg.show" @close="closeDownloadManager" />
     <ZmodemDialog v-if="zm.show" :info="zm" @cancel="onZmCancel" @close="zm.show = false" />
     <KeymapDialog v-if="kmDlg.show" :km="km" :gk="gk" @save="onKeymapSave" @close="kmDlg.show = false" />
   </div>

@@ -39,6 +39,7 @@ func init() {
 	application.RegisterEvent[*TermData]("term:data")
 	application.RegisterEvent[*TermStatus]("term:status")
 	application.RegisterEvent[*ZmodemProgress]("zmodem:progress")
+	application.RegisterEvent[*ZmodemDownloaded]("zmodem:downloaded")
 	application.RegisterEvent[*WindowModeState]("app:mode")
 	application.RegisterEvent[*PreviewRequest]("preview:load")
 	application.RegisterEvent[*LauncherRevealPayload]("fm:reveal")
@@ -74,6 +75,7 @@ func main() {
 	launcherService := NewLauncherService()
 	ipService := NewIPService(store)
 	fileService := NewFileService()
+	downloadManagerService := NewDownloadManagerService(store, fileService)
 	// 代理没配好之前 IP 库注定下不来，失败一轮就要等满一天闸门。用户刚刚把代理填对的
 	// 那一刻就是「该再试一次」的信号，不能让他等到明天。
 	configService.OnProxyChanged(func() { ipService.MaybeUpdate() })
@@ -111,6 +113,7 @@ func main() {
 			application.NewService(launcherService),
 			application.NewService(ipService),
 			application.NewService(fileService),
+			application.NewService(downloadManagerService),
 		},
 		Assets: application.AssetOptions{
 			Handler: newFMAssetHandler(assets, fileService),

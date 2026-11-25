@@ -216,6 +216,19 @@ function setFilter(pane: Pane, q: string) {
   scrollCursor()
 }
 
+// Esc 取消过滤时保留当前实体项；完整列表前面多了 . / ..，必须按路径重新定位，
+// 不能沿用过滤结果的索引，也不能像普通改过滤串那样把光标归零。
+function clearFilter(pane: Pane) {
+  const keepPath = pane.rows[pane.cursor]?.path || ''
+  pane.filter = ''
+  applyFilter(pane)
+  const found = keepPath ? pane.rows.findIndex((r) => r.path === keepPath) : -1
+  pane.cursor = found >= 0 ? found : 0
+  pane.anchor = pane.cursor
+  scrollCursor()
+  root.value?.focus()
+}
+
 function reloadActive() {
   const p = panes[active.value]
   return loadPane(active.value, p.path, p.rows[p.cursor]?.name || '')
@@ -907,7 +920,7 @@ function onKeydown(e: KeyboardEvent) {
     if (confirmDel.show) { e.preventDefault(); confirmDel.show = false; root.value?.focus(); return }
     if (menuOpen.value) { menuOpen.value = false; return }
     if (previewOn.value) { e.preventDefault(); closePreview(); return }
-    if (panes[active.value].filter) { e.preventDefault(); setFilter(panes[active.value], ''); return }
+    if (panes[active.value].filter) { e.preventDefault(); clearFilter(panes[active.value]); return }
   }
   // 操作确认框在场：焦点只在两按钮间穿梭（Tab 循环不出框，方向键左=确认/右=取消），
   // Enter/Space 不拦，留给聚焦按钮的原生 click。

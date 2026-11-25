@@ -41,6 +41,9 @@ const (
 	KindAudio = "audio"
 	KindVideo = "video"
 	KindPage  = "page"
+	KindText  = "text"
+	KindPDF   = "pdf"
+	KindFile  = "file"
 )
 
 // 预览窗口的两种模式。
@@ -81,11 +84,13 @@ const (
 	pvClosing   = 2
 )
 
-// PreviewItem 一条链接。Name 是给人看的短名（前端从路径末段取），Kind 见上面四个常量。
+// PreviewItem 一条预览内容。Name 是给人看的短名，Kind 见上面的常量。
+// Path 仅本地文件有：前端用它调用系统默认程序打开，而不是把签名 URL 交给浏览器。
 type PreviewItem struct {
 	URL  string `json:"url"`
 	Kind string `json:"kind"`
 	Name string `json:"name"`
+	Path string `json:"path,omitempty"`
 }
 
 // PreviewRequest 一次打开请求：整组媒体 + 当前序号。
@@ -152,7 +157,14 @@ func (s *PreviewService) OpenPreview(items []PreviewItem, index int) error {
 	s.waitFadeOut()
 	index = clampIndex(index, len(items))
 	item := items[index]
-	u, err := checkPreviewURL(item.URL)
+	var u *url.URL
+	var err error
+	if item.Kind == KindPage {
+		// 网页模式会顶层导航，永远只接受 http/https；本地签名地址不能走这条路。
+		u, err = checkPreviewURL(item.URL)
+	} else {
+		u, err = checkPreviewItemURL(item.URL)
+	}
 	if err != nil {
 		log.Printf("预览链接被拒绝：%s（%v）", item.URL, err)
 		return err
@@ -1474,6 +1486,19 @@ func (s *PreviewService) redock(win *application.WebviewWindow) {
 /* 纯函数：链接准入、序号钳制、标题                                               */
 /* --------------------------------------------------------------------------- */
 
+// checkPreviewItemURL 在链接准入之外，只额外放行 FileService 签过名的本地文件路由。
+// 真正的 HMAC 仍由 fmassets.go 的资产处理器校验；这里不收任意相对路径、file: 或跨域地址。
+func checkPreviewItemURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err == nil && u.Scheme == "" && u.Host == "" && u.Path == fmFileRoute && u.Fragment == "" {
+		q := u.Query()
+		if q.Get("p") != "" && q.Get("k") != "" {
+			return u, nil
+		}
+	}
+	return checkPreviewURL(raw)
+}
+
 // checkPreviewURL 只放行 http/https。链接内容来自远端，javascript: / data: / file:
 // 一律不许导航 —— 预览窗口跑在应用自己的 webview 里，放进去等于把后端绑定交出去。
 func checkPreviewURL(raw string) (*url.URL, error) {
@@ -1500,7 +1525,10 @@ func clampIndex(i, n int) int {
 // previewTitle 组窗口标题：类型 + 一个人类认得出的短名。短名取不到就退回主机名，
 // 标题栏不能是空的。截断按 rune，切半个中文出来会在 UTF-8 里留下乱码。
 func previewTitle(kind, name, rawURL string) string {
-	label := map[string]string{KindImage: "图片", KindAudio: "音频", KindVideo: "视频", KindPage: "网页"}[kind]
+	label := map[string]string{
+		KindImage: "图片", KindAudio: "音频", KindVideo: "视频", KindPage: "网页",
+		KindText: "文本", KindPDF: "PDF", KindFile: "文件",
+	}[kind]
 	n := strings.TrimSpace(name)
 	if n == "" {
 		n = urlHost(rawURL)

@@ -186,6 +186,35 @@ func TestDefaultKeymapSeedsFileManager(t *testing.T) {
 	}
 }
 
+func TestDefaultKeymapSeedsDownloadManager(t *testing.T) {
+	// Alt+Z 后再按 D 是应用内序列；出厂绑定与补种台账都必须记住这个新命令。
+	km := DefaultKeymap()
+	var hit *KeyBinding
+	for i := range km.Bindings {
+		if km.Bindings[i].Command == "downloads.open-manager" {
+			hit = &km.Bindings[i]
+		}
+	}
+	if hit == nil {
+		t.Fatal("出厂绑定里没有 downloads.open-manager")
+	}
+	if hit.Keys != "M-z d" {
+		t.Fatalf("下载管理器出厂键为 %q, want %q", hit.Keys, "M-z d")
+	}
+	if !hit.Enabled {
+		t.Fatal("下载管理器出厂绑定默认是停用的")
+	}
+	found := false
+	for _, id := range km.Seeded {
+		if id == "downloads.open-manager" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Seeded 台账缺 downloads.open-manager：%v", km.Seeded)
+	}
+}
+
 func TestDefaultKeymapSeedsEditPath(t *testing.T) {
 	// 文件管理器“编辑路径”出厂绑定 M-x d，同样要开箱即用且进补种台账。
 	// 键位撞车由 TestDefaultKeymapHasNoDuplicateKeys 统一拦。

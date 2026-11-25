@@ -16,8 +16,9 @@ const emit = defineEmits<{ (e: 'cancel'): void; (e: 'close'): void }>()
 
 const cancelling = ref(false)
 
+const knownSize = computed(() => props.info.size > 0)
 const pct = computed(() => {
-  if (props.info.size <= 0) return 0
+  if (!knownSize.value) return 0
   return Math.min(100, Math.round((props.info.done / props.info.size) * 100))
 })
 
@@ -73,12 +74,13 @@ watch(finished, (f) => { if (f) cancelling.value = false })
       <button v-if="finished" class="zm-x" @click="emit('close')" title="关闭">✕</button>
     </div>
     <div class="zm-file" :title="info.filename">{{ info.filename || '（无文件名）' }}</div>
-    <div class="zm-bar">
-      <div class="zm-fill" :class="{ done: info.state === 'done', err: info.state === 'error', cancelled: info.state === 'cancelled' || info.state === 'skipped' }" :style="{ width: pct + '%' }"></div>
+    <div class="zm-bar" :class="{ unknown: !knownSize }">
+      <div v-if="knownSize" class="zm-fill" :class="{ done: info.state === 'done', err: info.state === 'error', cancelled: info.state === 'cancelled' || info.state === 'skipped' }" :style="{ width: pct + '%' }"></div>
+      <div v-else class="zm-indeterminate"></div>
     </div>
     <div class="zm-stats">
-      <span>{{ fmtBytes(info.done) }} / {{ fmtBytes(info.size) }}</span>
-      <span class="zm-pct">{{ pct }}%</span>
+      <span>{{ fmtBytes(info.done) }} / {{ knownSize ? fmtBytes(info.size) : '未知大小' }}</span>
+      <span class="zm-pct">{{ knownSize ? pct + '%' : '—' }}</span>
       <span>{{ fmtSpeed(speed) }}</span>
     </div>
     <div class="zm-msg" v-if="info.message">{{ info.message }}</div>
@@ -102,6 +104,8 @@ watch(finished, (f) => { if (f) cancelling.value = false })
 .zm-fill.done { background: #57d25a; }
 .zm-fill.err { background: #e05c5c; }
 .zm-fill.cancelled { background: #777; }
+.zm-indeterminate { width: 35%; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #2f74c0, #4a9ae6); animation: zm-slide 1.1s ease-in-out infinite alternate; }
+@keyframes zm-slide { from { transform: translateX(0); } to { transform: translateX(185%); } }
 .zm-stats { display: flex; justify-content: space-between; padding: 6px 14px 0; font-size: 12px; color: #8a919e; }
 .zm-pct { color: #d5d9e0; font-weight: 600; }
 .zm-msg { padding: 6px 14px 0; font-size: 12px; color: #e0b341; }

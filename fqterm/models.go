@@ -269,6 +269,12 @@ func DefaultKeymap() KeymapConfig {
 			Enabled: true,
 			Note:    "新建一个 Total Commander 式双栏文件管理器标签",
 		},
+		{
+			Keys:    "M-z d",
+			Command: "downloads.open-manager",
+			Enabled: true,
+			Note:    "打开下载管理器（按自动下载目录预览或删除）",
+		},
 		// 编辑文件管理器活动栏的路径（d = directory）。只在有可见文件管理器标签时生效，
 		// 落在终端标签上时命令自己回一句提示。键位与已占用的 p/f/k/s/r/m/l/v/i/t/e 都不撞。
 		{

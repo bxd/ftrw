@@ -36,6 +36,28 @@ func TestCheckPreviewURLAllowsOnlyHTTP(t *testing.T) {
 	}
 }
 
+func TestCheckPreviewItemURLAllowsSignedLocalFile(t *testing.T) {
+	ok := "/__ftrwfile?p=C%3A%5Cdownload%5Cpost%5Cpost.txt&k=abc123"
+	if u, err := checkPreviewItemURL(ok); err != nil || u.Path != fmFileRoute {
+		t.Fatalf("签名本地文件地址应放行: u=%v err=%v", u, err)
+	}
+	for _, bad := range []string{
+		"/__ftrwfile?p=C%3A%5Cx.txt",            // 缺签名
+		"/__ftrwfile?k=abc",                     // 缺路径
+		"/other?p=C%3A%5Cx.txt&k=abc",           // 不是文件资产路由
+		"//__ftrwfile?p=C%3A%5Cx.txt&k=abc",     // 跨域相对地址
+		"/__ftrwfile?p=C%3A%5Cx.txt&k=abc#page", // 签名地址不需要片段
+	} {
+		if u, err := checkPreviewItemURL(bad); err == nil {
+			t.Errorf("应拒绝 %q，实际通过并得到 %v", bad, u)
+		}
+	}
+	// 外部浏览器/另存为/探测仍只走 http/https，不能把本地资产地址交给它们。
+	if _, err := checkPreviewURL(ok); err == nil {
+		t.Error("普通链接准入不应放行本地文件地址")
+	}
+}
+
 func TestClampIndex(t *testing.T) {
 	cases := [][3]int{
 		{0, 5, 0},
