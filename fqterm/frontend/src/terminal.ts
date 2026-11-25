@@ -9,8 +9,9 @@ import * as api from './api'
 import { keyseq } from './keyseq'
 import { translateKey, type KeyContext } from './keymap'
 import { extractURLSpans, hostSpanAt, ipSpanAt, scanLines, type PreviewItem } from './linkscan'
-import { detectPageState, hitTest, inSpan, rowText, type Hit, type PageState, type Screen } from './menuclick'
+import { detectPageState, hitTest, inSpan, parsePostOptionsFields, rowColumnText, visibleText, type Hit, type PageState, type Screen } from './menuclick'
 import { foregroundFor, makeSgrFilter, type SgrFilter } from './sgrfilter'
+import { normalizeLines } from './posttransform'
 
 /**
  * 中英分别字体：xterm.js 只有一个 fontFamily，但 CSS 字体栈是按字符逐个回退的
@@ -152,6 +153,19 @@ function ensureIPStyle() {
   document.head.appendChild(st)
 }
 
+export interface ComposeContext {
+  sessionId: string
+  profileId: string
+  siteKey: string
+  siteName: string
+  mode: 'new' | 'reply'
+  board: string
+  title: string
+  quote: string
+  state: 'post-options' | 'editing'
+  canUploadAttachments: boolean
+}
+
 export class TermTab {
   id: string
   title: string
@@ -170,6 +184,10 @@ export class TermTab {
    */
   onDisconnectedSpace?: () => void
   onDisconnectedEnter?: () => void
+  /** 稳定的 BBS 发文页面出现时请求 App 打开本地编辑器；返回 false 表示未接管。 */
+  onCompose?: (context: ComposeContext) => boolean
+  onBbsState?: (state: PageState, text: string) => void
+  bbsState: PageState = 'unknown'
 
   // FQTerm 式拉伸：固定行数，把字号放大到刚好填满高度，再让列数随宽度回流填满，
   // 上下左右都填满；若有少量残余空隙则居中。
@@ -217,6 +235,13 @@ export class TermTab {
   private ipPinned = false
   // 灌入正文期间置真：两次触发挤在一起会让两批字节互相穿插，成品是乱码。
   private inserting = false
+  private bbsTimer: number | undefined
+  private bbsStableText = ''
+  private bbsStableSince = 0
+  private bbsStateRev = 0
+  private composeFlowActive = false
+  private composeDismissed = false
+  private lastReadingText = ''
 
   /** 悬停查 IP 归属地的开关，由 App.vue 按偏好设置；关掉就不再扫行。 */
   ipHoverEnabled = true
@@ -306,9 +331,12 @@ export class TermTab {
       if (this.id) api.Resize(this.id, cols, rows)
       this.menuRev++ // 行列变了，页面类型得重新判
     })
-    this.term.onWriteParsed(() => { this.menuRev++ })
+    this.term.onWriteParsed(() => {
+      this.menuRev++
+    })
     this.term.onScroll(() => { this.menuRev++ }) // 滚出原来的屏，光标行也就不再是对照点
     this.wireMenuClick()
+    this.bbsTimer = window.setInterval(() => this.detectBbsState(), 140)
   }
 
   /** 按键方案/退格键的当前判据：每次按键现取，站点编辑框改完立即生效。 */
@@ -374,7 +402,12 @@ export class TermTab {
 
   /** 站点编辑后即时套用新的字体/排版（对齐原版“保存即刷新窗口”，无需重连）。 */
   applyFontOptions(site?: api.Site) {
-    if (site) this.site = site
+    if (site) {
+      const reenabled = this.site.autoEditor === false && site.autoEditor === true
+      this.site = site
+      // 用户在设置里把自动编辑器重新打开时，当前发文流程应立即重新获得接管机会。
+      if (reenabled) { this.composeFlowActive = false; this.composeDismissed = false }
+    }
     this.baseFontSize = this.site.fontSize || 14
     this.fontAutoFit = this.site.fontAutoFit ?? 1
     this.sgr = makeSgrFilter(this.displayOpts()) // 高亮/ANSI 开关也走这条路：改完立即生效
@@ -576,7 +609,7 @@ export class TermTab {
     if (this.inserting) throw new Error('上一次灌入还没结束，请稍候')
     this.inserting = true
     try {
-      return await this.writeLines(text)
+      return await this.writeLines(normalizeLines(text))
     } finally {
       this.inserting = false
     }
@@ -927,6 +960,102 @@ export class TermTab {
     return st
   }
 
+  /** 最近一次稳定阅读页的可见文本，供本地编辑器手动插入引用。 */
+  get lastReading(): string { return this.lastReadingText }
+
+  /** 当前发文上下文；手动打开编辑器时使用，附件能力按当前页面严格判定。 */
+  composeContext(): ComposeContext | null {
+    if (!this.id || this.status !== 'connected' || this.site.hostType !== 0
+      || this.site.protocolType === 3) return null
+    const screen = this.screen()
+    const state = detectPageState(screen)
+    if (state !== 'post-options' && state !== 'editing') return null
+    return this.makeComposeContext(state, visibleText(screen))
+  }
+
+  /** 切回标签时补一次自动接管；用户关闭过的本次流程不会再次弹出。 */
+  autoComposeContext(): ComposeContext | null {
+    if (this.site.hostType !== 0 || this.site.protocolType === 3
+      || this.site.autoEditor === false || this.composeFlowActive || this.composeDismissed) return null
+    return this.composeContext()
+  }
+
+  /** App 用它在发送 Enter 前取快照，避免把上一屏的 editing 误当成新页面。 */
+  get stateRevision(): number { return this.bbsStateRev }
+
+  private makeComposeContext(state: 'post-options' | 'editing', text: string): ComposeContext {
+    const { title, board } = parsePostOptionsFields(text)
+    const reply = /回帖|Re\s*:/i.test(text) || /^Re\s*:/i.test(title)
+    const profileId = this.site.profileId || ''
+    return {
+      sessionId: this.id,
+      profileId,
+      siteKey: profileId ? `profile:${profileId}` : `${this.site.name || this.site.host}@${this.site.host}:${this.site.port}`,
+      siteName: this.site.name || this.site.host,
+      mode: reply ? 'reply' : 'new',
+      board,
+      title,
+      quote: this.lastReadingText.slice(0, 12000),
+      state,
+      canUploadAttachments: state === 'post-options' && !!this.site.enableZmodem,
+    }
+  }
+
+  /**
+   * 等一屏文字稳定 450ms 再更新语义状态。BBS 刷新常把标题、正文、状态行分几批写出，
+   * 每次 onWriteParsed 都判定会在半张脸上误弹编辑器；光标移动不影响文字指纹。
+   */
+  private detectBbsState() {
+    if (!this.id || this.status !== 'connected' || this.site.hostType !== 0
+      || this.site.protocolType === 3 || this.term.modes.mouseTrackingMode !== 'none') return
+    const s = this.screen()
+    const text = visibleText(s)
+    const now = Date.now()
+    if (text !== this.bbsStableText) {
+      this.bbsStableText = text
+      this.bbsStableSince = now
+      return
+    }
+    if (now - this.bbsStableSince < 450) return
+    const state = this.pageStateOf(s)
+    if (state !== this.bbsState) {
+      this.bbsState = state
+      this.bbsStateRev++
+      if (state === 'menu' || state === 'list' || state === 'reading' || state === 'post-confirm') {
+        this.composeFlowActive = false
+        this.composeDismissed = false
+      }
+      this.onBbsState?.(state, text)
+    }
+    // 阅读页翻屏时状态没变，但可见引用应跟着更新，而不是永远保留刚进文章时的第一屏。
+    if (state === 'reading') this.lastReadingText = text
+    if (state !== 'post-options' && state !== 'editing') return
+    if (this.site.autoEditor === false || this.composeFlowActive || this.composeDismissed) return
+    const accepted = this.onCompose?.(this.makeComposeContext(state, text)) === true
+    if (accepted) this.composeFlowActive = true
+  }
+
+  /**
+   * 等待远端进入目标状态；超时返回 false，绝不靠固定睡眠猜测编辑器已就绪。
+   * afterRevision 用于发送 Enter/上传后的转换：必须看到状态修订号前进，不能直接
+   * 接受调用前已经缓存下来的旧 editing 状态。
+   */
+  async waitForBbsState(target: PageState, timeout = 15000, afterRevision = -1): Promise<boolean> {
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      if (this.bbsState === target && this.bbsStateRev > afterRevision) return true
+      await sleep(100)
+    }
+    return this.bbsState === target && this.bbsStateRev > afterRevision
+  }
+
+  /** 本地编辑器关闭且未回传：本次发文不再自动弹第二次。 */
+  dismissCompose() { this.composeFlowActive = false; this.composeDismissed = true }
+  /** 正文已回传：仍保持 dismissed，避免灌入期间再次弹窗。 */
+  finishCompose() { this.composeFlowActive = false; this.composeDismissed = true }
+  /** 手动打开时占用本次流程，防止状态检测重复弹窗。 */
+  beginCompose() { this.composeFlowActive = true }
+
   /** 鼠标像素 -> 单元格；落在屏幕区（行高、滚动条）以外返回 null。 */
   private cellAt(ev: MouseEvent): { row: number; col: number } | null {
     const host = this.menuScreenEl
@@ -955,22 +1084,22 @@ export class TermTab {
     const hit = hitTest(s, state, row, col)
     if (!hit) return null
     // 链接优先：整屏都是 URL 的页面（图贴）不该被当成菜单
-    if (inSpan(extractURLSpans(rowText(s, row)), col)) return null
+    if (inSpan(extractURLSpans(rowColumnText(s, row)), col)) return null
     return hit
   }
 
   /**
-   * 某一行当前的纯文本，带一格缓存。
+   * 某一行当前的显示列文本，带一格缓存。
    *
    * 行文本只由「内容指纹 + 行号」决定：menuRev 在每次 onWriteParsed /
    * onScroll / onResize 上都进一，所以不会拿到旧屏。光标移动不改内容，
    * 也就不需要重扫。
    */
-  private rowTextOf(row: number): string {
+  private rowColumnsOf(row: number): string {
     if (this.ipRowCache && this.ipRowCache.rev === this.menuRev && this.ipRowCache.row === row) {
       return this.ipRowCache.text
     }
-    const text = rowText(this.screen(), row)
+    const text = rowColumnText(this.screen(), row)
     this.ipRowCache = { rev: this.menuRev, row, text }
     return text
   }
@@ -1057,7 +1186,7 @@ export class TermTab {
    */
   private addrAt(row: number, col: number): { text: string; start: number } | null {
     if (!this.ipHoverEnabled || !this.id) return null
-    const line = this.rowTextOf(row)
+    const line = this.rowColumnsOf(row)
     const ip = ipSpanAt(line, col)
     if (ip) return ip
     // URL 区间里的不算：点在 https://x/y 上是要开链接，不是查站点归属地
@@ -1153,7 +1282,7 @@ export class TermTab {
 
   /** Alt+单击的诊断：把坐标、列号、那一行原文发回给界面与日志。 */
   private probeCell(row: number, col: number) {
-    const line = this.rowTextOf(row)
+    const line = this.rowColumnsOf(row)
     const ip = ipSpanAt(line, col)
     const host = ip ? null : hostSpanAt(line, col)
     // 诊断的浮层要就地在点的那一格出现，而不是落到左上角
@@ -1190,6 +1319,8 @@ export class TermTab {
 
   dispose() {
     cancelAnimationFrame(this.stretchRaf)
+    if (this.bbsTimer) window.clearInterval(this.bbsTimer)
+    this.bbsTimer = undefined
     const el = this.term.element
     if (el) {
       // 摘除必须跟挂上时同一个 capture 标志，否则照旧收不到事件（dispose 里没人报错）

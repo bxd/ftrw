@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Store persists sites, preferences, keymap and color schemes as JSON files
@@ -19,6 +21,7 @@ type Store struct {
 	Keymap    KeymapConfig  `json:"keymap"`
 	GlobalKey GlobalKeymap  `json:"globalKey"`
 	FMState   FMState       `json:"fmState"`
+	Drafts    []EditorDraft `json:"drafts"`
 	loaded    bool
 }
 
@@ -121,9 +124,24 @@ func (s *Store) load() error {
 		}
 	}
 	// sites
+	sitesChanged := false
 	if b, err := os.ReadFile(s.file("sites.json")); err == nil {
 		var sites []Site
 		if json.Unmarshal(b, &sites) == nil {
+			seenIDs := make(map[string]bool, len(sites))
+			for i := range sites {
+				// 迁移 profileId 时会整表回写，必须同时落实旧 BBS 的 autoEditor 默认值，
+				// 否则缺失字段会先被 JSON 零值写成显式 false，下次启动再也无法区分。
+				if sites[i].HostType == 0 && sites[i].ProtocolType != 3 && !sites[i].autoEditorSet {
+					sites[i].AutoEditor = true
+					sitesChanged = true
+				}
+				if sites[i].ProfileID == "" || seenIDs[sites[i].ProfileID] {
+					sites[i].ProfileID = newProfileID()
+					sitesChanged = true
+				}
+				seenIDs[sites[i].ProfileID] = true
+			}
 			s.Sites = sites
 		}
 	}
@@ -164,6 +182,25 @@ func (s *Store) load() error {
 		var fm FMState
 		if json.Unmarshal(b, &fm) == nil {
 			s.FMState = fm
+		}
+	}
+	// drafts.json：本地文章草稿。独立于 preferences，避免编辑器自动保存触发整套偏好回调。
+	if b, err := os.ReadFile(s.file("drafts.json")); err == nil {
+		var drafts []EditorDraft
+		if json.Unmarshal(b, &drafts) == nil {
+			s.Drafts = drafts
+		} else {
+			// 损坏文件先保留备份，绝不静默当空草稿后再覆盖，用户仍可手工恢复内容。
+			backup := s.file("drafts.corrupt-" + time.Now().Format("20060102-150405.000000000") + ".json")
+			if err := os.Rename(s.file("drafts.json"), backup); err != nil {
+				return fmt.Errorf("草稿文件损坏且无法备份: %w", err)
+			}
+			log.Printf("草稿文件损坏，已备份到 %s", backup)
+		}
+	}
+	if sitesChanged {
+		if err := s.saveJSON("sites.json", s.Sites); err != nil {
+			log.Printf("保存站点迁移失败: %v", err)
 		}
 	}
 	s.loaded = true
@@ -229,7 +266,27 @@ func (s *Store) saveJSON(name string, v interface{}) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.file(name), b, 0o644)
+	path := s.file(name)
+	f, err := os.CreateTemp(filepath.Dir(path), "."+name+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() { _ = f.Close(); _ = os.Remove(tmp) }()
+	if err = f.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	// 同目录原子替换，断电/崩溃不会留下被截断的正式 JSON。
+	return os.Rename(tmp, path)
 }
 
 func (s *Store) SaveSites() error {
@@ -268,6 +325,13 @@ func (s *Store) SaveFMState() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.saveJSON("fmstate.json", s.FMState)
+}
+
+// SaveDrafts 落盘本地文章草稿（drafts.json）。
+func (s *Store) SaveDrafts() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveJSON("drafts.json", s.Drafts)
 }
 
 // Dir returns the config directory.

@@ -322,7 +322,9 @@ type frame struct {
 	crcOK  bool
 }
 
-func (ts *TerminalService) runZmodem(s *Session, initial []byte) {
+// runZmodem 驱动一次协议会话，并返回同一 TCP 块中协议结束后尚未消费的字节。
+// readLoop 必须把这些尾部交给终端解码；否则 ZFIN/OO 后紧跟的 BBS 重绘会被整体吞掉。
+func (ts *TerminalService) runZmodem(s *Session, initial []byte) []byte {
 	defer func() {
 		if r := recover(); r != nil {
 			ts.emitData(s.ID, fmt.Sprintf("\r\n\x1b[31m[ZMODEM 异常: %v]\x1b[0m\r\n", r))
@@ -343,9 +345,19 @@ func (ts *TerminalService) runZmodem(s *Session, initial []byte) {
 		s.uploadFiles = nil
 	}
 	err := e.run()
+	if errors.Is(err, errNotZmodem) {
+		// 上一轮批末的 ZFIN/ZACK 等残留帧不是新会话：不能消费下一份预选附件，
+		// 也不能进入冷却或丢弃后续真正的 ZRINIT，更不能往 BBS 命令行注入换行。
+		e.setReadDeadline(time.Time{})
+		return e.prebuf
+	}
 	if err != nil {
 		if !errors.Is(err, errCancelled) && !errors.Is(err, errNotZmodem) {
-			e.progress("error", "", 0, 0, "ZMODEM: "+err.Error())
+			state := "error"
+			if e.direction == "send" {
+				state = "batch-error" // 会话级失败；单文件 error 仍会继续传后续文件
+			}
+			e.progress(state, "", 0, 0, "ZMODEM: "+err.Error())
 		}
 		// 异常/误判退出后，TCP 缓冲里可能仍有大量裸二进制子包。
 		// readLoop 在静默窗口内继续丢弃，避免重新解码成终端乱码。
@@ -357,6 +369,10 @@ func (ts *TerminalService) runZmodem(s *Session, initial []byte) {
 	// 下一次正常 Read 会被误杀成超时、连接被平白判死断开。
 	e.setReadDeadline(time.Time{})
 	ts.emitData(s.ID, "\r\n")
+	if err != nil {
+		return nil // 异常/取消后尾部可能仍是二进制，不能回放给终端。
+	}
+	return e.prebuf
 }
 
 func (e *zmodemEngine) rxByte() (byte, error) {
@@ -449,10 +465,13 @@ func (e *zmodemEngine) emitDownloaded(name, dir string, paths []string, split bo
 // errCancelled 表示用户通过进度弹窗取消了传输，区别于真实协议错误。
 var errCancelled = errors.New("zmodem: 已取消")
 
+// errRemoteAbort 表示远端明确中止/拒绝当前协议会话，不能继续发送后续文件。
+var errRemoteAbort = errors.New("zmodem: 远端中止传输")
+
 // errSessionFinished 表示 receiveFile 已替外层完成 ZFIN 握手，receiver 不应再等待下一帧。
 var errSessionFinished = errors.New("zmodem: session finished")
 
-// errNotZmodem 表示自动检测命中的字节没有合法开场帧；不报传输错误，但需进入残留数据丢弃窗口。
+// errNotZmodem 表示自动检测命中的字节没有合法开场帧；不报传输错误，也不进入冷却或丢弃窗口。
 var errNotZmodem = errors.New("zmodem: no valid opening frame")
 
 // abortSeq 是 FQTerm ZmodemAbort(行 748-750) 的中止序列：CAN×8 + BS×10。
@@ -1001,12 +1020,21 @@ func (e *zmodemEngine) run() error {
 		return errNotZmodem
 	}
 	if fr.typ == zrinit {
-		paths, perr := e.promptUploadFiles()
-		if perr != nil || len(paths) == 0 {
-			// 用户取消：发 ZABORT 让远端 rz 退出，否则它会持续重发 ZRINIT 反复弹框。
-			e.sendHexHeader(zabort, 0)
-			e.progress("cancelled", "", 0, 0, "已取消上传")
-			return nil
+		// 只有对端确认以 rz 接收时才消费本地编辑器预选文件。残留 ZFIN/ZACK
+		// 走到这里之前已返回，不会把下一份附件提前吞掉。
+		if len(e.upload) == 0 && e.sess != nil {
+			e.upload = e.sess.takeStagedUpload()
+		}
+		paths := e.upload
+		if len(paths) == 0 {
+			var perr error
+			paths, perr = e.promptUploadFiles()
+			if perr != nil || len(paths) == 0 {
+				// 用户取消：发 ZABORT 让远端 rz 退出，否则它会持续重发 ZRINIT 反复弹框。
+				e.sendHexHeader(zabort, 0)
+				e.progress("cancelled", "", 0, 0, "已取消上传")
+				return nil
+			}
 		}
 		e.upload = paths
 		e.direction = "send"
@@ -1463,8 +1491,8 @@ func (e *zmodemEngine) sender() error {
 				return err // 取消：不再发 ZFIN/**OO，中止序列已发出
 			}
 			e.progress("error", filepath.Base(path), 0, 0, err.Error())
-			failCount++
-			continue
+			// 本地缺文件可在发送前跳过；协议/网络错误后继续发可能交错帧，必须整批失败。
+			return err
 		}
 		if e.lastSkipped {
 			skipCount++
@@ -1505,19 +1533,25 @@ func (e *zmodemEngine) sender() error {
 	}
 	e.setReadDeadline(time.Time{})
 	e.writeRaw([]byte{'O', 'O'}) // FQTerm OverAndOut：裸 "OO"，不带 ZPAD
-	// 收尾事件按批次结果区分：全成功才报“上传完成”；部分跳过要注明；
-	// 全部被拒/失败时不发 done，保留 skipped/error 终态避免误报成功。
-	switch {
-	case okCount > 0 && skipCount == 0 && failCount == 0:
-		e.progress("done", "", 0, 0, "上传完成")
-	case okCount > 0:
-		e.progress("done", "", 0, 0, fmt.Sprintf("上传完成（%d 个文件被跳过/失败）", skipCount+failCount))
-	case skipCount > 0 || failCount > 0:
-		// 无一成功：保留最后一个 skipped/error 事件作为终态
-	default:
-		e.progress("done", "", 0, 0, "上传完成")
-	}
+	// 只有整批 ZFIN/OO 收尾后才发批次终态。单文件 error/skipped 不是终态，
+	// 前端必须等 batch-done，避免后台还在传时再次 StageUpload 交错协议。
+	message := uploadBatchMessage(okCount, skipCount, failCount)
+	e.progress("batch-done", "", 0, 0, message)
 	return nil
+}
+
+func uploadBatchMessage(okCount, skipCount, failCount int) string {
+	failed := skipCount + failCount
+	switch {
+	case okCount > 0 && failed == 0:
+		return "上传完成"
+	case okCount > 0:
+		return fmt.Sprintf("上传完成（%d 个文件被跳过/失败）", failed)
+	case failed > 0:
+		return fmt.Sprintf("上传失败（%d 个文件被跳过/失败）", failed)
+	default:
+		return "上传完成"
+	}
 }
 
 func (e *zmodemEngine) sendFile(path string, fi os.FileInfo) error {
@@ -1566,7 +1600,7 @@ func (e *zmodemEngine) sendFile(path string, fi os.FileInfo) error {
 			startPos = fr.pos
 			havePos = true
 		case zabort, zferr:
-			return nil
+			return fmt.Errorf("%w: ZFILE 阶段收到 ZABORT/ZFERR", errRemoteAbort)
 		default:
 			// ZRINIT/ZRQINIT/ZACK 等陈旧或非预期帧，继续等待真正的 ZRPOS。
 			continue
@@ -1612,7 +1646,7 @@ func (e *zmodemEngine) sendFileData(path, name string, size int64, startPos uint
 				}
 				e.dbg("sendFileData: ZEOF-wait readFrame err=%v", rerr)
 				e.setReadDeadline(time.Time{})
-				return nil
+				return fmt.Errorf("zmodem: 未收到文件完成确认: %w", rerr)
 			}
 			e.dbg("sendFileData: ZEOF-wait frame typ=%d pos=%d", fr.typ, fr.pos)
 			switch fr.typ {
@@ -1632,7 +1666,7 @@ func (e *zmodemEngine) sendFileData(path, name string, size int64, startPos uint
 				return e.sendFileData(path, name, size, fr.pos)
 			case zabort, zferr:
 				e.setReadDeadline(time.Time{})
-				return nil
+				return fmt.Errorf("%w: ZEOF 阶段收到 ZABORT/ZFERR", errRemoteAbort)
 			default:
 				continue
 			}
@@ -1714,7 +1748,7 @@ func (e *zmodemEngine) sendFileData(path, name string, size int64, startPos uint
 				break ack
 			case zabort, zferr:
 				e.setReadDeadline(time.Time{})
-				return nil
+				return fmt.Errorf("%w: 数据阶段收到 ZABORT/ZFERR", errRemoteAbort)
 			default:
 				// ZRINIT/ZNAK/其它：数据态按 zmodem2 一律忽略，继续等真正的 ZACK/ZRPOS。
 				continue ack

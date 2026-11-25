@@ -1,14 +1,21 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ConfigService is the Wails-bound service exposing site manager, preferences
 // and color scheme operations to the frontend.
 type ConfigService struct {
-	store *Store
+	store   *Store
+	draftMu sync.Mutex // 草稿保存/删除串行化，避免慢请求覆盖新快照
 	// onProxyChanged 在代理设置真的改了之后被叫一次（异步）。存在的理由很具体：
 	// IP 库下载失败过一轮就要等一天再去碰，而用户刚刚才把代理填对——这时候不能让他
 	// 等到明天。见 main.go 里的接线。
@@ -36,11 +43,12 @@ func (cs *ConfigService) OnPrefsChanged(fn func(prefs Preferences)) {
 // --- Site manager ---
 
 func (cs *ConfigService) ListSites() []Site {
-	cs.store.mu.RLock()
-	defer cs.store.mu.RUnlock()
+	cs.store.mu.Lock()
+	defer cs.store.mu.Unlock()
 	out := make([]Site, len(cs.store.Sites))
 	for i, s := range cs.store.Sites {
 		out[i] = normalizeSite(s)
+		cs.store.Sites[i] = out[i]
 	}
 	return out
 }
@@ -53,8 +61,14 @@ func (cs *ConfigService) ListSites() []Site {
 // 「故意关掉」而不是「字段缺失」，一旦走进上面的分支就会被补成开保活 + ^@ 消息，
 // 于是每隔两分钟往用户的 shell 里灌一个 NUL。
 func normalizeSite(site Site) Site {
+	if site.ProfileID == "" {
+		site.ProfileID = newProfileID()
+	}
 	if site.ProtocolType == 3 {
 		return site
+	}
+	if site.HostType == 0 && !site.autoEditorSet {
+		site.AutoEditor = true
 	}
 	if site.MaxIdleSeconds == 0 {
 		site.MaxIdleSeconds = 120
@@ -86,10 +100,25 @@ func normalizeSite(site Site) Site {
 }
 
 func (cs *ConfigService) SaveSite(index int, site Site) error {
+	site = normalizeSite(site)
 	cs.store.mu.Lock()
 	if index >= 0 && index < len(cs.store.Sites) {
+		// profileId 是不可变身份：前端改名、改账号或换主机都不能把它换掉。
+		site.ProfileID = cs.store.Sites[index].ProfileID
+		if site.ProfileID == "" {
+			site.ProfileID = newProfileID()
+		}
 		cs.store.Sites[index] = site
 	} else {
+		for _, existing := range cs.store.Sites {
+			if site.ProfileID != "" && existing.ProfileID == site.ProfileID {
+				site.ProfileID = newProfileID()
+				break
+			}
+		}
+		if site.ProfileID == "" {
+			site.ProfileID = newProfileID()
+		}
 		cs.store.Sites = append(cs.store.Sites, site)
 	}
 	sites := append([]Site(nil), cs.store.Sites...)
@@ -162,6 +191,117 @@ func (cs *ConfigService) SetFMState(st FMState) error {
 	cs.store.FMState = st
 	cs.store.mu.Unlock()
 	return cs.store.SaveFMState()
+}
+
+// ListEditorDrafts 返回按最近修改时间倒序排列的本地文章草稿。
+func (cs *ConfigService) ListEditorDrafts() []EditorDraft {
+	cs.store.mu.RLock()
+	defer cs.store.mu.RUnlock()
+	out := make([]EditorDraft, len(cs.store.Drafts))
+	copy(out, cs.store.Drafts)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
+	return out
+}
+
+// SaveEditorDraft 新增或覆盖一篇草稿。revision 必须等于当前版本，旧快照不能覆盖新内容。
+func (cs *ConfigService) SaveEditorDraft(draft EditorDraft) (EditorDraft, error) {
+	draft = normalizeEditorDraft(draft)
+	if draft.ID == "" {
+		return EditorDraft{}, errors.New("草稿缺少 ID")
+	}
+	cs.draftMu.Lock()
+	defer cs.draftMu.Unlock()
+
+	draft.UpdatedAt = time.Now().UnixMilli()
+	cs.store.mu.Lock()
+	next := append([]EditorDraft(nil), cs.store.Drafts...)
+	found := false
+	for i := range next {
+		if next[i].ID == draft.ID {
+			if draft.Revision != next[i].Revision {
+				cs.store.mu.Unlock()
+				return EditorDraft{}, errors.New("草稿已在别处更新，请重新打开后再保存")
+			}
+			draft.CreatedAt = next[i].CreatedAt
+			draft.Revision++
+			next[i] = draft
+			found = true
+			break
+		}
+	}
+	if !found {
+		if draft.Revision != 0 {
+			cs.store.mu.Unlock()
+			return EditorDraft{}, errors.New("草稿已被删除或已在别处更新")
+		}
+		draft.Revision = 1
+		next = append(next, draft)
+	}
+	if len(next) > 200 {
+		sort.SliceStable(next, func(i, j int) bool {
+			return next[i].UpdatedAt > next[j].UpdatedAt
+		})
+		next = next[:200]
+	}
+	cs.store.mu.Unlock()
+	// 先写成功再提交内存；落盘失败时调用方仍持旧 revision，可以直接重试。
+	if err := cs.store.saveJSON("drafts.json", next); err != nil {
+		return EditorDraft{}, err
+	}
+	cs.store.mu.Lock()
+	cs.store.Drafts = next
+	cs.store.mu.Unlock()
+	return draft, nil
+}
+
+// DeleteEditorDraft 删除本地草稿；已经上传到 BBS 的正文不受影响。
+func (cs *ConfigService) DeleteEditorDraft(id string) error {
+	id = strings.TrimSpace(id)
+	cs.draftMu.Lock()
+	defer cs.draftMu.Unlock()
+	cs.store.mu.Lock()
+	next := make([]EditorDraft, 0, len(cs.store.Drafts))
+	for _, draft := range cs.store.Drafts {
+		if draft.ID != id {
+			next = append(next, draft)
+		}
+	}
+	cs.store.mu.Unlock()
+	if err := cs.store.saveJSON("drafts.json", next); err != nil {
+		return err
+	}
+	cs.store.mu.Lock()
+	cs.store.Drafts = next
+	cs.store.mu.Unlock()
+	return nil
+}
+
+// SaveEditorImage 把浏览器 Canvas 生成的 PNG 落到配置目录，返回可交给 ZMODEM 的路径。
+// 只接受 PNG 且限制 8 MiB：既防止把任意文件伪装成图片，也避免误传巨大临时对象。
+func (cs *ConfigService) SaveEditorImage(name, dataBase64 string) (string, error) {
+	if i := strings.Index(dataBase64, ","); i >= 0 && strings.HasPrefix(dataBase64, "data:") {
+		dataBase64 = dataBase64[i+1:]
+	}
+	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(dataBase64))
+	if err != nil {
+		return "", errors.New("图片数据不是有效的 base64")
+	}
+	if len(data) < 8 || len(data) > 8<<20 || string(data[:8]) != "\x89PNG\r\n\x1a\n" {
+		return "", errors.New("文字图片必须是小于 8 MiB 的 PNG")
+	}
+	name = sanitizeName(strings.TrimSpace(name))
+	if !strings.HasSuffix(strings.ToLower(name), ".png") {
+		name = strings.TrimSuffix(name, filepath.Ext(name)) + ".png"
+	}
+	dir := filepath.Join(cs.store.Dir(), "editor-images")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := uniquePath(dir, name)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // normalizePreferences 守住 quake 宽/高的合法区间：前端传回的是整个 Preferences 对象，

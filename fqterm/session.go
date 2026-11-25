@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -101,13 +102,15 @@ type Session struct {
 	cdc     *codec
 	writeMu sync.Mutex
 
-	closed      chan struct{} // 会话终止信号（用户主动断开/标签关闭时关闭）：停掉防空闲、重连、登录推进协程
-	closeOne    sync.Once
-	uploadFiles []string     // pending ZMODEM upload (sender) files
-	zmCancel    atomic.Bool  // ZMODEM 传输取消请求（进度弹窗的取消按钮置位，引擎在检查点响应）
-	zmCooldown  atomic.Int64 // 取消冷却截止（UnixNano）：期内丢弃在途残留 ZMODEM 帧，防误启假会话
-	zmDrain     atomic.Bool  // 异常退出后丢弃残留二进制，直到数据静默超过 zmDrainQuiet
-	zmLastRaw   atomic.Int64 // 最近一次残留二进制接收时刻（UnixNano），用于静默窗口判定
+	closed       chan struct{} // 会话终止信号（用户主动断开/标签关闭时关闭）：停掉防空闲、重连、登录推进协程
+	closeOne     sync.Once
+	uploadFiles  []string // pending ZMODEM upload (sender) files
+	stageMu      sync.Mutex
+	stagedUpload []string     // 本地编辑器预选；等 BBS 发 ZRINIT 后直接发送，不弹文件框
+	zmCancel     atomic.Bool  // ZMODEM 传输取消请求（进度弹窗的取消按钮置位，引擎在检查点响应）
+	zmCooldown   atomic.Int64 // 取消冷却截止（UnixNano）：期内丢弃在途残留 ZMODEM 帧，防误启假会话
+	zmDrain      atomic.Bool  // 异常退出后丢弃残留二进制，直到数据静默超过 zmDrainQuiet
+	zmLastRaw    atomic.Int64 // 最近一次残留二进制接收时刻（UnixNano），用于静默窗口判定
 
 	// 空闲保活 / 自动重连 / 自动登录（对齐原版 idleTimer_、reconnectProcess、doAutoLogin 语义）
 	lastAct      atomic.Int64 // 最近一次用户输入时刻（UnixNano）：防空闲据此判定静默时长
@@ -168,7 +171,9 @@ func NewTerminalService(store *Store) *TerminalService {
 }
 
 func (ts *TerminalService) emitData(id, data string) {
-	application.Get().Event.Emit("term:data", &TermData{ID: id, Data: data})
+	if app := application.Get(); app != nil {
+		app.Event.Emit("term:data", &TermData{ID: id, Data: data})
+	}
 }
 
 func (ts *TerminalService) emitStatus(s *Session) {
@@ -316,18 +321,14 @@ func (ts *TerminalService) readLoop(s *Session) {
 						if cd := s.zmCooldown.Load(); cd != 0 && time.Now().UnixNano() < cd {
 							ts.dbg("readLoop: 冷却期内丢弃残留 ZMODEM 帧 len=%d", len(raw))
 						} else {
-							ts.runZmodem(s, raw)
+							ts.replayZmodemTail(s, raw)
 						}
 						handled = true
 					}
 				}
 			}
 			if !handled {
-				text := s.cdc.decode(raw)
-				if len(text) > 0 {
-					ts.emitData(s.ID, string(text))
-					ts.feedLogin(s, text) // 自动登录：扇入输出流匹配登录提示
-				}
+				ts.emitTerminalBytes(s, raw)
 			}
 		}
 		if err != nil {
@@ -338,6 +339,34 @@ func (ts *TerminalService) readLoop(s *Session) {
 			ts.handleClosed(s, reason)
 			return
 		}
+	}
+}
+
+// replayZmodemTail 回放协议会话结束后仍留在当前读取块里的字节。水木 rz 退出后可能立刻
+// 重绘发文设置页；若这些字节与 ZFIN 同包到达，不能留在引擎 prebuf 中直接被丢弃。
+func (ts *TerminalService) replayZmodemTail(s *Session, raw []byte) {
+	for len(raw) > 0 {
+		tail := ts.runZmodem(s, raw)
+		if len(tail) == 0 {
+			return
+		}
+		if len(tail) >= len(raw) {
+			ts.dbg("replayZmodemTail: 残留帧未消耗任何字节，停止回放 len=%d", len(raw))
+			return
+		}
+		raw = tail
+		if !detectZmodem(raw) {
+			ts.emitTerminalBytes(s, raw)
+			return
+		}
+	}
+}
+
+func (ts *TerminalService) emitTerminalBytes(s *Session, raw []byte) {
+	text := s.cdc.decode(raw)
+	if len(text) > 0 {
+		ts.emitData(s.ID, string(text))
+		ts.feedLogin(s, text) // 自动登录：扇入输出流匹配登录提示
 	}
 }
 
@@ -455,6 +484,79 @@ func (ts *TerminalService) SendFile(id string, paths []string) error {
 	s.zmDrain.Store(false)
 	s.uploadFiles = paths
 	return ts.Write(id, "rz\r")
+}
+
+// StageUpload 预选本地编辑器附件。这里只保存路径，不主动发送 rz；调用方随后在 BBS
+// 发文设置页发送大写 U，让服务端启动 ZMODEM 接收端。小写 u 仅显示 HTTP 上传地址、不会起 rz。
+// 触发键目前按水木系写死为大写 U，其它 BBS 如需不同键再抽配置。
+func (ts *TerminalService) StageUpload(id string, paths []string) error {
+	s, ok := ts.get(id)
+	if !ok {
+		return errors.New("session not found")
+	}
+	if !s.Site.EnableZmodem {
+		return errors.New("zmodem disabled for this site")
+	}
+	if len(paths) == 0 {
+		return errors.New("no files selected")
+	}
+	if len(paths) > 20 {
+		return errors.New("一次最多上传 20 个附件")
+	}
+	clean := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return errors.New("附件路径为空")
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("附件路径无效：%w", err)
+		}
+		abs = filepath.Clean(abs)
+		fi, err := os.Stat(abs)
+		if err != nil {
+			return fmt.Errorf("附件不存在或无法读取（%s）：%w", filepath.Base(abs), err)
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("附件不是普通文件：%s", filepath.Base(abs))
+		}
+		if fi.Size() > 64<<20 {
+			return fmt.Errorf("附件超过 64 MiB：%s", filepath.Base(abs))
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		clean = append(clean, abs)
+	}
+	s.stageMu.Lock()
+	s.stagedUpload = append([]string(nil), clean...)
+	s.stageMu.Unlock()
+	s.zmCooldown.Store(0)
+	s.zmDrain.Store(false)
+	return nil
+}
+
+// ClearStagedUpload 清掉尚未被 BBS 接收的预选附件。
+func (ts *TerminalService) ClearStagedUpload(id string) error {
+	s, ok := ts.get(id)
+	if !ok {
+		return errors.New("session not found")
+	}
+	s.stageMu.Lock()
+	s.stagedUpload = nil
+	s.stageMu.Unlock()
+	return nil
+}
+
+func (s *Session) takeStagedUpload() []string {
+	s.stageMu.Lock()
+	defer s.stageMu.Unlock()
+	paths := s.stagedUpload
+	s.stagedUpload = nil
+	return paths
 }
 
 // CancelTransfer 请求中止当前 ZMODEM 传输（上传/下载均适用）。

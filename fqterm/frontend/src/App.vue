@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as api from './api'
-import { TermTab } from './terminal'
+import { TermTab, type ComposeContext } from './terminal'
+import { EDITOR_ENTER_TRIGGER, EDITOR_UPLOAD_TRIGGER, uploadEditorAttachmentsSequentially } from './editorupload'
 import { FmTab, type FmSnapshot } from './fmtab'
 import { Clipboard, Dialogs, Window } from '@wailsio/runtime'
 import SiteDialog from './components/SiteDialog.vue'
@@ -9,6 +10,8 @@ import PrefsDialog from './components/PrefsDialog.vue'
 import SchemeDialog from './components/SchemeDialog.vue'
 import ZmodemDialog from './components/ZmodemDialog.vue'
 import DownloadManagerDialog from './components/DownloadManagerDialog.vue'
+import BbsEditorDialog from './components/BbsEditorDialog.vue'
+import DraftManagerDialog from './components/DraftManagerDialog.vue'
 import KeymapDialog from './components/KeymapDialog.vue'
 import EditToolbar from './components/EditToolbar.vue'
 import { keyseq, registerCommand, type EchoInfo } from './keyseq'
@@ -404,7 +407,8 @@ function applyKeymap(c: api.KeymapConfig) {
  * 工具栏按钮后焦点就停在按钮上（不在 viewport 里），M-x p 这类绑定会全部失效。
  */
 function onGlobalKey(ev: KeyboardEvent) {
-  if (downloadDlg.show) return // 下载管理器自己处理列表/删除确认按键，不触发背后的应用命令
+  // 本地编辑器里的 Ctrl+Z/Y/F、Esc 都属于编辑操作；草稿管理也有自己的列表快捷键。
+  if (downloadDlg.show || editorDlg.show || draftDlg.show) return
   const el = document.activeElement
   // 焦点在终端里 → 交给 xterm 回调，不查两遍。但活动标签若是文件管理器（也挂在
   // viewport 里、没有 xterm）就不能早退：得让 M-x / S-<方向> 这些出厂序列在这也能用
@@ -512,6 +516,20 @@ registerCommand({
   title: '下载管理器：预览或删除已下载文章',
   description: '默认序列 M-z d（Alt+Z 后再按 D）；只按自动建立的下载目录操作，不进入目录内部',
   handler: () => { downloadDlg.show = true },
+})
+
+registerCommand({
+  id: 'editor.open',
+  title: '本地文章编辑器：打开当前文章或新建草稿',
+  description: '顶栏「本地编辑」；在 BBS 发文页打开时可回传正文，其它情况只保存本地草稿',
+  handler: () => openManualEditor(),
+})
+
+registerCommand({
+  id: 'editor.drafts',
+  title: '本地文章编辑器：管理草稿',
+  description: '顶栏「草稿」；可继续编辑、删除，或关联到当前 BBS 发文页回传',
+  handler: () => { if (!editorDlg.show) draftDlg.show = true },
 })
 
 // 编辑路径：命令住在 App 侧，但路径栏状态住在独立的 FileManagerView 里，
@@ -709,6 +727,19 @@ async function winClose() { try { await Window.Close() } catch { /* noop */ } }
 const siteDlg = reactive({ show: false, site: null as api.Site | null, index: -1, save: true })
 const prefsDlg = reactive({ show: false })
 const schemeDlg = reactive({ show: false })
+const editorDlg = reactive({
+  show: false,
+  context: null as ComposeContext | null,
+  draft: null as api.EditorDraft | null,
+  cols: 80,
+  busy: false,
+  error: '',
+})
+const draftDlg = reactive({ show: false })
+let composingTab: TermTab | null = null
+const uploadedPaths = new Set<string>()
+let bodyInsertAttempted = false
+let bodyInserted = false
 
 function closeDownloadManager() {
   downloadDlg.show = false
@@ -717,7 +748,255 @@ function closeDownloadManager() {
 
 // 任何全屏对话框开着时，悬浮面板不得浮现（它会滑到遮罩后面，看起来像残留的鬼影）。
 // sidebarShown 在上方已引用这里，但它的 getter 只在渲染时求值，不会碰到 TDZ。
-const dialogOpen = computed(() => siteDlg.show || prefsDlg.show || schemeDlg.show || kmDlg.show || downloadDlg.show)
+const dialogOpen = computed(() => siteDlg.show || prefsDlg.show || schemeDlg.show || kmDlg.show
+  || downloadDlg.show || editorDlg.show || draftDlg.show)
+
+/* ---------------- 本地文章编辑器 ---------------- */
+
+function errorText(e: unknown): string { return e instanceof Error ? e.message : String(e) }
+
+function sameProfile(a?: { profileId?: string } | null, b?: { profileId?: string } | null): boolean {
+  return !!a?.profileId && a.profileId === b?.profileId
+}
+
+function resetEditorFlow() {
+  editorDlg.show = false
+  editorDlg.context = null
+  editorDlg.draft = null
+  editorDlg.busy = false
+  editorDlg.error = ''
+  composingTab = null
+  uploadedPaths.clear()
+  bodyInsertAttempted = false
+  bodyInserted = false
+}
+
+function openCompose(tab: TermTab | null, context: ComposeContext | null, draft: api.EditorDraft | null = null): boolean {
+  if (editorDlg.show || editorDlg.busy || draftDlg.show || siteDlg.show || prefsDlg.show
+    || schemeDlg.show || kmDlg.show || downloadDlg.show || zm.show) return false
+  if (context && (!tab || context.sessionId !== tab.id || tab.status !== 'connected')) return false
+  // 没有稳定身份时只编辑本地草稿；旧草稿也不能仅凭同名/同端点自动关联到当前账号。
+  if (context && !context.profileId) context = null
+  if (context && draft && !sameProfile(draft, context)) context = null
+  keyseq.cancel('')
+  resetEditorFlow()
+  editorDlg.show = true
+  editorDlg.context = context
+  editorDlg.draft = draft
+  editorDlg.cols = tab?.termCols || 80
+  composingTab = context ? tab : null
+  if (context) tab!.beginCompose()
+  return true
+}
+
+function openManualEditor() {
+  if (editorDlg.show || editorDlg.busy) return
+  const tab = activeTerm()
+  const context = tab?.site.hostType === 0 ? tab.composeContext() : null
+  openCompose(tab, context)
+}
+
+function openDraft(draft: api.EditorDraft) {
+  if (editorDlg.show || editorDlg.busy) return
+  draftDlg.show = false
+  const tab = activeTerm()
+  const current = tab?.site.hostType === 0 ? tab.composeContext() : null
+  const context = current && sameProfile(current, draft) && !draft.synced ? current : null
+  openCompose(tab, context, draft)
+}
+
+function openNewDraft() {
+  if (editorDlg.show || editorDlg.busy) return
+  draftDlg.show = false
+  openCompose(activeTerm(), null)
+}
+
+function closeEditor() {
+  if (editorDlg.busy) return
+  composingTab?.dismissCompose()
+  resetEditorFlow()
+  nextTick(() => insts[active.value]?.focus())
+}
+
+interface UploadWaiter {
+  sessionId: string
+  started: boolean
+  timer: number
+  promise: Promise<void>
+  resolve: () => void
+  reject: (error: Error) => void
+}
+const uploadWaiters = new Map<string, UploadWaiter>()
+
+function settleUpload(waiter: UploadWaiter, error?: Error) {
+  if (uploadWaiters.get(waiter.sessionId) !== waiter) return
+  uploadWaiters.delete(waiter.sessionId)
+  window.clearTimeout(waiter.timer)
+  if (error) waiter.reject(error)
+  else waiter.resolve()
+}
+
+function cancelEditorUpload(sessionId: string, message: string) {
+  const waiter = uploadWaiters.get(sessionId)
+  if (waiter) settleUpload(waiter, new Error(message))
+}
+
+function rejectSessionUploads(sessionId: string, message: string) {
+  cancelEditorUpload(sessionId, message)
+}
+
+function waitForEditorUpload(tab: TermTab): UploadWaiter {
+  cancelEditorUpload(tab.id!, '已被新的附件上传替换')
+  let resolve!: () => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<void>((ok, fail) => { resolve = ok; reject = fail })
+  const waiter: UploadWaiter = {
+    sessionId: tab.id!, started: false, timer: 0, promise, resolve, reject,
+  }
+  waiter.timer = window.setTimeout(() => {
+    const message = waiter.started
+      ? '附件上传超过 5 分钟未完成，已请求中止；草稿仍保留在本地'
+      : '等待 BBS 启动附件接收超时；请确认当前仍在发文设置页且已启用 ZMODEM'
+    if (!waiter.started) console.debug('editorUpload timeout', tab.id, '35s 内未收到任何 ZMODEM 进度事件（未收到服务器 ZRINIT）')
+    if (waiter.started) void api.CancelTransfer(tab.id!).catch(() => { /* 会话可能已断开 */ })
+    settleUpload(waiter, new Error(message))
+  }, 35000)
+  uploadWaiters.set(tab.id!, waiter)
+  return waiter
+}
+
+function notifyEditorUpload(d: api.ZmodemProgress) {
+  const waiter = uploadWaiters.get(d.id)
+  if (!waiter || (d.direction && d.direction !== 'send')) return
+  if ((d.state === 'start' || d.state === 'progress') && !waiter.started) {
+    waiter.started = true
+    window.clearTimeout(waiter.timer)
+    waiter.timer = window.setTimeout(() => {
+      void api.CancelTransfer(d.id).catch(() => { /* 会话可能已断开 */ })
+      settleUpload(waiter, new Error('附件上传超过 5 分钟未完成，已请求中止；草稿仍保留在本地'))
+    }, 300000)
+  }
+  if (d.state === 'batch-done') {
+    // 单文件 error/skipped 不代表整批结束；只有批次终态才能继续灌正文。
+    settleUpload(waiter, /跳过|失败/.test(d.message || '')
+      ? new Error(`附件未全部上传成功：${d.message}`)
+      : undefined)
+  } else if (d.state === 'batch-error' || d.state === 'cancelled') {
+    settleUpload(waiter, new Error(d.message || '附件上传未完成'))
+  }
+}
+
+async function uploadEditorAttachments(
+  tab: TermTab,
+  paths: string[],
+  onUploaded: (path: string) => void,
+): Promise<void> {
+  await uploadEditorAttachmentsSequentially(tab, paths, {
+    clearStagedUpload: (id) => api.ClearStagedUpload(id),
+    stageUpload: (id, files) => api.StageUpload(id, files),
+    transferOne: async (target, path) => {
+      // 先挂等待器再发命令，避免服务器很快回传 ZRINIT 时错过首批事件。
+      // 大写 U 触发服务端 ZMODEM 接收；水木 getdata 还要回车才提交，小写 u 仅显示 HTTP 地址。
+      const waiter = waitForEditorUpload(tab)
+      try {
+        console.debug('editorUpload trigger', target.id, 'file:', path, 'keys: U + Enter')
+        await api.Write(target.id, EDITOR_UPLOAD_TRIGGER)
+        await waiter.promise
+      } catch (e) {
+        settleUpload(waiter, new Error(errorText(e)))
+        await waiter.promise.catch(() => { /* 已转成外层错误 */ })
+        throw e
+      }
+    },
+  }, onUploaded, (done, total) => {
+    editorDlg.error = done === total
+      ? '附件已处理，正在进入远端编辑器…'
+      : `正在上传附件…（${done}/${total}）`
+  })
+}
+
+async function submitEditor(draft: api.EditorDraft) {
+  if (editorDlg.busy) return
+  const tab = composingTab
+  const context = editorDlg.context
+  if (!tab || !context) {
+    // 独立草稿已由对话框自身保存成功，这里只负责收尾。
+    resetEditorFlow()
+    showEcho('草稿已保存', 'info')
+    return
+  }
+  if (draft.transferState === 'sending' || draft.transferState === 'sent') {
+    editorDlg.error = '这篇草稿已开始回传，不能重复提交；请先回终端检查远端正文，或新建草稿。'
+    return
+  }
+  if (bodyInsertAttempted || bodyInserted) {
+    editorDlg.error = bodyInserted
+      ? '正文已经完整回传，不要重复提交；请回到终端人工发表。'
+      : '正文可能已经部分写入远端编辑器，不要直接重复回传。请先回终端检查，或关闭后新建草稿。'
+    return
+  }
+  editorDlg.busy = true
+  editorDlg.error = ''
+  try {
+    if (!tab.id || tab.status !== 'connected') throw new Error('终端会话已断开，草稿已保留')
+    let current = tab.composeContext()
+    if (!current || !sameProfile(current, context)) throw new Error('当前已离开对应的 BBS 发文页，未发送任何内容')
+
+    if (current.state === 'post-options') {
+      const pending = draft.attachments
+        .map((a) => a.path)
+        .filter((path) => !uploadedPaths.has(path.toLowerCase()))
+      if (pending.length) {
+        if (!current.canUploadAttachments) throw new Error('附件只能在发文设置页上传，并且站点必须启用 ZMODEM')
+        editorDlg.error = '正在上传附件…'
+        await uploadEditorAttachments(tab, pending, (path) => uploadedPaths.add(path.toLowerCase()))
+      }
+      // 水木在整批附件上传完后还需一次回车接受发文参数，才会进入正文编辑器。
+      // 该回车必须排在最后一份 ZFIN/OO 之后；不能再依赖附件间的屏幕重绘识别。
+      editorDlg.error = '附件已处理，正在进入远端编辑器…'
+      const revision = tab.stateRevision
+      await api.Write(tab.id, EDITOR_ENTER_TRIGGER)
+      if (!await tab.waitForBbsState('editing', 20000, revision)) {
+        throw new Error('等待远端正文编辑器超时；请检查终端画面，草稿和已上传附件状态均已保留')
+      }
+    }
+
+    const ready = tab.composeContext()
+    if (!ready || ready.state !== 'editing' || !sameProfile(ready, context)) {
+      throw new Error('当前不在对应 BBS 的远端正文编辑器，未灌入正文')
+    }
+    if (draft.attachments.some((a) => !uploadedPaths.has(a.path.toLowerCase()))) {
+      throw new Error('还有附件未上传，不能从远端正文编辑器继续；请返回发文设置页后再试')
+    }
+    editorDlg.error = '正在保存回传状态…'
+    // 首个字节写出前先落盘；此后关闭重开也会保留“已开始回传”的防重复保护。
+    draft = await api.SaveEditorDraft({ ...draft, transferState: 'sending' })
+    editorDlg.draft = draft
+    editorDlg.error = '正在逐行回传正文…'
+    bodyInsertAttempted = true
+    await tab.insertText(draft.body)
+    bodyInserted = true
+    try {
+      draft = await api.SaveEditorDraft({ ...draft, transferState: 'sent', synced: true, updatedAt: Date.now() })
+      editorDlg.draft = draft
+    } catch (e) {
+      throw new Error(`正文已回传，但草稿状态保存失败：${errorText(e)}`)
+    }
+    tab.finishCompose()
+    resetEditorFlow()
+    showEcho('正文已回传 BBS，尚未发表；请在终端检查后人工发表', 'info', true)
+    nextTick(() => insts[active.value]?.focus())
+  } catch (e) {
+    const reason = errorText(e)
+    editorDlg.error = bodyInserted
+      ? `正文已完整回传，但未能标记草稿：${reason}。不要重复回传，请直接回终端人工发表。`
+      : bodyInsertAttempted
+        ? `正文可能已部分写入远端编辑器：${reason}。不要直接重复回传，请先回终端检查。`
+        : `回传未完成，草稿已保留：${reason}`
+  } finally {
+    editorDlg.busy = false
+  }
+}
 
 // ZMODEM 进度弹窗状态（由 zmodem:progress 事件驱动）
 const zm = reactive({ show: false, id: '', direction: 'send', filename: '', size: 0, done: 0, state: '', message: '' })
@@ -725,6 +1004,12 @@ let zmHideTimer: number | undefined
 
 function onZmCancel() {
   if (zm.id) api.CancelTransfer(zm.id).catch(() => { /* session gone */ })
+}
+
+function zmodemFinished(direction: string, state: string): boolean {
+  if (state === 'cancelled' || state === 'batch-error') return true
+  if (direction === 'send') return state === 'batch-done'
+  return state === 'done' || state === 'error' || state === 'skipped'
 }
 
 const statusText = (s: string) =>
@@ -847,6 +1132,10 @@ async function newTab(site: api.Site) {
   // 回车重连（复用 api.Connect 起新会话、api.Disconnect 清掉旧的死会话）。
   tab.onDisconnectedSpace = () => { const i = idxOf(tab); if (i >= 0) void closeTab(i) }
   tab.onDisconnectedEnter = () => { void reconnectTab(tab) }
+  tab.onCompose = (context) => {
+    if (activeTerm() !== tab) return false
+    return openCompose(tab, context)
+  }
   // 鼠标点菜单：开关取偏好（旧 prefs.json 没这个键时算开），悬停命中的提示进 echo 区
   tab.menuClick = prefs.value?.menuClickEnabled !== false
   tab.onMenuHint = (label) => showEcho(`点菜单：${label}`, 'info')
@@ -1073,7 +1362,13 @@ async function openDownloadedPreview(d: api.ZmodemDownloaded) {
 function setActive(i: number) {
   active.value = i
   insts.forEach((t, idx) => { t.container.style.display = idx === i ? 'block' : 'none' })
-  nextTick(() => { const t = insts[i]; if (t) { t.fitNow(); t.focus() } })
+  const t = insts[i]
+  // 切回一个已经停在发文页的标签时补一次自动接管；文件管理器没有 site/terminal 方法。
+  if (t?.site) {
+    const context = t.autoComposeContext()
+    if (context) openCompose(t, context)
+  }
+  nextTick(() => { if (t) { t.fitNow(); if (!editorDlg.show) t.focus() } })
 }
 
 /**
@@ -1166,7 +1461,8 @@ async function closeTab(i: number) {
     }))
     if (r !== '断开') return
   }
-  if (t.id) { api.Disconnect(t.id); byId.delete(t.id) }
+  if (t.id) { rejectSessionUploads(t.id, '终端标签已关闭'); api.Disconnect(t.id); byId.delete(t.id) }
+  if (composingTab === t) resetEditorFlow()
   t.dispose()
   t.container.remove()
   insts.splice(i, 1)
@@ -1188,7 +1484,7 @@ async function reconnectTab(tab: TermTab) {
   tab.setStatus('connecting')
   if (tabs.value[mi]) tabs.value[mi].status = 'connecting'
   const old = tab.id
-  if (old) { api.Disconnect(old).catch(() => { /* 死会话断开失败无所谓 */ }); byId.delete(old) }
+  if (old) { rejectSessionUploads(old, '终端正在重连'); api.Disconnect(old).catch(() => { /* 死会话断开失败无所谓 */ }); byId.delete(old) }
   tab.write('\r\n\x1b[90m[正在重连…]\x1b[0m\r\n')
   try {
     const id = await api.Connect(tab.site)
@@ -1219,14 +1515,24 @@ async function openSiteEditor(index: number) {
 }
 
 async function onSiteSaved(site: api.Site, index: number, save: boolean) {
-  if (save) { await api.SaveSite(index, site); await refreshSites() }
-  siteDlg.show = false
-  // 编辑已有站点时，已打开的同名标签即时套用新字体/排版（对齐原版“保存即刷新窗口”，
-  // 字体以外的连接类变更仍需重连生效）。
-  if (save && index >= 0) {
-    for (const t of insts) if (t.site.name === site.name) t.applyFontOptions(site)
+  const previous = save && index >= 0 ? sites.value[index] : null
+  let savedSite = site
+  if (save) {
+    await api.SaveSite(index, site)
+    await refreshSites()
+    if (index >= 0) savedSite = sites.value[index] || site
   }
-  await newTab(site)
+  siteDlg.show = false
+  // 已打开标签按不可变 profileId 即时套用新字体/排版和 autoEditor；
+  // 改名、换主机都不会错认账号。
+  if (previous) {
+    for (const t of insts) {
+      if (sameProfile(t.site, previous)) {
+        t.applyFontOptions(savedSite)
+      }
+    }
+  }
+  await newTab(savedSite)
 }
 
 async function removeSite(index: number) { await api.DeleteSite(index); await refreshSites() }
@@ -1343,6 +1649,7 @@ onMounted(async () => {
     const t = byId.get(d.id)
     if (!t) return
     t.setStatus(d.status)
+    if (d.status === 'closed' || d.status === 'error') rejectSessionUploads(d.id, '终端连接已断开')
     if (d.title) t.title = d.title
     const mi = idxOf(t)
     if (mi >= 0 && tabs.value[mi]) {
@@ -1352,9 +1659,10 @@ onMounted(async () => {
   })
   offZ = api.onZmodem((d) => {
     const t = byId.get(d.id)
-    if (!t) return
+    if (!t) { rejectSessionUploads(d.id, '终端会话已断开'); return }
+    notifyEditorUpload(d)
     if (zmHideTimer) { clearTimeout(zmHideTimer); zmHideTimer = undefined }
-    const fin = d.state === 'done' || d.state === 'error' || d.state === 'cancelled' || d.state === 'skipped'
+    const fin = zmodemFinished(d.direction || zm.direction, d.state)
     // 结束事件的 size/filename 可能为空，沿用进行中状态里的值让弹窗信息完整
     zm.show = true
     zm.id = d.id
@@ -1367,7 +1675,7 @@ onMounted(async () => {
     if (fin) {
       // 终态自动收起：完成/取消 1 秒后消失；失败/跳过留 10 秒供看清原因（也可手动 ✕）
       const st = d.state
-      const hideMs = (st === 'done' || st === 'cancelled') ? 1000 : 10000
+      const hideMs = (st === 'done' || st === 'batch-done' || st === 'cancelled') ? 1000 : 10000
       zmHideTimer = window.setTimeout(() => { if (zm.state === st) zm.show = false }, hideMs)
     }
     // 状态栏简短提示（保留旧行为）
@@ -1414,7 +1722,18 @@ onMounted(async () => {
   window.addEventListener('beforeunload', onSaveFmBeforeUnload)
 })
 
-onBeforeUnmount(() => { offData?.(); offStatus?.(); offZ?.(); offDownloaded?.(); offMode?.(); offIP?.(); offReveal?.(); if (zmHideTimer) clearTimeout(zmHideTimer); if (echoTimer) clearTimeout(echoTimer); if (fmSaveTimer) clearTimeout(fmSaveTimer); clearSideHide(); window.removeEventListener('resize', onWinResize); window.removeEventListener('blur', onWindowBlur); window.removeEventListener('keydown', onGlobalKey, true); window.removeEventListener('beforeunload', onSaveFmBeforeUnload) })
+onBeforeUnmount(() => {
+  for (const id of [...uploadWaiters.keys()]) rejectSessionUploads(id, '应用正在关闭')
+  offData?.(); offStatus?.(); offZ?.(); offDownloaded?.(); offMode?.(); offIP?.(); offReveal?.()
+  if (zmHideTimer) clearTimeout(zmHideTimer)
+  if (echoTimer) clearTimeout(echoTimer)
+  if (fmSaveTimer) clearTimeout(fmSaveTimer)
+  clearSideHide()
+  window.removeEventListener('resize', onWinResize)
+  window.removeEventListener('blur', onWindowBlur)
+  window.removeEventListener('keydown', onGlobalKey, true)
+  window.removeEventListener('beforeunload', onSaveFmBeforeUnload)
+})
 
 function onWinResize() {
   insts[active.value]?.fitNow()
@@ -1488,6 +1807,8 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
         <option v-for="s in schemes" :key="s.name" :value="s.name">{{ s.name }}</option>
       </select>
       <button @click="downloadDlg.show = true" title="下载管理器（Alt+Z 后再按 D）">下载</button>
+      <button @click="openManualEditor" :disabled="editorDlg.busy" title="打开本地文章编辑器">本地编辑</button>
+      <button @click="draftDlg.show = true" :disabled="editorDlg.busy" title="管理本地文章草稿">草稿</button>
       <button @click="schemeDlg.show = true" title="配色方案编辑">🎨</button>
       <button @click="kmDlg.show = true" title="键序列 / 热键编辑器（Emacs 风格）">⌨ 热键</button>
       <button @click="prefsDlg.show = true" title="偏好设置">⚙ 设置</button>
@@ -1576,6 +1897,10 @@ const cur = computed(() => (active.value >= 0 ? { meta: tabs.value[active.value]
     <SchemeDialog v-if="schemeDlg.show" :schemes="schemes" @close="schemeDlg.show = false"
                   @changed="async () => { schemes = await api.ListSchemes(); applySchemeToActive() }" />
     <DownloadManagerDialog v-if="downloadDlg.show" @close="closeDownloadManager" />
+    <BbsEditorDialog v-if="editorDlg.show" :context="editorDlg.context" :draft="editorDlg.draft"
+                    :cols="editorDlg.cols" :busy="editorDlg.busy" :error="editorDlg.error"
+                    @submit="submitEditor" @close="closeEditor" />
+    <DraftManagerDialog v-if="draftDlg.show" @edit="openDraft" @new="openNewDraft" @close="draftDlg.show = false" />
     <ZmodemDialog v-if="zm.show" :info="zm" @cancel="onZmCancel" @close="zm.show = false" />
     <KeymapDialog v-if="kmDlg.show" :km="km" :gk="gk" @save="onKeymapSave" @close="kmDlg.show = false" />
   </div>

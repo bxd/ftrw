@@ -16,7 +16,7 @@
  * （terminal.ts 用 buffer 填）。因此可以拿真实水木屏幕文本单独跑断言。
  */
 
-export type PageState = 'unknown' | 'menu' | 'list'
+export type PageState = 'unknown' | 'menu' | 'list' | 'reading' | 'post-options' | 'editing' | 'post-confirm'
 
 /**
  * 一屏的只读视图。行/列都是 **显示列**（0 基）：宽字符占两列，所以
@@ -60,15 +60,24 @@ export const KEY = {
   enter: '\r',
 }
 
-/**
- * 把一行展开成「一个显示列一个字符」的字符串：空串（宽字符右半格）补成空格。
- *
- * 不能直接 cells.join('')：那会让字串下标比显示列少掉所有中文的那一半，
- * 菜单项区间、URL 区间、鼠标列三者就对不上了。每列只取一个码元，所以
- * 碰上 astral 字（GB18030 扩展汉字、emoji）时会退化成半个代理对 —— 仍然
- * 是个「非空格」，本层只关心这一列有没有内容，判定不受影响。
- */
+/** 一行的语义文本：跳过宽字符右半格的空串，保留中文词句与原有空白。 */
 export function rowText(s: Screen, row: number): string {
+  const cells = s.rowCells(row)
+  let out = ''
+  for (let i = 0; i < s.cols; i++) {
+    const ch = cells[i]
+    if (ch) out += ch
+  }
+  return out
+}
+
+/**
+ * 一行的显示列文本：每个单元格占一个下标，宽字符右半格补成空格。
+ *
+ * 只用于菜单项、URL/IP 等需要把字符串下标直接对应鼠标显示列的地方。
+ * 页面识别与引用必须用 rowText，否则汉字会被拆成「发 信 人」，中文正则全部失配。
+ */
+export function rowColumnText(s: Screen, row: number): string {
   const cells = s.rowCells(row)
   let out = ''
   for (let i = 0; i < s.cols; i++) {
@@ -76,10 +85,6 @@ export function rowText(s: Screen, row: number): string {
     out += ch ? ch[0]! : ' '
   }
   return out
-}
-
-function blankAt(text: string, i: number): boolean {
-  return i < 0 || i >= text.length || text[i] === ' '
 }
 
 /** 行内非空字符数：整行只有边框线、只有空格的行都靠它排掉。 */
@@ -107,30 +112,33 @@ export interface MenuEntry {
  *   `cstr.lastIndexOf("   ")` 再算宽度的做法同旨，只是这里直接按列走。
  */
 export function itemsInRow(s: Screen, row: number): MenuEntry[] {
-  const text = rowText(s, row)
+  const cells = s.rowCells(row)
+  const text = rowColumnText(s, row)
   const out: MenuEntry[] = []
+  // 右半格空串属于前一个宽字符，不能把它当成菜单项前的空白。
+  const blankCellAt = (i: number) => i < 0 || i >= s.cols || cells[i] === ' '
   ITEM_MARK.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = ITEM_MARK.exec(text)) !== null) {
     const mark = m.index
     // 正则只会落在「0)」上，多位序号自己往前并回来
     let tokenStart = mark
-    while (tokenStart > 0 && /[0-9]/.test(text[tokenStart - 1]!)) tokenStart--
-    if (!blankAt(text, tokenStart - 1)) continue
+    while (tokenStart > 0 && /[0-9]/.test(cells[tokenStart - 1]!)) tokenStart--
+    if (!blankCellAt(tokenStart - 1)) continue
     // 分隔符后面紧跟字母/数字的是行文里的编号或小数（「3.5 万」、「2.0」），不是菜单项
-    if (/[0-9A-Za-z]/.test(text[mark + 2] ?? ' ')) continue
+    if (/[0-9A-Za-z]/.test(cells[mark + 2] ?? ' ')) continue
     const token = text.slice(tokenStart, mark + 1)
     // 项后面得真跟着文字：句子结尾的「等等.」不算
-    if (!text.slice(mark + 2).trim()) continue
+    if (!cells.slice(mark + 2).some((ch) => ch && ch !== ' ')) continue
 
     let end = mark + 2
-    const limit = Math.min(text.length, mark + 60)
+    const limit = Math.min(s.cols, mark + 60)
     while (end < limit) {
-      if (blankAt(text, end) && blankAt(text, end + 1)) break
+      if (blankCellAt(end) && blankCellAt(end + 1)) break
       end++
     }
     // 去掉尾巴上的间隙，高亮框才是贴着文字而不是多出一截空白
-    while (end > mark + 2 && blankAt(text, end - 1)) end--
+    while (end > mark + 2 && blankCellAt(end - 1)) end--
     out.push({ token, start: tokenStart, end })
     ITEM_MARK.lastIndex = end
   }
@@ -152,11 +160,37 @@ function isListRow(s: Screen, row: number): boolean {
 /**
  * 判页面类型。宁可 unknown 也不要乱认：unknown 时整条链路等于不存在。
  *
- * - menu：成片出现的编号项（横排一行里 ≥2 项，或整屏累计 ≥4 项）。
- * - list：≥3 行像清单。列表排在菜单之后判，因为菜单页里也常有带日期的说明行，
- *   而编号项一旦成串就是明确的「按字符选一项」现场。
+ * 编辑/确认/阅读页要先于菜单和清单判定：正文里出现编号、日期或「发信人」等词，
+ * 都不能让它反过来变成可点击菜单。每个语义状态都要求多个屏幕特征同时成立。
  */
 export function detectPageState(s: Screen): PageState {
+  const lines: string[] = []
+  for (let r = 0; r < s.rows; r++) lines.push(rowText(s, r).trimEnd())
+  const text = lines.join('\n')
+  const has = (re: RegExp) => re.test(text)
+
+  const editorMode = lines.some((line) =>
+    /(?:插入|INSERT)\s*\|\s*(?:OVER|覆盖)/i.test(line)
+    || /(?:OVER|覆盖)\s*\|\s*(?:插入|INSERT)/i.test(line)
+    || /状态\s*\[\s*(?:插入|替换|INSERT|OVER)\s*\]/i.test(line))
+  if (editorMode && has(/(?:Ctrl\+Q|Ctrl-Q|Ctrl\^Q|\^Q|C-q).*(?:帮助|求助|求救)/i)) return 'editing'
+
+  // 水木系 KBS_BBS 的普通发文页没有「匿名/转信」，最终提示是「Enter继续」。
+  // 多个发文特征必须同时出现，避免把正文或初始标题输入页误当成发文设置页。
+  const waterwoodPostOptions = has(/发表文章于\s*.+?\s+讨论区/)
+    && has(/使用标题\s*[:：]/)
+    && has(/使用(?:随机|第\s*\d+\s*个)\s*签名档/)
+    && has(/Enter\s*(?:继续|接受)/i)
+  const legacyPostOptions = has(/(?:^|\n)\s*(?:使用)?标题\s*[:：]/)
+    && has(/(?:^|\n)\s*(?:使用)?(?:随机|第\s*\d+\s*个)?签名档\s*[:：]/)
+    && has(/(?:^|\n)\s*(?:匿名|转信)\s*(?:[:：]|$)/m)
+    && has(/(?:接受所有设定|Enter\s*接受)/i)
+  if (waterwoodPostOptions || legacyPostOptions) return 'post-options'
+
+  if (has(/站内/) && has(/转信/) && has(/\[L\]/i)) return 'post-confirm'
+
+  if (has(/发信人\s*[:：]/) && has(/标\s*题\s*[:：]/) && has(/发信站\s*[:：]/)) return 'reading'
+
   let rowsWithItems = 0
   let totalItems = 0
   let listRows = 0
@@ -175,6 +209,25 @@ export function detectPageState(s: Screen): PageState {
   return 'unknown'
 }
 
+/** 当前可见屏幕文本；去掉行尾空白和屏幕底部空行，供引用与发文上下文解析。 */
+export function visibleText(s: Screen): string {
+  const lines: string[] = []
+  for (let r = 0; r < s.rows; r++) lines.push(rowText(s, r).replace(/\s+$/g, ''))
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  return lines.join('\n')
+}
+
+/** 从已识别的发文设置页提取标题与版名；水木真实格式与旧版格式都要兼容。 */
+export function parsePostOptionsFields(text: string): { title: string; board: string } {
+  const title = text.match(/^\s*使用标题\s*[:：]\s*(.*?)\s*$/m)?.[1]?.trim()
+    || text.match(/^\s*(?:使用)?标题\s*[:：]\s*(.*?)\s*$/m)?.[1]?.trim()
+    || ''
+  const board = text.match(/^\s*发表文章于\s+([^\s]+)\s+讨论区/m)?.[1]?.trim()
+    || text.match(/^\s*(?:讨论区|版面|版名|所在版)\s*[:：]\s*([^\s]+)/m)?.[1]?.trim()
+    || ''
+  return { title, board }
+}
+
 function hit(keys: string[], row: number, x0: number, x1: number, cursor: Hit['cursor'], label: string): Hit {
   return { keys, row, x0, x1, cursor, label }
 }
@@ -184,7 +237,7 @@ function hit(keys: string[], row: number, x0: number, x1: number, cursor: Hit['c
  * 上层应当保持 xterm 自己的选择行为、并且不要改光标形状。
  */
 export function hitTest(s: Screen, state: PageState, row: number, col: number): Hit | null {
-  if (state === 'unknown') return null
+  if (state !== 'menu' && state !== 'list') return null
   if (row < 0 || row >= s.rows || col < 0 || col >= s.cols) return null
 
   if (state === 'menu') {

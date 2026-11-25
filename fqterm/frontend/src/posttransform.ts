@@ -119,7 +119,9 @@ function insertBetween(line: string, pick: (index: number) => string): string {
 
 /** 统一成 \n 的 internal 表示；灌入时再按行还原成回车。 */
 export function normalizeLines(text: string): string {
-  return text.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+  return text.replace(/\r\n?/g, '\n')
+    .replace(/\t/g, '    ')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
 }
 
 /**

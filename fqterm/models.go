@@ -1,8 +1,16 @@
 package main
 
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+)
+
 // Site mirrors FQTerm's FQTermParam connection profile (see fqterm src/common/fqterm_param.h).
 // It describes a saved connection in the site manager.
 type Site struct {
+	// ProfileID 是跨改名、改主机仍保持不变的配置身份；草稿关联和已打开标签更新都靠它认 profile。
+	ProfileID string `json:"profileId"`
 	// General
 	Name         string `json:"name"`         // display name
 	Host         string `json:"host"`         // host address
@@ -48,6 +56,8 @@ type Site struct {
 	ReconnectInterva int    `json:"reconnectInterval"`
 	ReconnectRetries int    `json:"reconnectRetries"` // 重连重试次数；-1 = 无限（对齐原版 retryTimes_）
 	EnableZmodem     bool   `json:"enableZmodem"`
+	AutoEditor       bool   `json:"autoEditor"` // BBS 发文设置页自动打开本地编辑器
+	autoEditorSet    bool   // 仅用于兼容旧 JSON：缺字段默认开，显式 false 保持关闭
 	Group            string `json:"group"` // site manager folder/group
 
 	// 网络代理（D3）：站点级覆盖，编号沿用原版 fqterm.h 但含义多一档 ——
@@ -66,6 +76,23 @@ type Site struct {
 	ShellID   string   `json:"shellID"`
 	ShellArgs []string `json:"shellArgs"`
 	Auto      bool     `json:"auto"`
+}
+
+// UnmarshalJSON 记住 autoEditor 是否显式出现。bool 的零值无法区分「旧配置缺字段」
+// 与「用户明确关闭」，而这两者的默认行为恰好相反。
+func (s *Site) UnmarshalJSON(data []byte) error {
+	type plain Site
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*s = Site(decoded)
+	_, s.autoEditorSet = fields["autoEditor"]
+	return nil
 }
 
 // Preferences is the global application configuration (see FQTermPref).
@@ -416,9 +443,19 @@ type ColorScheme struct {
 	Palette    [16]string `json:"palette"`
 }
 
+// newProfileID 生成不暴露账号或主机信息的稳定随机标识。
+func newProfileID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // DefaultSite returns a sensible BBS-oriented default profile.
 func DefaultSite() Site {
 	return Site{
+		ProfileID:        newProfileID(),
 		Host:             "bbs.example.com",
 		Port:             23,
 		HostType:         0,
@@ -431,6 +468,7 @@ func DefaultSite() Site {
 		CursorType:       0,
 		Backspace:        1,
 		EnableZmodem:     true,
+		AutoEditor:       true,
 		// 空闲/重连默认值对齐原版 fqterm_param.cpp：maxIdle=120、antiidlestring="^@"、isantiidle=true。
 		MaxIdleSeconds:   120,
 		AntiIdle:         true,

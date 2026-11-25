@@ -22,13 +22,22 @@ const pct = computed(() => {
   return Math.min(100, Math.round((props.info.done / props.info.size) * 100))
 })
 
-const finished = computed(() => ['done', 'error', 'cancelled', 'skipped'].includes(props.info.state))
+const finished = computed(() => {
+  if (props.info.state === 'cancelled' || props.info.state === 'batch-error') return true
+  if (props.info.direction === 'send') return props.info.state === 'batch-done'
+  return ['done', 'error', 'skipped'].includes(props.info.state)
+})
+const batchFailed = computed(() => props.info.state === 'batch-done' && /跳过|失败/.test(props.info.message))
+const failed = computed(() => props.info.state === 'error' || props.info.state === 'batch-error' || batchFailed.value)
+const successful = computed(() => finished.value && !failed.value && props.info.state !== 'skipped')
 
 const title = computed(() => {
   const d = props.info.direction === 'send' ? '上传' : '下载'
   switch (props.info.state) {
     case 'done': return `${d}完成`
+    case 'batch-done': return batchFailed.value ? `${d}未全部完成` : `${d}完成`
     case 'error': return `${d}失败`
+    case 'batch-error': return `${d}失败`
     case 'cancelled': return '已取消'
     case 'skipped': return '被服务器跳过'
     default: return `${d}中…`
@@ -75,7 +84,7 @@ watch(finished, (f) => { if (f) cancelling.value = false })
     </div>
     <div class="zm-file" :title="info.filename">{{ info.filename || '（无文件名）' }}</div>
     <div class="zm-bar" :class="{ unknown: !knownSize }">
-      <div v-if="knownSize" class="zm-fill" :class="{ done: info.state === 'done', err: info.state === 'error', cancelled: info.state === 'cancelled' || info.state === 'skipped' }" :style="{ width: pct + '%' }"></div>
+      <div v-if="knownSize" class="zm-fill" :class="{ done: successful, err: failed, cancelled: info.state === 'cancelled' || info.state === 'skipped' }" :style="{ width: pct + '%' }"></div>
       <div v-else class="zm-indeterminate"></div>
     </div>
     <div class="zm-stats">

@@ -30,6 +30,7 @@ const s = reactive<api.Site>({
   // useAnsiColor 不在这里兜底：后端 normalizeSite 已经按「旧站点」补成开，而用户真关掉时
   // 这里再补一次就会把「ANSI 颜色」永远锁在开。alwaysHighlight 出厂为关，缺键正好。
   alwaysHighlight: raw.alwaysHighlight ?? false,
+  autoEditor: raw.autoEditor ?? true,
   // 按键方案出厂 BBS（与后端 defaultSite 一致）；SSH 私钥两个字段旧站点根本没有。
   keyType: raw.keyType ?? 0,
   keyFile: raw.keyFile ?? '',
@@ -230,6 +231,12 @@ function doSave() {
             <label>重试次数</label>
             <div class="row2"><input type="number" v-model.number="s.reconnectRetries" min="-1" /> <span class="unit">-1 为无限重试</span></div>
           </div>
+        </fieldset>
+
+        <fieldset v-if="!isLocal && s.hostType === 0">
+          <legend>本地文章编辑器</legend>
+          <label class="chk"><input type="checkbox" v-model="s.autoEditor" /> 自动打开本地编辑器</label>
+          <p class="hint">进入 BBS 发文设置页时自动接管正文编辑；保存后回传远端编辑器，仍由你人工发表。关闭后不再自动弹出，仍可从顶栏手动打开。</p>
         </fieldset>
 
         <fieldset v-if="!isLocal">

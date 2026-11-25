@@ -575,6 +575,38 @@ func (s *AppService) PickKeyFile() (string, error) {
 	return path, nil
 }
 
+// PickEditorFiles 供本地编辑器选择附件。返回真实绝对路径，浏览器 File 对象无法直接
+// 交给 Go 侧 ZMODEM，因此必须走原生对话框。取消返回空切片。
+func (s *AppService) PickEditorFiles() ([]string, error) {
+	if s.app == nil {
+		return nil, errors.New("应用尚未就绪")
+	}
+	s.dialogGuard.Store(true)
+	defer s.dialogGuard.Store(false)
+	opts := &application.OpenFileDialogOptions{
+		Title:                   "选择文章附件",
+		Message:                 "可多选；保存并回传时按顺序上传",
+		CanChooseFiles:          true,
+		CanChooseDirectories:    false,
+		AllowsMultipleSelection: true,
+		AllowsOtherFileTypes:    true,
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		opts.Directory = home
+	}
+	if s.win != nil {
+		opts.Window = s.win
+	}
+	paths, err := s.app.Dialog.OpenFileWithOptions(opts).PromptForMultipleSelection()
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "cancel") {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	return paths, nil
+}
+
 // ApplyPreferences 在偏好保存后重放与原生侧相关的设置（目前是托盘显隐）。
 // 模式几何不在此处重算：quake 宽高只在下次进入 quake 时生效，避免正在用的下拉
 // 因为改了个数字就突然跳高跳宽。

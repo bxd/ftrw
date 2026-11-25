@@ -5,6 +5,8 @@ import { Call, Events } from '@wailsio/runtime'
 // ---- Data models mirroring the Go structs ----
 
 export interface Site {
+  // 跨改名、改账号和换主机保持不变的配置身份；旧 profile 由后端迁移补齐。
+  profileId?: string
   name: string
   host: string
   port: number
@@ -42,6 +44,8 @@ export interface Site {
   reconnectInterval: number
   reconnectRetries: number // 重连重试次数，-1 = 无限
   enableZmodem: boolean
+  // BBS 发文设置页是否自动打开本地编辑器；旧 profile 缺字段时按开启处理
+  autoEditor?: boolean
   group: string
   // 网络代理（D3）站点级覆盖：0=跟随全局设置（旧站点缺键即此） 1=本站点强制直连
   // 2=SOCKS4 3=SOCKS5 4=HTTP。选了类型但地址为空等于不用代理。
@@ -234,6 +238,7 @@ export const SetGlobalKeysPaused = (on: boolean): Promise<void> => Call.ByName(`
 export const SetDialogGuard = (on: boolean): Promise<void> => Call.ByName(`${appsvc}.SetDialogGuard`, on)
 // SSH 私钥选择：弹原生选文件框，起始目录落在 ~/.ssh；取消返空串（不是错误）
 export const PickKeyFile = (): Promise<string> => Call.ByName(`${appsvc}.PickKeyFile`)
+export const PickEditorFiles = (): Promise<string[]> => Call.ByName(`${appsvc}.PickEditorFiles`)
 // 偏好保存后重放与原生侧相关的设置（目前是托盘显隐）
 export const ApplyAppPreferences = (): Promise<void> => Call.ByName(`${appsvc}.ApplyPreferences`)
 
@@ -509,6 +514,37 @@ export const DeleteDownloads = (paths: string[]): Promise<void> =>
 export const PreviewDownload = (path: string): Promise<PreviewItem[]> =>
   Call.ByName(`${downloads}.Preview`, path)
 
+export interface EditorAttachment {
+  name: string
+  path: string
+  size: number
+  generated: boolean
+}
+
+export interface EditorDraft {
+  id: string
+  profileId?: string
+  revision: number
+  siteKey: string
+  siteName: string
+  mode: string
+  board: string
+  title: string
+  body: string
+  quote?: string
+  attachments: EditorAttachment[]
+  createdAt: number
+  updatedAt: number
+  synced: boolean
+  transferState?: '' | 'sending' | 'sent'
+}
+
+export const ListEditorDrafts = (): Promise<EditorDraft[]> => Call.ByName(`${cfg}.ListEditorDrafts`)
+export const SaveEditorDraft = (draft: EditorDraft): Promise<EditorDraft> => Call.ByName(`${cfg}.SaveEditorDraft`, draft)
+export const DeleteEditorDraft = (id: string): Promise<void> => Call.ByName(`${cfg}.DeleteEditorDraft`, id)
+export const SaveEditorImage = (name: string, dataBase64: string): Promise<string> =>
+  Call.ByName(`${cfg}.SaveEditorImage`, name, dataBase64)
+
 // ---- Terminal service ----
 
 export const Connect = (site: Site): Promise<string> => Call.ByName(`${term}.Connect`, site)
@@ -516,6 +552,8 @@ export const Write = (id: string, data: string): Promise<void> => Call.ByName(`$
 export const Resize = (id: string, cols: number, rows: number): Promise<void> => Call.ByName(`${term}.Resize`, id, cols, rows)
 export const Disconnect = (id: string): Promise<void> => Call.ByName(`${term}.Disconnect`, id)
 export const SendFile = (id: string, paths: string[]): Promise<void> => Call.ByName(`${term}.SendFile`, id, paths)
+export const StageUpload = (id: string, paths: string[]): Promise<void> => Call.ByName(`${term}.StageUpload`, id, paths)
+export const ClearStagedUpload = (id: string): Promise<void> => Call.ByName(`${term}.ClearStagedUpload`, id)
 export const CancelTransfer = (id: string): Promise<void> => Call.ByName(`${term}.CancelTransfer`, id)
 export const ListSessions = (): Promise<SessionInfo[]> => Call.ByName(`${term}.ListSessions`)
 
