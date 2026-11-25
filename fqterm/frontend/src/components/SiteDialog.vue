@@ -10,7 +10,7 @@ const props = defineProps<{
   schemes: api.ColorScheme[]
 }>()
 const emit = defineEmits<{
-  (e: 'save', site: api.Site, index: number, save: boolean): void
+  (e: 'save', site: api.Site, index: number, save: boolean, connect: boolean): void
   (e: 'close'): void
 }>()
 
@@ -125,12 +125,12 @@ const proxyHint = computed(() => {
   }
 })
 
-function doSave() {
+function doSave(connect: boolean) {
   if (isLocal.value) {
     // 本地 shell 不参与下面那套「旧站点缺字段」兼容归一化：它的 maxIdleSeconds=0 是
     // 故意关掉，补成 120 会让保活重新启动。
     s.shellArgs = splitArgs(argsText.value)
-    emit('save', { ...s }, props.index, props.save)
+    emit('save', { ...s }, props.index, props.save, connect)
     return
   }
   // 字段归一化：避免旧站点数据缺项导致后端拿到 0 值而行为错乱。
@@ -139,7 +139,7 @@ function doSave() {
   if (!s.reconnectInterval || s.reconnectInterval < 1) s.reconnectInterval = 3
   if (s.reconnectRetries === undefined || s.reconnectRetries === null) s.reconnectRetries = -1
   if (s.antiIdleMessage === undefined || s.antiIdleMessage === null) s.antiIdleMessage = '^@'
-  emit('save', { ...s }, props.index, props.save)
+  emit('save', { ...s }, props.index, props.save, connect)
 }
 </script>
 
@@ -338,7 +338,8 @@ function doSave() {
         </fieldset>
       </div>
       <div class="foot">
-        <button class="primary" @click="doSave">{{ save ? '保存并连接' : '连接' }}</button>
+        <button v-if="save" @click="doSave(false)">仅保存</button>
+        <button class="primary" @click="doSave(true)">{{ save ? '保存并连接' : '连接' }}</button>
         <button @click="emit('close')">取消</button>
       </div>
     </div>

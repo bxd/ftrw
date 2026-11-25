@@ -1514,7 +1514,7 @@ async function openSiteEditor(index: number) {
   Object.assign(siteDlg, { show: true, site: s, index, save: true })
 }
 
-async function onSiteSaved(site: api.Site, index: number, save: boolean) {
+async function onSiteSaved(site: api.Site, index: number, save: boolean, connect: boolean) {
   const previous = save && index >= 0 ? sites.value[index] : null
   let savedSite = site
   if (save) {
@@ -1532,7 +1532,8 @@ async function onSiteSaved(site: api.Site, index: number, save: boolean) {
       }
     }
   }
-  await newTab(savedSite)
+  if (connect) await newTab(savedSite)
+  else showEcho('站点已保存', 'info')
 }
 
 async function removeSite(index: number) { await api.DeleteSite(index); await refreshSites() }
