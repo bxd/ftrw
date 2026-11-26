@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import * as api from '../api'
 import type { ComposeContext } from '../terminal'
 import { applySeparators, isQuoteLine, normalizeLines, SEP_DEFAULT, SEP_PRESETS, toVertical } from '../posttransform'
-import { clipboardImageFileName, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from '../editorinput'
+import { clipboardImageFileName, isSaveAndHandoffShortcut, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from '../editorinput'
 import TextImageDialog from './TextImageDialog.vue'
 
 const props = defineProps<{
@@ -162,6 +162,12 @@ function onEditorKey(e: KeyboardEvent) {
   if (e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo() }
   else if (e.key.toLowerCase() === 'y') { e.preventDefault(); redo() }
   else if (e.key.toLowerCase() === 'f') { e.preventDefault(); findOpen.value = true }
+}
+function onDialogKey(e: KeyboardEvent) {
+  if (imageOpen.value || !isSaveAndHandoffShortcut(e)) return
+  e.preventDefault()
+  e.stopPropagation()
+  void submit()
 }
 function replaceSelection(value: string) {
   const el = editor.value
@@ -442,7 +448,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="mask" @mousedown.self="keepEditorFocus" @click.self="keepEditorFocus">
-    <div class="dlg" role="dialog" aria-modal="true" aria-label="本地文章编辑器" @keydown.esc.stop.prevent="close">
+    <div class="dlg" role="dialog" aria-modal="true" aria-label="本地文章编辑器" @keydown="onDialogKey" @keydown.esc.stop.prevent="close">
       <div class="head">
         <span>本地文章编辑器 <i>{{ context ? (context.mode === 'reply' ? '回帖' : '发文') : '草稿' }}</i></span>
         <button class="x" :disabled="locked" @click="close">✕</button>
@@ -491,7 +497,7 @@ onBeforeUnmount(() => {
         data-file-drop-target="editor-attachments"
         spellcheck="false"
         wrap="soft"
-        title="Ctrl+V 可粘贴文件或剪贴板图片；也可把文件拖到这里作为附件"
+        title="Ctrl+W 保存并回传；Ctrl+V 可粘贴文件或剪贴板图片；也可把文件拖到这里作为附件"
         @input="onInput"
         @keydown="onEditorKey"
         @paste="onPaste"

@@ -80,7 +80,7 @@ onBeforeUnmount(() => { if (timer) window.clearTimeout(timer); renderSeq++ })
                       class="style" :class="[`style-${preset.id}`, { on: opts.style === preset.id }]"
                       :aria-pressed="opts.style === preset.id" @click="pickStyle(preset.id)">
                 <span class="swatch" :class="`swatch-${preset.id}`"
-                      :style="{ background: preset.cardBackground, color: preset.foreground, borderColor: preset.borderColor }">Aa</span>
+                      :style="{ background: preset.cardBackground, color: preset.foreground }">Aa</span>
                 <span class="style-copy"><strong>{{ preset.name }}</strong><small>{{ preset.description }}</small></span>
               </button>
             </div>
@@ -129,7 +129,7 @@ onBeforeUnmount(() => { if (timer) window.clearTimeout(timer); renderSeq++ })
 .style-classic.on { border-color: #35e7ff; box-shadow: inset 0 0 0 1px rgba(53,231,255,.5), 0 0 14px rgba(53,231,255,.14); }
 .style-gold.on { border-color: #d6af62; background: linear-gradient(135deg, #3b3020, #242017); box-shadow: inset 0 0 0 1px rgba(214,175,98,.45), 0 0 14px rgba(214,175,98,.12); }
 .style-glitch.on { border-color: #ff4fd8; background: linear-gradient(135deg, #25213c, #351c33); box-shadow: inset 0 0 0 1px rgba(255,79,216,.45), 2px 0 0 rgba(85,246,255,.18); }
-.swatch { position: relative; overflow: hidden; flex: 0 0 36px; width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid; font: 600 13px/1 "Segoe UI", sans-serif; }
+.swatch { position: relative; overflow: hidden; flex: 0 0 36px; width: 36px; height: 36px; display: grid; place-items: center; border: 0; font: 600 13px/1 "Segoe UI", sans-serif; }
 .swatch-classic { box-shadow: inset 0 0 12px rgba(53,231,255,.12), 0 0 9px rgba(53,231,255,.24); }
 .swatch-aurora { border-radius: 10px; box-shadow: inset 0 0 0 3px rgba(255,255,255,.07), 0 0 12px rgba(103,232,249,.2); backdrop-filter: blur(3px); }
 .swatch-gold { border-radius: 2px; box-shadow: inset 0 0 0 3px #100d09, inset 0 0 0 4px rgba(214,175,98,.5), 0 0 10px rgba(214,175,98,.18); }

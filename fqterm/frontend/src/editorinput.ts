@@ -1,5 +1,10 @@
 export const MAX_EDITOR_ATTACHMENTS = 20
 
+// 与编辑器底栏主按钮共用同一个提交入口，避免快捷键走出另一套保存/回传逻辑。
+export function isSaveAndHandoffShortcut(e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey'>): boolean {
+  return (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'w'
+}
+
 export function attachmentPathKey(path: string): string {
   return path.trim().toLowerCase()
 }
