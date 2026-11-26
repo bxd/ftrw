@@ -58,7 +58,8 @@ type Site struct {
 	EnableZmodem     bool   `json:"enableZmodem"`
 	AutoEditor       bool   `json:"autoEditor"` // BBS 发文设置页自动打开本地编辑器
 	autoEditorSet    bool   // 仅用于兼容旧 JSON：缺字段默认开，显式 false 保持关闭
-	Group            string `json:"group"` // site manager folder/group
+	LinkHoverPreview bool   `json:"linkHoverPreview"` // 鼠标在链接上停留 1 秒后自动下载并预览，默认关闭
+	Group            string `json:"group"`            // site manager folder/group
 
 	// 网络代理（D3）：站点级覆盖，编号沿用原版 fqterm.h 但含义多一档 ——
 	// 0=跟随全局设置（旧 sites.json 缺键即此，行为与升级前一致）、1=本站点强制直连、
@@ -469,6 +470,7 @@ func DefaultSite() Site {
 		Backspace:        1,
 		EnableZmodem:     true,
 		AutoEditor:       true,
+		LinkHoverPreview: false,
 		// 空闲/重连默认值对齐原版 fqterm_param.cpp：maxIdle=120、antiidlestring="^@"、isantiidle=true。
 		MaxIdleSeconds:   120,
 		AntiIdle:         true,

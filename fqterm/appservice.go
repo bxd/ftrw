@@ -122,6 +122,7 @@ func (s *AppService) prefs() Preferences {
 // 通知区域，而那一刻 SetIcon 还没调，Wails 会回退到内置的 "W" 图标。见 SetupTray。
 func (s *AppService) Start() {
 	s.installCloseHook()
+	s.installEditorDropHook()
 	s.installBlurHook()
 	s.installQuakeOnTop()
 	s.startGlobalKeys()

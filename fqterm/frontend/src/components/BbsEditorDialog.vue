@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import * as api from '../api'
 import type { ComposeContext } from '../terminal'
 import { applySeparators, isQuoteLine, normalizeLines, SEP_DEFAULT, SEP_PRESETS, toVertical } from '../posttransform'
+import { clipboardImageFileName, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from '../editorinput'
 import TextImageDialog from './TextImageDialog.vue'
 
 const props = defineProps<{
@@ -43,6 +44,10 @@ const editor = ref<HTMLTextAreaElement | null>(null)
 const saveState = ref<'saved' | 'saving' | 'error'>('saved')
 const localError = ref('')
 const picking = ref(false)
+const addingPaths = ref(false)
+const pasting = ref(false)
+const dragActive = ref(false)
+let offEditorDrop: (() => void) | null = null
 const imageOpen = ref(false)
 const imageText = ref('')
 let imageSource: { start: number; end: number; text: string } | null = null
@@ -232,6 +237,33 @@ function jumpLine() {
   editor.value?.focus()
   editor.value?.setSelectionRange(pos, pos + lines[n - 1].length)
 }
+// 选文件、粘贴 CF_HDROP、拖放文件共用同一条校验/入库链路。
+async function addPaths(paths: string[]): Promise<boolean> {
+  if (locked.value || addingPaths.value) return false
+  const pending = newAttachmentPaths(paths, draft.attachments)
+  if (!pending.length) return false
+  const room = MAX_EDITOR_ATTACHMENTS - draft.attachments.length
+  if (pending.length > room) {
+    localError.value = `一次最多 ${MAX_EDITOR_ATTACHMENTS} 个附件，当前还能添加 ${room} 个`
+    return false
+  }
+  addingPaths.value = true
+  localError.value = ''
+  try {
+    for (const path of pending) {
+      const stat = await api.FileStat(path)
+      if (stat.isDir) throw new Error(`不能添加目录：${stat.name}`)
+      draft.attachments.push({ name: stat.name, path: stat.path, size: stat.size, generated: false })
+    }
+    return true
+  } catch (e: any) {
+    localError.value = e?.message || String(e)
+    return false
+  } finally {
+    addingPaths.value = false
+  }
+}
+
 async function pickFiles() {
   if (locked.value || picking.value) return
   picking.value = true
@@ -243,16 +275,72 @@ async function pickFiles() {
     try { paths = await api.PickEditorFiles() } finally {
       setTimeout(() => { api.SetDialogGuard(false).catch(() => { /* noop */ }) }, 250)
     }
-    const room = 20 - draft.attachments.length
-    if (paths.length > room) throw new Error(`一次最多 20 个附件，当前还能添加 ${room} 个`)
-    for (const path of paths) {
-      if (draft.attachments.some((a) => a.path.toLowerCase() === path.toLowerCase())) continue
-      const stat = await api.FileStat(path)
-      if (stat.isDir) throw new Error(`不能添加目录：${stat.name}`)
-      draft.attachments.push({ name: stat.name, path: stat.path, size: stat.size, generated: false })
-    }
+    await addPaths(paths || [])
   } catch (e: any) { localError.value = e?.message || String(e) }
   finally { picking.value = false }
+}
+
+async function onPaste(e: ClipboardEvent) {
+  if (locked.value) return
+  // 必须同步阻止默认粘贴：后端读剪贴板是异步的，等结果回来再 preventDefault
+  // 已经晚了一步。没有附件时下面手动插回文字，行为与普通粘贴一致。
+  e.preventDefault()
+  if (pasting.value) return
+  const fallbackText = e.clipboardData?.getData('text/plain') || ''
+  pasting.value = true
+  try {
+    const data = await api.ReadEditorClipboard()
+    if (locked.value) return
+    if (data.files?.length) {
+      await addPaths(data.files)
+      return
+    }
+    if (data.imageBase64) {
+      if (draft.attachments.length >= MAX_EDITOR_ATTACHMENTS) {
+        localError.value = `一次最多 ${MAX_EDITOR_ATTACHMENTS} 个附件`
+        return
+      }
+      const path = await api.SaveEditorImage(clipboardImageFileName(new Date()), data.imageBase64)
+      const stat = await api.FileStat(path)
+      appendAttachment({ name: stat.name, path: stat.path, size: stat.size, generated: true })
+      return
+    }
+    if (fallbackText) {
+      const el = editor.value
+      const start = el?.selectionStart ?? draft.body.length
+      const end = el?.selectionEnd ?? start
+      const text = normalizeLines(fallbackText)
+      void setBody(draft.body.slice(0, start) + text + draft.body.slice(end), start + text.length)
+    }
+  } catch (err: any) {
+    localError.value = `粘贴附件失败：${err?.message || err}`
+    if (fallbackText) {
+      const el = editor.value
+      const start = el?.selectionStart ?? draft.body.length
+      const end = el?.selectionEnd ?? start
+      const text = normalizeLines(fallbackText)
+      void setBody(draft.body.slice(0, start) + text + draft.body.slice(end), start + text.length)
+    }
+  } finally {
+    pasting.value = false
+  }
+}
+
+function onDragOver(e: DragEvent) {
+  if (locked.value || !Array.from(e.dataTransfer?.types || []).includes('Files')) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  dragActive.value = true
+}
+
+async function onDrop(e: DragEvent) {
+  dragActive.value = false
+  const paths = Array.from(e.dataTransfer?.files || [])
+    .map((file) => (file as File & { path?: string }).path || '')
+    .filter(Boolean)
+  if (!paths.length) return // 文字拖拽仍走浏览器默认插入。
+  e.preventDefault()
+  await addPaths(paths)
 }
 function removeAttachment(index: number) { if (!locked.value) draft.attachments.splice(index, 1) }
 function openImage() {
@@ -272,14 +360,19 @@ function openImage() {
   }
   imageOpen.value = true
 }
-function addAttachment(a: api.EditorAttachment): boolean {
+function appendAttachment(a: api.EditorAttachment): boolean {
   if (locked.value) return false
-  if (draft.attachments.length >= 20) { localError.value = '一次最多 20 个附件'; return false }
+  if (draft.attachments.length >= MAX_EDITOR_ATTACHMENTS) { localError.value = `一次最多 ${MAX_EDITOR_ATTACHMENTS} 个附件`; return false }
   if (draft.attachments.some((item) => item.path.toLowerCase() === a.path.toLowerCase())) {
-    localError.value = '该图片附件已经添加'
+    localError.value = '该附件已经添加'
     return false
   }
   draft.attachments.push(a)
+  return true
+}
+
+function addAttachment(a: api.EditorAttachment): boolean {
+  if (!appendAttachment(a)) return false
   imageOpen.value = false
   const source = imageSource
   imageSource = null
@@ -322,12 +415,24 @@ async function close() {
 }
 function fmtSize(n: number): string { return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MiB` : `${Math.max(1, Math.round(n / 1024))} KiB` }
 
+/** 遮罩不是关闭按钮：按下时阻止浏览器把焦点交给空白层，再主动交还正文。 */
+function keepEditorFocus(e: MouseEvent) {
+  if (locked.value) return
+  e.preventDefault()
+  editor.value?.focus({ preventScroll: true })
+}
+
 onMounted(() => {
   history.value = [draft.body]
   historyIndex.value = 0
+  offEditorDrop = api.onEditorFilesDropped((event) => {
+    if (!disposed && !locked.value) void addPaths(event.files || [])
+  })
   nextTick(() => editor.value?.focus())
 })
 onBeforeUnmount(() => {
+  offEditorDrop?.()
+  offEditorDrop = null
   if (saveTimer) { window.clearTimeout(saveTimer); saveTimer = undefined }
   // 正常关闭已 await 最后保存；这里只兜底应用退出/父组件直接卸载。
   if (!submitted && !handedOff) void save()
@@ -336,7 +441,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="mask" @click.self="close">
+  <div class="mask" @mousedown.self="keepEditorFocus" @click.self="keepEditorFocus">
     <div class="dlg" role="dialog" aria-modal="true" aria-label="本地文章编辑器" @keydown.esc.stop.prevent="close">
       <div class="head">
         <span>本地文章编辑器 <i>{{ context ? (context.mode === 'reply' ? '回帖' : '发文') : '草稿' }}</i></span>
@@ -377,7 +482,23 @@ onBeforeUnmount(() => {
       <div class="warning" v-if="context && !context.canUploadAttachments && draft.attachments.length">
         当前页面不支持自动上传附件：需停留在发文设置页，并在站点配置中启用 ZMODEM。
       </div>
-      <textarea ref="editor" class="editor" :value="draft.body" :disabled="locked" spellcheck="false" wrap="soft" @input="onInput" @keydown="onEditorKey" />
+      <textarea
+        ref="editor"
+        class="editor"
+        :class="{ dragging: dragActive }"
+        :value="draft.body"
+        :disabled="locked"
+        data-file-drop-target="editor-attachments"
+        spellcheck="false"
+        wrap="soft"
+        title="Ctrl+V 可粘贴文件或剪贴板图片；也可把文件拖到这里作为附件"
+        @input="onInput"
+        @keydown="onEditorKey"
+        @paste="onPaste"
+        @dragover="onDragOver"
+        @dragleave="dragActive = false"
+        @drop="onDrop"
+      />
       <div class="error" v-if="localError || error || handoffWarning">{{ localError || error || handoffWarning }}</div>
       <div class="foot">
         <span class="save-state" :class="saveState">{{ saveState === 'saving' ? '正在自动保存…' : saveState === 'saved' ? '草稿已自动保存' : '草稿保存失败' }} · {{ stats.chars }} 字符 · {{ stats.lines }} 行</span>
@@ -419,6 +540,7 @@ input, textarea { box-sizing: border-box; background: #1b1d22; color: #d5d9e0; b
 .attachment button { padding: 2px 7px; font-size: 11px; }
 .warning { padding: 7px 14px; color: #e0b341; background: #352f20; font-size: 12px; }
 .editor { flex: 1; min-height: 120px; resize: none; border: none; border-radius: 0; padding: 14px 16px; outline: none; font: 14px/1.65 Consolas, "Microsoft YaHei UI", monospace; tab-size: 4; }
+.editor.dragging { background: #202c3b; box-shadow: inset 0 0 0 2px #6ab0f3; }
 .error { padding: 6px 14px; color: #e06c5b; background: #352326; font-size: 12px; white-space: pre-wrap; }
 .foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid #33373f; }
 .save-state { color: #8a919e; font-size: 12px; }

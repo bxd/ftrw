@@ -8,7 +8,7 @@ import '@xterm/xterm/css/xterm.css'
 import * as api from './api'
 import { keyseq } from './keyseq'
 import { translateKey, type KeyContext } from './keymap'
-import { extractURLSpans, hostSpanAt, ipSpanAt, scanLines, type PreviewItem } from './linkscan'
+import { extractURLSpans, hostSpanAt, ipSpanAt, scanLines, urlSpanAt, type PreviewItem } from './linkscan'
 import { detectPageState, hitTest, inSpan, parsePostOptionsFields, rowColumnText, visibleText, type Hit, type PageState, type Screen } from './menuclick'
 import { foregroundFor, makeSgrFilter, type SgrFilter } from './sgrfilter'
 import { normalizeLines } from './posttransform'
@@ -65,6 +65,9 @@ function chunkCells(s: string, n: number): string[] {
 
 /** 一次原地替换最多删多少字：再大就退格上千次，站端一吞字就把草稿搅残，不如让用户分段。 */
 const SEL_MAX_CHARS = 2000
+
+/** 链接悬停预览与其它浮动 UI 一致：在同一链接上停满 1 秒才触发。 */
+const LINK_HOVER_DELAY = 1000
 
 /**
  * 选区读取结果。state 不是 ok 时其余字段都只是占位，调用方按 state 给用户说清楚为什么。
@@ -199,6 +202,8 @@ export class TermTab {
    * 不在这儿直接 window.open：那会开出 WebView2 自己的弹窗，既不受我们控制也关不掉。
    */
   onLink?: (uri: string) => void
+  /** 鼠标在同一链接上停留满 1 秒后的自动预览入口；isActive 供异步探测期间判断是否已离开。 */
+  onLinkHover?: (uri: string, isActive: () => boolean) => void
   /**
    * 鼠标点菜单（BBS 菜单页/清单页）：只在 hostType==0 且总开关开着时参与。
    * 关掉后 xterm 的鼠标行为回到原样（只选字），所以它是个可以直接给用户的偏好。
@@ -222,6 +227,10 @@ export class TermTab {
   private menuHover: Hit | null = null
   private menuDown: { row: number; col: number } | null = null
   private menuScreenEl: HTMLElement | null = null
+  // 链接悬停：key 含内容指纹、行和首列，在同一地址内移动不会重置 1 秒计时。
+  private linkHoverKey = ''
+  private linkHoverUrl = ''
+  private linkHoverTimer: number | undefined
   // 悬停 IP：只缓存上一次那一行的文本。mousemove 一秒上百次，每次重扫整行
   // 单元格（每格一次 getCell）没必要，而菜单判定用的 menuRev 正好也是内容指纹。
   private ipRowCache: { rev: number; row: number; text: string } | null = null
@@ -329,12 +338,14 @@ export class TermTab {
     // Enter key / paste handled by onData. Resize -> backend
     this.term.onResize(({ cols, rows }) => {
       if (this.id) api.Resize(this.id, cols, rows)
+      this.cancelLinkHover()
       this.menuRev++ // 行列变了，页面类型得重新判
     })
     this.term.onWriteParsed(() => {
+      this.cancelLinkHover()
       this.menuRev++
     })
-    this.term.onScroll(() => { this.menuRev++ }) // 滚出原来的屏，光标行也就不再是对照点
+    this.term.onScroll(() => { this.cancelLinkHover(); this.menuRev++ }) // 滚出原来的屏，光标行也就不再是对照点
     this.wireMenuClick()
     this.bbsTimer = window.setInterval(() => this.detectBbsState(), 140)
   }
@@ -405,6 +416,7 @@ export class TermTab {
     if (site) {
       const reenabled = this.site.autoEditor === false && site.autoEditor === true
       this.site = site
+      this.cancelLinkHover()
       // 用户在设置里把自动编辑器重新打开时，当前发文流程应立即重新获得接管机会。
       if (reenabled) { this.composeFlowActive = false; this.composeDismissed = false }
     }
@@ -1196,6 +1208,7 @@ export class TermTab {
 
   private onMenuMove = (ev: MouseEvent) => {
     const at = this.cellAt(ev)
+    this.trackLinkHover(at, at ? this.linkAt(at.row, at.col) : null)
     // 文本上的地址是精确签名，菜单矩形是启发式判出来的：压着地址时按地址走。
     // 以前是菜单优先，后果是菜单页里写着来源 IP 的那几行永远查不出归属地，
     // 而那种页面恰恰最想查。点击送按键的行为（onMenuDown）不动。
@@ -1223,6 +1236,7 @@ export class TermTab {
   }
 
   private onMenuLeave = () => {
+    this.cancelLinkHover()
     this.setMenuHover(null)
     if (this.ipPinned) return // 钉住的那条正是给「鼠标挪走之后还能读」用的
     if (this.ipHover) { this.ipHover = ''; this.onIPHint?.('') }
@@ -1231,6 +1245,7 @@ export class TermTab {
   }
 
   private onMenuDown = (ev: MouseEvent) => {
+    this.cancelLinkHover()
     // 带了修饰键的点击另有用途（选字、将来的扩展），一律不当点菜单。Alt 单独按下要
     // 留下坐标：Alt+单击是归属地诊断，不看菜单。
     if (ev.button !== 0 || ev.shiftKey || ev.ctrlKey || ev.metaKey) {
@@ -1269,6 +1284,39 @@ export class TermTab {
     this.term.clearSelection()
     if (this.id) api.Write(this.id, hit.keys.join(''))
     this.setMenuHover(null) // 屏幕马上就要变，留着高亮就是个假提示
+  }
+
+  /** 站点开关、远端鼠标上报和连接状态共同决定是否参与链接悬停。 */
+  private linkHoverAllowed(): boolean {
+    return this.site.linkHoverPreview === true && this.site.protocolType !== 3
+      && this.status === 'connected' && this.term.modes.mouseTrackingMode === 'none'
+  }
+
+  private linkAt(row: number, col: number): { url: string; start: number; end: number } | null {
+    if (!this.linkHoverAllowed()) return null
+    return urlSpanAt(this.rowColumnsOf(row), col)
+  }
+
+  private trackLinkHover(at: { row: number; col: number } | null, link: { url: string; start: number; end: number } | null) {
+    const key = at && link ? `${this.menuRev}:${at.row}:${link.start}:${link.url}` : ''
+    if (!key) { this.cancelLinkHover(); return }
+    if (key === this.linkHoverKey) return
+    this.cancelLinkHover()
+    this.linkHoverKey = key
+    this.linkHoverUrl = link!.url
+    this.linkHoverTimer = window.setTimeout(() => {
+      this.linkHoverTimer = undefined
+      if (!this.linkHoverAllowed() || key !== this.linkHoverKey) return
+      this.onLinkHover?.(this.linkHoverUrl, () => this.linkHoverAllowed() && key === this.linkHoverKey)
+    }, LINK_HOVER_DELAY)
+  }
+
+  /** 离开链接、屏幕变化、点击或关闭标签时取消尚未触发的悬停预览。 */
+  cancelLinkHover() {
+    if (this.linkHoverTimer !== undefined) window.clearTimeout(this.linkHoverTimer)
+    this.linkHoverTimer = undefined
+    this.linkHoverKey = ''
+    this.linkHoverUrl = ''
   }
 
   /** 钉住某个地址：浮层按首列对齐，鼠标挪开也不收。 */
@@ -1318,6 +1366,7 @@ export class TermTab {
   onIPProbe?: (msg: string) => void
 
   dispose() {
+    this.cancelLinkHover()
     cancelAnimationFrame(this.stretchRaf)
     if (this.bbsTimer) window.clearInterval(this.bbsTimer)
     this.bbsTimer = undefined

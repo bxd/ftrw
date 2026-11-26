@@ -44,6 +44,7 @@ func init() {
 	application.RegisterEvent[*PreviewRequest]("preview:load")
 	application.RegisterEvent[*LauncherRevealPayload]("fm:reveal")
 	application.RegisterEvent[*FileTask]("fm:task")
+	application.RegisterEvent[*EditorFilesDropped]("editor:files-dropped")
 }
 
 func main() {
@@ -128,6 +129,9 @@ func main() {
 		Width:     1120,
 		Height:    720,
 		Frameless: true,
+		// 接收 Explorer 等位置拖入的文件；Wails 按 data-file-drop-target 回报落下区域，
+		// 目前只把编辑区标记交给内置编辑器，其它区域保持原有行为。
+		EnableFileDrop: true,
 		// 文件管理器行自己接管右键弹原生 Shell 菜单，关掉 WebView2 默认菜单（重新加载/检查）以免抢先弹出。
 		DefaultContextMenuDisabled: true,
 		BackgroundColour:           application.NewRGB(24, 26, 30),

@@ -149,6 +149,43 @@ func TestSiteAutoEditorDefaultAndExplicitOff(t *testing.T) {
 	}
 }
 
+func TestSiteLinkHoverPreviewDefaultAndPersistence(t *testing.T) {
+	if DefaultSite().LinkHoverPreview {
+		t.Fatal("新 profile 的链接悬停预览应默认关闭")
+	}
+	var old Site
+	if err := json.Unmarshal([]byte(`{"name":"旧站","hostType":0,"protocolType":0}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if normalizeSite(old).LinkHoverPreview {
+		t.Fatal("旧 profile 缺少 linkHoverPreview 时应保持关闭")
+	}
+
+	store := &Store{dir: t.TempDir()}
+	cs := NewConfigService(store)
+	on := DefaultSite()
+	on.LinkHoverPreview = true
+	if err := cs.SaveSite(-1, on); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.load(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cs.ListSites(); len(got) != 1 || !got[0].LinkHoverPreview {
+		t.Fatalf("开启状态应跨保存/加载保留：%+v", got)
+	}
+	on.LinkHoverPreview = false
+	if err := cs.SaveSite(0, on); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.load(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cs.ListSites(); len(got) != 1 || got[0].LinkHoverPreview {
+		t.Fatalf("关闭状态应跨保存/加载保留：%+v", got)
+	}
+}
+
 func TestSaveSitePreservesProfileIdentity(t *testing.T) {
 	store := &Store{dir: t.TempDir()}
 	cs := NewConfigService(store)

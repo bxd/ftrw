@@ -1128,6 +1128,13 @@ async function newTab(site: api.Site) {
 
   const tab = new TermTab(site, container, { scrollback: prefs.value?.scrollbackLines })
   tab.onLink = (uri) => void onLinkClick(tab, uri)
+  tab.onLinkHover = (uri, isActive) => {
+    if (activeTerm() !== tab || dialogOpen.value || !prefs.value?.imageViewerEnabled) {
+      tab.cancelLinkHover() // 本次未接单，鼠标再移动时才允许重新计时
+      return
+    }
+    void onLinkClick(tab, uri, true, isActive)
+  }
   // 断线后的按键出口：空格关掉本标签（用 idxOf 现取现算，免得标签前后变动时关错），
   // 回车重连（复用 api.Connect 起新会话、api.Disconnect 清掉旧的死会话）。
   tab.onDisconnectedSpace = () => { const i = idxOf(tab); if (i >= 0) void closeTab(i) }
@@ -1254,18 +1261,21 @@ function revealInFileManager(path: string, preview: boolean) {
   nextTick(dispatch)
 }
 
+let linkOpenSeq = 0
+
 /**
- * 点到超链接：交给预览窗口。
+ * 点击或悬停超链接：交给同一个预览窗口。
  *
  * 清单取自当前屏幕（tab.collectLinks()），所以点开一张图之后还能在这一帖的图里
  * 循环着翻；被点的那条万一不在清单里（跨行折断一类）就单独补一条，保证「点了必有
  * 反应」。扩展名判不准的先问一次服务器：BBS 的图大量走 att.php?... 或纯附件号，
  * 误判成网页就得把整个窗口交给对方文档，缩放/翻页/另存为全都画不出来；而且真文件名
  * 只在服务器的响应头里，不探测就只能拿地址末段当名字。
- * 偏好里关掉预览时退回系统浏览器，不拦截用户。
+ * 点击在偏好里关掉预览时退回系统浏览器；悬停不打扰用户，直接跳过。
  */
-async function onLinkClick(tab: TermTab, uri: string) {
+async function onLinkClick(tab: TermTab, uri: string, hover = false, isHoverActive?: () => boolean) {
   if (!prefs.value?.imageViewerEnabled) {
+    if (hover) return
     try {
       await api.OpenExternalURL(uri)
     } catch (e) {
@@ -1273,13 +1283,24 @@ async function onLinkClick(tab: TermTab, uri: string) {
     }
     return
   }
+  // 探测是异步的：用户已经移开、切标签或改用点击时，迟到的结果不能再抢预览窗口。
+  const seq = ++linkOpenSeq
+  const obsolete = () => seq !== linkOpenSeq
+    || (hover && (activeTerm() !== tab || dialogOpen.value || (!!isHoverActive && !isHoverActive())))
+  if (obsolete()) return
   const scanned = tab.collectLinks()
-  const targets = probeTargets(scanned)
+  // 悬停只探测光标下这一条，不能因为鼠标扫过一个链接就把整屏未知链接都请求一遍。
+  const hovered = scanned.find((it) => it.url === uri)
+  const targets = hover
+    ? probeTargets(hovered ? [hovered] : [{ url: uri, kind: classifyURL(uri), name: linkName(uri) }])
+    : probeTargets(scanned)
   const list = applyProbe(scanned, targets, await probeInfos(targets))
+  if (obsolete()) return
   let clicked = list.find((it) => it.url === uri)
   if (!clicked) {
     // 屏幕里没扫到：单独探这一条，别让它因为扩展名不明就退化成开网页
     const solo = (await probeInfos([uri]))[0]
+    if (obsolete()) return
     const name = (solo?.name || '').trim()
     clicked = {
       url: uri,
@@ -1296,9 +1317,10 @@ async function onLinkClick(tab: TermTab, uri: string) {
   }
   const index = Math.max(0, items.findIndex((it) => it.url === uri))
   try {
+    if (obsolete()) return
     await api.OpenPreview(items, index)
   } catch (e) {
-    showEcho(`预览打开失败：${e}`, 'error')
+    if (!obsolete()) showEcho(`预览打开失败：${e}`, 'error')
   }
 }
 

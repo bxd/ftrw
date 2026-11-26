@@ -46,6 +46,8 @@ export interface Site {
   enableZmodem: boolean
   // BBS 发文设置页是否自动打开本地编辑器；旧 profile 缺字段时按开启处理
   autoEditor?: boolean
+  // 鼠标在链接上停留 1 秒后自动下载并预览；旧 profile 缺字段时保持关闭
+  linkHoverPreview?: boolean
   group: string
   // 网络代理（D3）站点级覆盖：0=跟随全局设置（旧站点缺键即此） 1=本站点强制直连
   // 2=SOCKS4 3=SOCKS5 4=HTTP。选了类型但地址为空等于不用代理。
@@ -239,6 +241,14 @@ export const SetDialogGuard = (on: boolean): Promise<void> => Call.ByName(`${app
 // SSH 私钥选择：弹原生选文件框，起始目录落在 ~/.ssh；取消返空串（不是错误）
 export const PickKeyFile = (): Promise<string> => Call.ByName(`${appsvc}.PickKeyFile`)
 export const PickEditorFiles = (): Promise<string[]> => Call.ByName(`${appsvc}.PickEditorFiles`)
+export const CopyFilesToClipboard = (paths: string[]): Promise<void> =>
+  Call.ByName(`${appsvc}.CopyFilesToClipboard`, paths)
+export interface EditorClipboardData {
+  files: string[]
+  imageBase64: string
+}
+export const ReadEditorClipboard = (): Promise<EditorClipboardData> =>
+  Call.ByName(`${appsvc}.ReadEditorClipboard`)
 // 偏好保存后重放与原生侧相关的设置（目前是托盘显隐）
 export const ApplyAppPreferences = (): Promise<void> => Call.ByName(`${appsvc}.ApplyPreferences`)
 
@@ -513,6 +523,12 @@ export const DeleteDownloads = (paths: string[]): Promise<void> =>
 // 后端已签好本地 URL，并按正文、附件顺序排除拆分前的原始容器。
 export const PreviewDownload = (path: string): Promise<PreviewItem[]> =>
   Call.ByName(`${downloads}.Preview`, path)
+
+export interface EditorFilesDropped {
+  files: string[]
+}
+export const onEditorFilesDropped = (cb: (d: EditorFilesDropped) => void) =>
+  Events.On('editor:files-dropped', (e: any) => cb({ files: e.data?.files || [] }))
 
 export interface EditorAttachment {
   name: string

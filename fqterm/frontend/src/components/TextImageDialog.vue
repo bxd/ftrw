@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import * as api from '../api'
-import { renderTextImage, TEXT_IMAGE_DEFAULTS, textImageFileName } from '../textimage'
+import { renderTextImage, TEXT_IMAGE_DEFAULTS, TEXT_IMAGE_PRESETS, textImageFileName, textImagePresetOptions, type TextImageStyleId } from '../textimage'
 
 const props = defineProps<{ initialText: string }>()
 const emit = defineEmits<{
@@ -33,6 +33,11 @@ async function redraw() {
       error.value = e?.message || String(e)
     }
   }
+}
+
+function pickStyle(id: TextImageStyleId) {
+  Object.assign(opts, textImagePresetOptions(id))
+  scheduleDraw()
 }
 
 let timer: number | undefined
@@ -68,6 +73,18 @@ onBeforeUnmount(() => { if (timer) window.clearTimeout(timer); renderSeq++ })
       <div class="head"><span>文字转图片附件</span><button class="x" @click="!busy && emit('close')">✕</button></div>
       <div class="body">
         <div class="controls">
+          <div class="style-picker">
+            <div class="section-title">样式方案</div>
+            <div class="styles">
+              <button v-for="preset in TEXT_IMAGE_PRESETS" :key="preset.id" type="button"
+                      class="style" :class="[`style-${preset.id}`, { on: opts.style === preset.id }]"
+                      :aria-pressed="opts.style === preset.id" @click="pickStyle(preset.id)">
+                <span class="swatch" :class="`swatch-${preset.id}`"
+                      :style="{ background: preset.cardBackground, color: preset.foreground, borderColor: preset.borderColor }">Aa</span>
+                <span class="style-copy"><strong>{{ preset.name }}</strong><small>{{ preset.description }}</small></span>
+              </button>
+            </div>
+          </div>
           <label>文字<textarea v-model="opts.text" rows="9" @input="scheduleDraw" /></label>
           <div class="grid">
             <label>最大宽度<input v-model.number="opts.width" type="number" min="320" max="1600" step="80" @input="scheduleDraw"></label>
@@ -101,6 +118,26 @@ onBeforeUnmount(() => { if (timer) window.clearTimeout(timer); renderSeq++ })
 .body { display: grid; grid-template-columns: 330px 1fr; gap: 16px; padding: 16px; }
 .controls, .grid { display: flex; flex-direction: column; gap: 8px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; }
+.style-picker { display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid #33373f; }
+.section-title { color: #8a919e; font-size: 12px; }
+.styles { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.style { position: relative; isolation: isolate; overflow: hidden; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 7px; text-align: left; background: linear-gradient(135deg, rgba(255,255,255,.045), rgba(255,255,255,.015)); transition: border-color .15s, box-shadow .15s, transform .15s; }
+.style::after { content: ''; position: absolute; z-index: -1; inset: 0; opacity: 0; background: linear-gradient(115deg, transparent 12%, rgba(255,255,255,.1) 46%, transparent 78%); transform: translateX(-55%); transition: opacity .15s, transform .25s; pointer-events: none; }
+.style:hover { border-color: #667085; transform: translateY(-1px); }
+.style:hover::after, .style.on::after { opacity: 1; transform: translateX(45%); }
+.style.on { border-color: #7dd3fc; background: linear-gradient(135deg, #263b50, #29263f); box-shadow: inset 0 0 0 1px rgba(125,211,252,.55), 0 0 14px rgba(56,189,248,.12); }
+.style-classic.on { border-color: #35e7ff; box-shadow: inset 0 0 0 1px rgba(53,231,255,.5), 0 0 14px rgba(53,231,255,.14); }
+.style-gold.on { border-color: #d6af62; background: linear-gradient(135deg, #3b3020, #242017); box-shadow: inset 0 0 0 1px rgba(214,175,98,.45), 0 0 14px rgba(214,175,98,.12); }
+.style-glitch.on { border-color: #ff4fd8; background: linear-gradient(135deg, #25213c, #351c33); box-shadow: inset 0 0 0 1px rgba(255,79,216,.45), 2px 0 0 rgba(85,246,255,.18); }
+.swatch { position: relative; overflow: hidden; flex: 0 0 36px; width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid; font: 600 13px/1 "Segoe UI", sans-serif; }
+.swatch-classic { box-shadow: inset 0 0 12px rgba(53,231,255,.12), 0 0 9px rgba(53,231,255,.24); }
+.swatch-aurora { border-radius: 10px; box-shadow: inset 0 0 0 3px rgba(255,255,255,.07), 0 0 12px rgba(103,232,249,.2); backdrop-filter: blur(3px); }
+.swatch-gold { border-radius: 2px; box-shadow: inset 0 0 0 3px #100d09, inset 0 0 0 4px rgba(214,175,98,.5), 0 0 10px rgba(214,175,98,.18); }
+.swatch-glitch { border-radius: 0; text-shadow: -2px 0 #55f6ff, 2px 0 #ff4fd8; }
+.swatch-glitch::after { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 4px); pointer-events: none; }
+.style-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.style-copy strong { color: #d5d9e0; font-size: 12px; font-weight: 600; }
+.style-copy small { color: #8a919e; font-size: 10px; line-height: 1.35; }
 label { display: flex; flex-direction: column; gap: 4px; color: #8a919e; font-size: 12px; }
 input, textarea { width: 100%; box-sizing: border-box; background: #1b1d22; color: #d5d9e0; border: 1px solid #3d424b; border-radius: 5px; padding: 6px 8px; font: inherit; }
 textarea { resize: vertical; line-height: 1.5; }

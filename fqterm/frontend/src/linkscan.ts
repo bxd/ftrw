@@ -84,6 +84,14 @@ export function extractURLSpans(text: string): Array<[number, number]> {
   return urlMatches(text).map((m) => [m.start, m.end])
 }
 
+/** 某一列上正好压着的 URL；悬停预览按完整地址触发，而不是只看有没有命中区间。 */
+export function urlSpanAt(text: string, col: number): { url: string; start: number; end: number } | null {
+  for (const m of urlMatches(text)) {
+    if (col >= m.start && col < m.end) return m
+  }
+  return null
+}
+
 function extOf(u: string): string {
   let p = ''
   try {

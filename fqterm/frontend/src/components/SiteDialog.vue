@@ -31,6 +31,7 @@ const s = reactive<api.Site>({
   // 这里再补一次就会把「ANSI 颜色」永远锁在开。alwaysHighlight 出厂为关，缺键正好。
   alwaysHighlight: raw.alwaysHighlight ?? false,
   autoEditor: raw.autoEditor ?? true,
+  linkHoverPreview: raw.linkHoverPreview ?? false,
   // 按键方案出厂 BBS（与后端 defaultSite 一致）；SSH 私钥两个字段旧站点根本没有。
   keyType: raw.keyType ?? 0,
   keyFile: raw.keyFile ?? '',
@@ -237,6 +238,12 @@ function doSave(connect: boolean) {
           <legend>本地文章编辑器</legend>
           <label class="chk"><input type="checkbox" v-model="s.autoEditor" /> 自动打开本地编辑器</label>
           <p class="hint">进入 BBS 发文设置页时自动接管正文编辑；保存后回传远端编辑器，仍由你人工发表。关闭后不再自动弹出，仍可从顶栏手动打开。</p>
+        </fieldset>
+
+        <fieldset v-if="!isLocal">
+          <legend>链接悬停预览</legend>
+          <label class="chk"><input type="checkbox" v-model="s.linkHoverPreview" /> 鼠标悬停 1 秒后自动下载并预览</label>
+          <p class="hint">默认关闭。开启后，鼠标在终端里的 http/https 链接上停留满 1 秒才会请求并打开预览；移开即取消，不会自动交给系统浏览器。</p>
         </fieldset>
 
         <fieldset v-if="!isLocal">

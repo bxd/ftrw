@@ -483,6 +483,22 @@ function switchPane() {
 
 /* ---------- 文件操作 ---------- */
 
+// Ctrl+C 写标准文件列表（CF_HDROP），不是复制路径文本；编辑器 Ctrl+V 会直接收成附件。
+async function copySelectedFiles() {
+  const pane = panes[active.value]
+  const paths = selectedPaths(pane)
+  if (!paths.length) { status.value = '当前没有可复制的文件'; return }
+  const rows = pane.rows.filter((r) => !r.special && paths.includes(r.path))
+  if (rows.some((r) => r.isDir)) { status.value = 'Ctrl+C 只复制文件，不能复制目录'; return }
+  if (rows.some((r) => r.path.includes('::'))) { status.value = '压缩包内的文件请先解压再复制'; return }
+  try {
+    await api.CopyFilesToClipboard(paths)
+    status.value = `已复制 ${paths.length} 个文件，可在编辑器 Ctrl+V 粘贴为附件`
+  } catch (e: any) {
+    status.value = `复制文件失败：${e?.message || e}`
+  }
+}
+
 async function doCopy() {
   await askOp('copy')
 }
@@ -943,6 +959,8 @@ function onKeydown(e: KeyboardEvent) {
   // 其余浮层 / 菜单在场时整体让路。
   if (input.show || confirmDel.show || viewer.show || menuOpen.value) return
   const pane = panes[active.value]
+  // Ctrl/⌘+C：复制活动栏选中的文件；未多选时就是当前高亮文件。
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); void copySelectedFiles(); return }
   // Ctrl/⌘+Q：就地预览开关（出厂键表未绑、也非 WebView2 保留键，能落到这里）。
   if ((e.ctrlKey || e.metaKey) && (e.key === 'q' || e.key === 'Q')) { e.preventDefault(); togglePreview(); return }
   switch (e.key) {
@@ -1350,7 +1368,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="foot">
-      <span class="hint">Tab 切栏 · Enter 打开 · F5 复制 / F6 移动 / F7 目录 · Del 回收站 / Shift+Del 永删 · F2 重命名 · F3 预览 · Insert 多选 · Shift+↑↓ / Shift+点击 连续多选 · Ctrl+点击 跳选 · Ctrl+Q 预览/退出 · 敲字母过滤（支持拼音）· 双击地址栏 / Alt+X d 改路径 · 行拖拽到外部应用</span>
+      <span class="hint">Tab 切栏 · Enter 打开 · F5 复制 / F6 移动 / F7 目录 · Del 回收站 / Shift+Del 永删 · F2 重命名 · F3 预览 · Insert 多选 · Shift+↑↓ / Shift+点击 连续多选 · Ctrl+点击 跳选 · Ctrl+C 复制文件 · Ctrl+Q 预览/退出 · 敲字母过滤（支持拼音）· 双击地址栏 / Alt+X d 改路径 · 行拖拽到外部应用</span>
       <span v-if="status" class="status">{{ status }}</span>
     </div>
 
