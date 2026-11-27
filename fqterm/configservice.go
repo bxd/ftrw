@@ -256,17 +256,37 @@ func (cs *ConfigService) SaveEditorDraft(draft EditorDraft) (EditorDraft, error)
 
 // DeleteEditorDraft 删除本地草稿；已经上传到 BBS 的正文不受影响。
 func (cs *ConfigService) DeleteEditorDraft(id string) error {
-	id = strings.TrimSpace(id)
+	return cs.DeleteEditorDrafts([]string{id})
+}
+
+// DeleteEditorDrafts 一次写入批量删除结果，避免逐条删除留下半成品。
+func (cs *ConfigService) DeleteEditorDrafts(ids []string) error {
+	wanted := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+
 	cs.draftMu.Lock()
 	defer cs.draftMu.Unlock()
 	cs.store.mu.Lock()
 	next := make([]EditorDraft, 0, len(cs.store.Drafts))
+	changed := false
 	for _, draft := range cs.store.Drafts {
-		if draft.ID != id {
-			next = append(next, draft)
+		if _, ok := wanted[draft.ID]; ok {
+			changed = true
+			continue
 		}
+		next = append(next, draft)
 	}
 	cs.store.mu.Unlock()
+	if !changed {
+		return nil
+	}
 	if err := cs.store.saveJSON("drafts.json", next); err != nil {
 		return err
 	}

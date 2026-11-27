@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { EDITOR_ENTER_TRIGGER, EDITOR_UPLOAD_TRIGGER, uploadEditorAttachmentsSequentially } from './editorupload.ts'
+import { EDITOR_ENTER_TRIGGER, EDITOR_UPLOAD_TRIGGER, markEditorDraftSentAndDelete, uploadEditorAttachmentsSequentially } from './editorupload.ts'
 
 function fixture(paths = ['a.png', 'b.png', 'c.png']) {
   const calls = []
@@ -77,6 +77,41 @@ test('整批附件完成后不发送额外回车，最终回车由调用方统�
   assert.deepEqual(f.uploaded, f.paths)
   assert.equal(f.calls.filter(([kind]) => kind === 'transfer').length, 2)
   assert.equal(f.calls.some(([kind, , value]) => kind === 'transfer' && value === EDITOR_ENTER_TRIGGER), false)
+})
+
+test('回传成功先标记 sent，再删除对应草稿', async () => {
+  const calls = []
+  const sent = []
+  const draft = { id: 'draft-1', revision: 2, transferState: 'sending', synced: false, updatedAt: 1 }
+  const result = await markEditorDraftSentAndDelete(draft, {
+    async save(value) { calls.push(['save', value]); return { ...value, revision: value.revision + 1 } },
+    async delete(id) { calls.push(['delete', id]) },
+  }, (value) => sent.push(value))
+  assert.deepEqual(calls.map(([kind]) => kind), ['save', 'delete'])
+  assert.equal(calls[0][1].transferState, 'sent')
+  assert.equal(calls[0][1].synced, true)
+  assert.equal(calls[1][1], 'draft-1')
+  assert.equal(sent.length, 1)
+  assert.equal(result.revision, 3)
+})
+
+test('sent 标记保存失败时不删除草稿', async () => {
+  let deleted = false
+  await assert.rejects(markEditorDraftSentAndDelete({ id: 'draft-1' }, {
+    async save() { throw new Error('save failed') },
+    async delete() { deleted = true },
+  }), /save failed/)
+  assert.equal(deleted, false)
+})
+
+test('删除失败时保留 sent 快照并向上报告', async () => {
+  let saved
+  await assert.rejects(markEditorDraftSentAndDelete({ id: 'draft-1' }, {
+    async save(value) { saved = { ...value, revision: 1 }; return saved },
+    async delete() { throw new Error('delete failed') },
+  }, (value) => { saved = value }), /delete failed/)
+  assert.equal(saved.transferState, 'sent')
+  assert.equal(saved.synced, true)
 })
 
 test('附件路径按 Windows 大小写不敏感规则去重', async () => {

@@ -558,6 +558,7 @@ export interface EditorDraft {
 export const ListEditorDrafts = (): Promise<EditorDraft[]> => Call.ByName(`${cfg}.ListEditorDrafts`)
 export const SaveEditorDraft = (draft: EditorDraft): Promise<EditorDraft> => Call.ByName(`${cfg}.SaveEditorDraft`, draft)
 export const DeleteEditorDraft = (id: string): Promise<void> => Call.ByName(`${cfg}.DeleteEditorDraft`, id)
+export const DeleteEditorDrafts = (ids: string[]): Promise<void> => Call.ByName(`${cfg}.DeleteEditorDrafts`, ids)
 export const SaveEditorImage = (name: string, dataBase64: string): Promise<string> =>
   Call.ByName(`${cfg}.SaveEditorImage`, name, dataBase64)
 

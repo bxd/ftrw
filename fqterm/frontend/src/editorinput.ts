@@ -1,8 +1,19 @@
 export const MAX_EDITOR_ATTACHMENTS = 20
 
-// 与编辑器底栏主按钮共用同一个提交入口，避免快捷键走出另一套保存/回传逻辑。
-export function isSaveAndHandoffShortcut(e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey'>): boolean {
-  return (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'w'
+type EditorShortcut = Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey'>
+
+function matchesShortcut(e: EditorShortcut, key: string): boolean {
+  return (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === key
+}
+
+// 保存快捷键只落草稿，不触发回传或关闭编辑器。
+export function isSaveShortcut(e: EditorShortcut): boolean {
+  return matchesShortcut(e, 's')
+}
+
+// 回传快捷键与底栏回传按钮共用同一个提交入口。
+export function isHandoffShortcut(e: EditorShortcut): boolean {
+  return matchesShortcut(e, 'w')
 }
 
 export function attachmentPathKey(path: string): string {

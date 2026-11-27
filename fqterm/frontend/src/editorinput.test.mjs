@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { clipboardImageFileName, isSaveAndHandoffShortcut, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from './editorinput.ts'
+import { clipboardImageFileName, isHandoffShortcut, isSaveShortcut, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from './editorinput.ts'
 
 test('附件路径按 Windows 大小写不敏感规则去重', () => {
   const existing = [{ path: 'C:\\Docs\\one.txt' }]
@@ -16,11 +16,17 @@ test('附件输入保留顺序并容忍空数组', () => {
   assert.equal(MAX_EDITOR_ATTACHMENTS, 20)
 })
 
-test('Ctrl+W 与主按钮共用保存并回传快捷键语义', () => {
-  assert.equal(isSaveAndHandoffShortcut({ key: 'w', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }), true)
-  assert.equal(isSaveAndHandoffShortcut({ key: 'W', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true }), false)
-  assert.equal(isSaveAndHandoffShortcut({ key: 'w', ctrlKey: false, metaKey: true, altKey: false, shiftKey: false }), true)
-  assert.equal(isSaveAndHandoffShortcut({ key: 'w', ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }), false)
+test('Ctrl+S 只保存，Ctrl+W 只回传，修饰键语义一致', () => {
+  const plain = { key: 's', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }
+  assert.equal(isSaveShortcut(plain), true)
+  assert.equal(isHandoffShortcut(plain), false)
+  assert.equal(isHandoffShortcut({ ...plain, key: 'w' }), true)
+  assert.equal(isSaveShortcut({ ...plain, key: 'w' }), false)
+  assert.equal(isSaveShortcut({ ...plain, key: 'S', shiftKey: true }), false)
+  assert.equal(isHandoffShortcut({ ...plain, key: 'W', shiftKey: true }), false)
+  assert.equal(isSaveShortcut({ ...plain, ctrlKey: false, metaKey: true }), true)
+  assert.equal(isHandoffShortcut({ ...plain, key: 'w', ctrlKey: false, metaKey: true }), true)
+  assert.equal(isSaveShortcut({ ...plain, ctrlKey: false, metaKey: false }), false)
 })
 
 test('剪贴板图片临时文件名是纯 ASCII PNG', () => {

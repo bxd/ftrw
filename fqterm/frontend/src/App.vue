@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as api from './api'
 import { TermTab, type ComposeContext } from './terminal'
-import { EDITOR_ENTER_TRIGGER, EDITOR_UPLOAD_TRIGGER, uploadEditorAttachmentsSequentially } from './editorupload'
+import { EDITOR_ENTER_TRIGGER, EDITOR_UPLOAD_TRIGGER, markEditorDraftSentAndDelete, uploadEditorAttachmentsSequentially } from './editorupload'
 import { FmTab, type FmSnapshot } from './fmtab'
 import { Clipboard, Dialogs, Window } from '@wailsio/runtime'
 import SiteDialog from './components/SiteDialog.vue'
@@ -977,9 +977,15 @@ async function submitEditor(draft: api.EditorDraft) {
     await tab.insertText(draft.body)
     bodyInserted = true
     try {
-      draft = await api.SaveEditorDraft({ ...draft, transferState: 'sent', synced: true, updatedAt: Date.now() })
-      editorDlg.draft = draft
+      draft = await markEditorDraftSentAndDelete(
+        draft,
+        { save: api.SaveEditorDraft, delete: api.DeleteEditorDraft },
+        (sent) => { draft = sent; editorDlg.draft = sent },
+      )
     } catch (e) {
+      if (draft.transferState === 'sent' && draft.synced) {
+        throw new Error(`清理本地草稿失败：${errorText(e)}。可到草稿箱手动删除`)
+      }
       throw new Error(`正文已回传，但草稿状态保存失败：${errorText(e)}`)
     }
     tab.finishCompose()
@@ -989,7 +995,7 @@ async function submitEditor(draft: api.EditorDraft) {
   } catch (e) {
     const reason = errorText(e)
     editorDlg.error = bodyInserted
-      ? `正文已完整回传，但未能标记草稿：${reason}。不要重复回传，请直接回终端人工发表。`
+      ? `正文已完整回传，但回传收尾失败：${reason}。不要重复回传，请直接回终端人工发表。`
       : bodyInsertAttempted
         ? `正文可能已部分写入远端编辑器：${reason}。不要直接重复回传，请先回终端检查。`
         : `回传未完成，草稿已保留：${reason}`

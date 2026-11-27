@@ -1,3 +1,5 @@
+import type { EditorDraft } from './api'
+
 export interface EditorUploadTab {
   id: string
   composeContext(): { state: string } | null
@@ -14,6 +16,23 @@ export const EDITOR_UPLOAD_TRIGGER = 'U\r'
 
 /** 整批附件传输完毕后，再用一次回车接受发文参数并进入正文编辑器。 */
 export const EDITOR_ENTER_TRIGGER = '\r'
+
+export interface EditorDraftHandoffIO {
+  save(draft: EditorDraft): Promise<EditorDraft>
+  delete(id: string): Promise<void>
+}
+
+/** 正文已写入远端后，先持久化防重复标记，再删除本地草稿。 */
+export async function markEditorDraftSentAndDelete(
+  draft: EditorDraft,
+  io: EditorDraftHandoffIO,
+  onSent?: (draft: EditorDraft) => void,
+): Promise<EditorDraft> {
+  const sent = await io.save({ ...draft, transferState: 'sent', synced: true, updatedAt: Date.now() })
+  onSent?.(sent)
+  await io.delete(sent.id)
+  return sent
+}
 
 /**
  * 水木发文设置页的一次 U 只启动一个单文件 rz 接收会话。逐文件暂存、传输，

@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import * as api from '../api'
 import type { ComposeContext } from '../terminal'
 import { applySeparators, isQuoteLine, normalizeLines, SEP_DEFAULT, SEP_PRESETS, toVertical } from '../posttransform'
-import { clipboardImageFileName, isSaveAndHandoffShortcut, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from '../editorinput'
+import { clipboardImageFileName, isHandoffShortcut, isSaveShortcut, MAX_EDITOR_ATTACHMENTS, newAttachmentPaths } from '../editorinput'
 import TextImageDialog from './TextImageDialog.vue'
 
 const props = defineProps<{
@@ -107,6 +107,12 @@ function save(): Promise<boolean> {
   saveChain = task.then(() => undefined)
   return task
 }
+async function saveNow() {
+  if (locked.value) return
+  localError.value = ''
+  if (saveTimer) { window.clearTimeout(saveTimer); saveTimer = undefined }
+  await save()
+}
 function scheduleSave() {
   draft.synced = false
   if (saveTimer) window.clearTimeout(saveTimer)
@@ -116,7 +122,12 @@ watch(() => [draft.body, draft.title, draft.board, draft.quote, draft.attachment
 // App 接受回传后才进入 busy；失败恢复 false 时重新允许卸载补存，避免最后改动丢失。
 watch(() => props.busy, (busy) => { submitted = !!busy })
 // App 在首次写入远端前/完成后更新持久化状态，关闭重开也不能丢掉重复回传保护。
-watch(() => props.draft?.transferState, (state) => { if (state) draft.transferState = state })
+watch(() => props.draft, (saved) => {
+  if (!saved) return
+  draft.revision = saved.revision
+  draft.updatedAt = saved.updatedAt
+  if (saved.transferState) draft.transferState = saved.transferState
+})
 
 function pushHistory() {
   if (applyingHistory) return
@@ -164,10 +175,16 @@ function onEditorKey(e: KeyboardEvent) {
   else if (e.key.toLowerCase() === 'f') { e.preventDefault(); findOpen.value = true }
 }
 function onDialogKey(e: KeyboardEvent) {
-  if (imageOpen.value || !isSaveAndHandoffShortcut(e)) return
-  e.preventDefault()
-  e.stopPropagation()
-  void submit()
+  if (imageOpen.value || e.defaultPrevented) return
+  if (isSaveShortcut(e)) {
+    e.preventDefault()
+    e.stopPropagation()
+    void saveNow()
+  } else if (isHandoffShortcut(e)) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (props.context) void submit()
+  }
 }
 function replaceSelection(value: string) {
   const el = editor.value
@@ -393,7 +410,7 @@ function addAttachment(a: api.EditorAttachment): boolean {
   return true
 }
 async function submit() {
-  if (locked.value || (props.context && handoffBlocked.value)) return
+  if (!props.context || locked.value || handoffBlocked.value) return
   localError.value = ''
   submitting.value = true
   try {
@@ -497,7 +514,7 @@ onBeforeUnmount(() => {
         data-file-drop-target="editor-attachments"
         spellcheck="false"
         wrap="soft"
-        title="Ctrl+W 保存并回传；Ctrl+V 可粘贴文件或剪贴板图片；也可把文件拖到这里作为附件"
+        title="Ctrl+S 保存；Ctrl+W 回传；Ctrl+V 可粘贴文件或剪贴板图片；也可把文件拖到这里作为附件"
         @input="onInput"
         @keydown="onEditorKey"
         @paste="onPaste"
@@ -507,11 +524,12 @@ onBeforeUnmount(() => {
       />
       <div class="error" v-if="localError || error || handoffWarning">{{ localError || error || handoffWarning }}</div>
       <div class="foot">
-        <span class="save-state" :class="saveState">{{ saveState === 'saving' ? '正在自动保存…' : saveState === 'saved' ? '草稿已自动保存' : '草稿保存失败' }} · {{ stats.chars }} 字符 · {{ stats.lines }} 行</span>
+        <span class="save-state" :class="saveState">{{ saveState === 'saving' ? '正在保存…' : saveState === 'saved' ? '草稿已保存' : '草稿保存失败' }} · {{ stats.chars }} 字符 · {{ stats.lines }} 行</span>
         <div class="actions">
           <button :disabled="locked" @click="close">关闭</button>
-          <button class="primary" :disabled="locked || (!!context && handoffBlocked)" @click="submit">
-            {{ locked ? '正在回传…' : context && handoffBlocked ? '已开始回传' : context ? '保存并回传' : '保存草稿' }}
+          <button :disabled="locked" title="Ctrl+S" @click="saveNow">保存</button>
+          <button v-if="context" class="primary" :disabled="locked || handoffBlocked" title="Ctrl+W" @click="submit">
+            {{ locked ? '正在回传…' : handoffBlocked ? '已开始回传' : '回传' }}
           </button>
         </div>
       </div>

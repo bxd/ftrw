@@ -93,6 +93,31 @@ func TestConfigServiceEditorDraftsAndImage(t *testing.T) {
 	}
 }
 
+func TestConfigServiceDeleteEditorDrafts(t *testing.T) {
+	store := &Store{dir: t.TempDir()}
+	cs := NewConfigService(store)
+	for _, id := range []string{"one", "two", "three"} {
+		if _, err := cs.SaveEditorDraft(EditorDraft{ID: id, Title: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cs.DeleteEditorDrafts([]string{"", " ", "one", " one ", "two", "two", "missing"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := cs.ListEditorDrafts(); len(got) != 1 || got[0].ID != "three" {
+		t.Fatalf("批量删除结果错误：%+v", got)
+	}
+	if err := cs.DeleteEditorDrafts(nil); err != nil {
+		t.Fatalf("空批量删除应为幂等操作：%v", err)
+	}
+	if err := store.load(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cs.ListEditorDrafts(); len(got) != 1 || got[0].ID != "three" {
+		t.Fatalf("重新加载后批量删除未持久化：%+v", got)
+	}
+}
+
 func TestConfigServiceAllowsEmptyEditorBody(t *testing.T) {
 	store := &Store{dir: t.TempDir()}
 	cs := NewConfigService(store)
